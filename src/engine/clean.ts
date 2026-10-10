@@ -61,9 +61,13 @@ const TRACKER_INLINE =
 // A tracker snippet is made of loaders (an IIFE or document.write that names a tracker), calls
 // such as ga('send', 'pageview') and tracker variables such as var _gaq = _gaq || [].
 const TRACKER_LOADER = new RegExp(`${TRACKER_SRC.source}|GoogleAnalyticsObject|_hjSettings|yandex_metrika_callbacks|Ya\\.Metrika|gtm\\.start|\\b(?:matomo|piwik)\\.(?:js|php)\\b`, 'i');
+// A string in a script that names where a tracker loads from: a URL or path on a tracker host.
+const TRACKER_URL = (s: string) => (s.includes('/') && TRACKER_SRC.test(s)) || /\b(?:matomo|piwik)\.(?:js|php)\b/i.test(s);
 const IIFE = /^(?:[(!+~]|void\s)\s*(?:function\b|\(|async\b)/;
 // What a loader's function does: declare and assign, find and insert the script tag, queue calls.
-const LOADER_STEP = /^(?:(?:var|let|const)\s|(?:return|if|try)\b|[\w$.[\]'"]+\s*=(?!=)|[^;{}]*?\.(?:push|insertBefore|appendChild|write|writeln)\s*\()/;
+const LOADER_STEP = /^(?:(?:var|let|const)\s|(?:return|break|continue|if|try)\b|[\w$.[\]'"]+\s*=(?!=)|[^;{}]*?\.(?:push|insertBefore|appendChild|write|writeln)\s*\()/;
+// How deep the search for a loader goes into blocks: callbacks, if bodies, functions.
+const MAX_DEPTH = 6;
 const TRACKER_CALL = /^(?:window\.)?(?:ga|gtag|fbq|ym|hj|__gaTracker|urchinTracker|(?:_gaq|_paq|_hmt|_qevents|dataLayer|clicky_site_ids)\.push|pageTracker\.\w+|clicky\.init)\s*\(/;
 const TRACKER_VAR =
   /^(?:window\.)?(?:_gaq|_gat|ga|gtag|dataLayer|fbq|_fbq|_paq|_hmt|_qevents|_qoptions|__gaTracker|pageTracker|_uacct|_udn|_uff|gaJsHost|scJsHost|sc_\w+|clicky_site_ids|clicky_custom|addthis_\w+|yaCounter\d+|_hjSettings|google_ad_\w+|google_analytics_\w+|_gaUserPrefs)(?:\.\w+)*$/;
@@ -81,6 +85,30 @@ interface Tok {
 const EXPR_KEYWORDS = new Set(['return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'throw', 'case', 'do', 'else', 'yield', 'await', 'var', 'let', 'const']);
 const EOL = /[\n\r\u2028\u2029]/;
 const isWordChar = (ch: string) => /[\w$]/.test(ch) || (ch > '\x7f' && !/\s/.test(ch));
+
+/** Where the template literal that starts at i ends, past its ${...} parts and the templates in them; -1 if it does not. */
+function templateEnd(code: string, i: number, depth = 0): number {
+  if (depth > 20) return -1;
+  for (i++; i < code.length; i++) {
+    if (code[i] === '\\') i++;
+    else if (code[i] === '`') return i + 1;
+    else if (code[i] === '$' && code[i + 1] === '{') {
+      let braces = 1;
+      for (i += 2; i < code.length; i++) {
+        const c = code[i];
+        if (c === '{') braces++;
+        else if (c === '}' && --braces === 0) break;
+        else if (c === '`') {
+          i = templateEnd(code, i, depth + 1) - 1;
+          if (i < 0) return -1;
+        } else if (c === '"' || c === "'") {
+          for (i++; i < code.length && code[i] !== c; i++) if (code[i] === '\\') i++;
+        }
+      }
+    }
+  }
+  return -1;
+}
 
 /** A rough JavaScript tokenizer: enough to find statements; null when the code does not lex. */
 function jsTokens(code: string): Tok[] | null {
@@ -114,10 +142,14 @@ function jsTokens(code: string): Tok[] | null {
     const start = i;
     const prev = out[out.length - 1];
     let kind: Tok['kind'] = 'p';
-    if (c === '"' || c === "'" || c === '`') {
+    if (c === '`') {
+      i = templateEnd(code, i);
+      if (i < 0) return null;
+      kind = 's';
+    } else if (c === '"' || c === "'") {
       for (i++; i < code.length && code[i] !== c; i++) {
         if (code[i] === '\\') i++;
-        else if (c !== '`' && EOL.test(code[i])) return null;
+        else if (EOL.test(code[i])) return null;
       }
       if (i++ >= code.length) return null;
       kind = 's';
@@ -202,7 +234,31 @@ function iifeBody(code: string, st: Tok[]): { body: string; start: number } | nu
   return null;
 }
 
-function isLoader(code: string, st: Tok[]): boolean {
+/** The source of a for or while loop's body, braces left off. */
+function loopBody(code: string, st: Tok[]): string | null {
+  if (st[1]?.v !== '(') return null;
+  let k = 1;
+  for (let depth = 0; k < st.length; k++) {
+    if ('([{'.includes(st[k].v)) depth++;
+    else if (')]}'.includes(st[k].v) && --depth === 0) break;
+  }
+  const body = st.slice(k + 1, st[st.length - 1].v === ';' ? -1 : undefined);
+  if (!body.length) return null;
+  const braced = body[0].v === '{' && body[body.length - 1].v === '}';
+  return braced ? code.slice(body[0].end, body[body.length - 1].start) : code.slice(body[0].start, body[body.length - 1].end);
+}
+
+function isLoaderStep(code: string, st: Tok[], depth = 0): boolean {
+  // Yandex's tag first checks whether the page has it already: for (...) { if (s.src === r) return; }
+  if (st[0].v === 'for' || st[0].v === 'while') {
+    const body = depth < 2 ? loopBody(code, st) : null; // no snippet nests loops deeper
+    const inner = body === null ? null : statements(body);
+    return body !== null && !!inner && inner.every((s) => isLoaderStep(body, s, depth + 1));
+  }
+  return LOADER_STEP.test(textOf(code, st));
+}
+
+function isLoader(code: string, st: Tok[], inTry = false): boolean {
   const text = textOf(code, st);
   if (/^document\.write(?:ln)?\s*\(/.test(text)) return TRACKER_LOADER.test(text) && !/\bfunction\b/.test(text);
   if (IIFE.test(text)) {
@@ -211,15 +267,24 @@ function isLoader(code: string, st: Tok[]): boolean {
     // the site's own code wrapped around a snippet.
     const fn = iifeBody(code, st);
     const inner = fn && statements(fn.body);
-    return !!fn && !!inner && inner.every((s) => LOADER_STEP.test(textOf(fn.body, s)));
+    return !!fn && !!inner && inner.every((s) => isLoaderStep(fn.body, s));
   }
   // try { var pageTracker = _gat._getTracker("UA-1"); pageTracker._trackPageview(); } catch (err) {}
   const m = /^try\s*\{([\s\S]*)\}\s*catch\s*\(\s*\w+\s*\)\s*\{\s*\}$/.exec(text);
-  return !!m && trackerOnly(m[1]);
+  return !!m && !inTry && trackerOnly(m[1], true);
 }
 
-function isTrackerStatement(code: string, st: Tok[]): boolean {
-  if (isLoader(code, st)) return true;
+/** x.src = '//www.google-analytics.com/ga.js': the step that makes a loader load anything. */
+function setsTrackerSrc(code: string, st: Tok[]): boolean {
+  const text = textOf(code, st);
+  return (
+    /^(?:new\s+)?[\w$.[\]'"()]+\.(?:src\s*=(?!=)|setAttribute\(\s*['"]src['"])/.test(text) &&
+    st.some((t) => t.kind === 's' && TRACKER_URL(t.v))
+  );
+}
+
+function isTrackerStatement(code: string, st: Tok[], inTry = false): boolean {
+  if (isLoader(code, st, inTry)) return true;
   const text = textOf(code, st);
   if (/^\(\s*(?:window\.)?adsbygoogle\s*=\s*window\.adsbygoogle\s*\|\|\s*\[\s*\]\s*\)\s*\.push\(\s*\{[^{}]*\}\s*\)$/.test(text)) return true;
   if (TRACKER_CALL.test(text)) {
@@ -253,9 +318,9 @@ function isTrackerStatement(code: string, st: Tok[]): boolean {
 }
 
 /** True when the script is nothing but tracker statements. */
-function trackerOnly(code: string): boolean {
+function trackerOnly(code: string, inTry = false): boolean {
   const list = statements(code);
-  return !!list && list.length > 0 && list.every((st) => isTrackerStatement(code, st));
+  return !!list && list.length > 0 && list.every((st) => isTrackerStatement(code, st, inTry));
 }
 
 function compiles(code: string): boolean {
@@ -267,15 +332,29 @@ function compiles(code: string): boolean {
   }
 }
 
-/** Where the tracker loaders are in a script, also inside an IIFE that wraps the site's code. */
-function loaderRanges(code: string, base = 0): Array<[number, number]> {
+/** The source inside each outermost { } of a statement: function bodies, if and else blocks, callbacks. */
+function blocks(code: string, st: Tok[]): Array<{ body: string; start: number }> {
+  const out: Array<{ body: string; start: number }> = [];
+  let depth = 0;
+  let open = 0;
+  for (const t of st) {
+    if (t.kind !== 'p') continue;
+    if (t.v === '{' && depth++ === 0) open = t.end;
+    else if (t.v === '}' && --depth === 0) out.push({ body: code.slice(open, t.start), start: open });
+  }
+  return out;
+}
+
+/**
+ * Where the tracker loaders are in a script: whole loader snippets and the statements that point a
+ * script tag at a tracker, also inside the site's own functions, callbacks and if blocks (a
+ * consent check, a delayed loadGTM(), MonsterInsights' if (mi_track_user) { ... }).
+ */
+function loaderRanges(code: string, base = 0, depth = 0): Array<[number, number]> {
   const out: Array<[number, number]> = [];
   for (const st of statements(code) ?? []) {
-    if (isLoader(code, st)) out.push([base + st[0].start, base + st[st.length - 1].end]);
-    else if (IIFE.test(textOf(code, st))) {
-      const fn = iifeBody(code, st);
-      if (fn) out.push(...loaderRanges(fn.body, base + fn.start));
-    }
+    if (isLoader(code, st) || setsTrackerSrc(code, st)) out.push([base + st[0].start, base + st[st.length - 1].end]);
+    else if (depth < MAX_DEPTH) for (const b of blocks(code, st)) out.push(...loaderRanges(b.body, base + b.start, depth + 1));
   }
   return out;
 }
@@ -353,18 +432,28 @@ export function cleanDocument($: Doc, opts: { stripTracking: boolean }): CleanSt
       return;
     }
     const code = $el.html() ?? '';
-    if (/json/i.test($el.attr('type') ?? '') || !TRACKER_INLINE.test(code)) return;
-    stubs = true;
+    if (/json/i.test($el.attr('type') ?? '')) return;
+    const calls = TRACKER_INLINE.test(code);
+    if (!calls && !TRACKER_LOADER.test(code)) return;
     if (trackerOnly(code)) {
       removeNode($, el);
       stats.trackersRemoved++;
+      stubs = true;
       return;
     }
     const kept = withoutLoaders(code);
-    if (kept !== code) {
+    const tokens = jsTokens(kept);
+    const pointsAtTracker = tokens ? tokens.some((t) => t.kind === 's' && TRACKER_URL(t.v)) : TRACKER_URL(kept);
+    // Last resort, as before: a script that calls a tracker and still names where one loads from
+    // (a loader that could not be cut out cleanly) goes whole rather than load it.
+    if (calls && pointsAtTracker) {
+      removeNode($, el);
+      stats.trackersRemoved++;
+    } else if (kept !== code) {
       $el.text(kept);
       stats.trackersRemoved++;
-    }
+    } else if (!calls) return;
+    stubs = true;
   });
   $('noscript').each((_, el) => {
     const inner = $(el).html() ?? '';

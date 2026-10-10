@@ -30,24 +30,59 @@ export function loadHtml(html: string): Doc {
 // the submit button does nothing. Such controls get form="<id of the form>", which says the same.
 const LISTED = new Set(['button', 'fieldset', 'input', 'object', 'output', 'select', 'textarea']);
 const RAW_TEXT = new Set(['script', 'style', 'textarea', 'title', 'xmp', 'iframe', 'noembed', 'noframes', 'noscript', 'plaintext']);
+// What the adoption agency copies when it untangles misnested tags such as <b><div></b></div>.
+const FORMATTING = new Set(['a', 'b', 'big', 'code', 'em', 'font', 'i', 'nobr', 's', 'small', 'strike', 'strong', 'tt', 'u']);
+const HTML_NS = 'http://www.w3.org/1999/xhtml';
 
 interface SourceLoc {
   startOffset: number;
   endOffset: number;
   startTag?: { startOffset: number; endOffset: number };
-  endTag?: { startOffset: number };
+  endTag?: { startOffset: number; endOffset: number };
 }
 const locOf = (n: AnyNode) => (n as { sourceCodeLocation?: SourceLoc | null }).sourceCodeLocation ?? undefined;
 const isElement = (n: AnyNode): n is Element => n.type === 'tag' || n.type === 'script' || n.type === 'style';
+// A <form>, <script> or <template> inside <svg> or <math> is just a foreign element of that name.
+const isHtml = (el: Element) => (el.namespace ?? HTML_NS) === HTML_NS;
+/** A copy the adoption agency made: a formatting element with no place in the source. */
+const isCopy = (n: AnyNode | undefined): n is Element => !!n && isElement(n) && !locOf(n) && isHtml(n) && FORMATTING.has(n.name);
+
+/** The ranges sorted, with overlapping ones merged. */
+function merge(ranges: Array<[number, number]>): Array<[number, number]> {
+  ranges.sort((a, b) => a[0] - b[0]);
+  const out: Array<[number, number]> = [];
+  for (const r of ranges) {
+    const prev = out[out.length - 1];
+    if (prev && r[0] <= prev[1]) prev[1] = Math.max(prev[1], r[1]);
+    else out.push([r[0], r[1]]);
+  }
+  return out;
+}
+
+/** Offsets where `re` matches outside the merged ranges, i.e. real tags rather than text. */
+function tagsOutside(html: string, re: RegExp, ranges: Array<[number, number]>): number[] {
+  const out: number[] = [];
+  let k = 0;
+  for (const m of html.matchAll(re)) {
+    while (k < ranges.length && ranges[k][1] <= m.index) k++;
+    if (!(k < ranges.length && ranges[k][0] <= m.index)) out.push(m.index);
+  }
+  return out;
+}
 
 function keepFormOwners($: Doc, html: string): void {
-  // Source ranges that cannot hold a </form> tag: start tags, comments, the doctype and raw-text
-  // content. Plain text nodes are left out because the parser merges text across a stray </form>.
+  // Source ranges that cannot hold a </form> tag: start tags, other end tags, comments, the doctype
+  // and raw-text content. Plain text nodes are left out because the parser merges text across a
+  // stray </form>.
   const opaque: Array<[number, number]> = [];
+  const endTags: Array<[number, number]> = [];
   const forms: Element[] = [];
   const controls: Element[] = [];
   const ids = new Map<string, number>();
-  const walk = (nodes: AnyNode[]) => {
+  // For each control under copies the adoption agency made: each copy and the child of it the control is in.
+  const copies = new Map<Element, Array<{ copy: Element; child: Element }>>();
+  const trail: Array<{ copy: Element; child: Element }> = [];
+  const walk = (nodes: AnyNode[], copy: Element | undefined) => {
     for (const n of nodes) {
       const loc = locOf(n);
       if (!isElement(n)) {
@@ -55,36 +90,33 @@ function keepFormOwners($: Doc, html: string): void {
         continue;
       }
       // Template content is a separate tree: its forms never set the pointer, its </form> never clears it.
-      if (n.name === 'template') {
+      if (n.name === 'template' && isHtml(n)) {
         if (loc) opaque.push([loc.startOffset, loc.endOffset]);
         continue;
       }
+      if (copy) trail.push({ copy, child: n });
       if (n.attribs.id) ids.set(n.attribs.id, (ids.get(n.attribs.id) ?? 0) + 1);
       if (loc?.startTag) {
         opaque.push([loc.startTag.startOffset, loc.startTag.endOffset]);
-        if (RAW_TEXT.has(n.name)) opaque.push([loc.startTag.endOffset, loc.endTag?.startOffset ?? loc.endOffset]);
-        if (n.name === 'form') forms.push(n);
-        else if (LISTED.has(n.name) && n.attribs.form === undefined) controls.push(n);
+        if (loc.endTag && n.name !== 'form') endTags.push([loc.endTag.startOffset, loc.endTag.endOffset]);
+        if (isHtml(n)) {
+          if (RAW_TEXT.has(n.name)) opaque.push([loc.startTag.endOffset, loc.endTag?.startOffset ?? loc.endOffset]);
+          if (n.name === 'form') forms.push(n);
+          else if (LISTED.has(n.name) && n.attribs.form === undefined) {
+            controls.push(n);
+            if (trail.length) copies.set(n, trail.slice());
+          }
+        }
       }
-      walk(n.children);
+      walk(n.children, isCopy(n) ? n : undefined);
+      if (copy) trail.pop();
     }
   };
-  walk($.root().get(0)?.children ?? []);
+  walk($.root().get(0)?.children ?? [], undefined);
   if (!forms.length || !controls.length) return;
 
-  opaque.sort((a, b) => a[0] - b[0]);
-  const merged: Array<[number, number]> = [];
-  for (const r of opaque) {
-    const last = merged[merged.length - 1];
-    if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
-    else merged.push([r[0], r[1]]);
-  }
-  const formEnds: number[] = [];
-  let k = 0;
-  for (const m of html.matchAll(/<\/form[\s/>]/gi)) {
-    while (k < merged.length && merged[k][1] <= m.index) k++;
-    if (!(k < merged.length && merged[k][0] <= m.index)) formEnds.push(m.index);
-  }
+  const formEnds = tagsOutside(html, /<\/form[\s/>]/gi, merge([...opaque, ...endTags]));
+  const moved = copies.size || controls.some((el) => isCopy(el.children[0])) ? movedControls($, html, merge(opaque), copies) : () => false;
 
   // Each form's span runs from its start tag to the next </form>; the spans do not overlap, so
   // one sweep over forms, end tags and controls in source order finds every control in each.
@@ -101,9 +133,7 @@ function keepFormOwners($: Doc, html: string): void {
     while (c < controls.length && at(controls[c]) < from) c++;
     const orphans: Element[] = [];
     for (let j = c; j < controls.length && at(controls[j]) < to; j++) {
-      let p = controls[j].parent;
-      while (p && p !== form) p = p.parent;
-      if (!p) orphans.push(controls[j]);
+      if (!inside(controls[j], form) && !moved(controls[j], form)) orphans.push(controls[j]);
     }
     if (!orphans.length) continue;
     let id = form.attribs.id;
@@ -117,6 +147,83 @@ function keepFormOwners($: Doc, html: string): void {
     }
     for (const el of orphans) el.attribs.form = id;
   }
+}
+
+function inside(x: AnyNode, y: AnyNode): boolean {
+  let p: AnyNode | null = x;
+  while (p && p !== y) p = p.parent;
+  return !!p;
+}
+
+/**
+ * When the adoption agency untangles <form><font><div><input></form></font></div>, it moves the
+ * open block (the div) and hands what it held to a copy of the formatting element. A browser
+ * gives a control it moves the form around it, as the written page does, unless the control's
+ * form moved along with it; only the controls it never moved keep the form from the pointer.
+ * This tells which (control, form) pairs it moved apart. `opaque` is where no tag can start.
+ */
+function movedControls(
+  $: Doc,
+  html: string,
+  opaque: Array<[number, number]>,
+  copies: Map<Element, Array<{ copy: Element; child: Element }>>,
+): (control: Element, form: Element) => boolean {
+  // The tags that can make the adoption agency move things: formatting end tags, here with the
+  // elements they closed, and <a> and <nobr> start tags.
+  const claims = new Map<number, Element[]>();
+  const starts = new Map<number, string>();
+  for (const el of $([...FORMATTING].join(',')).toArray()) {
+    const loc = locOf(el);
+    if (!isElement(el) || !loc?.startTag || !isHtml(el)) continue;
+    if (loc.endTag) {
+      if (!claims.has(loc.endTag.startOffset)) claims.set(loc.endTag.startOffset, []);
+      claims.get(loc.endTag.startOffset)!.push(el);
+    }
+    if (el.name === 'a' || el.name === 'nobr') starts.set(loc.startOffset, el.name);
+  }
+  // By tag name, and all of them under ''.
+  const triggers = new Map<string, number[]>([['', []]]);
+  const add = (name: string, at: number) => {
+    for (const key of ['', name]) {
+      if (!triggers.has(key)) triggers.set(key, []);
+      triggers.get(key)!.push(at);
+    }
+  };
+  for (const at of tagsOutside(html, new RegExp(`</(?:${[...FORMATTING].join('|')})[\\s/>]`, 'gi'), opaque)) {
+    add(/^<\/([a-z]+)/i.exec(html.slice(at, at + 9))![1].toLowerCase(), at);
+  }
+  for (const [at, name] of starts) add(name, at);
+  for (const list of triggers.values()) list.sort((x, y) => x - y);
+
+  // The tag that made a copy is the first tag after its block opened that could have: not an end
+  // tag that closed an element inside the copy. One found too early only leaves a moved control
+  // its form="".
+  const madeAt = new Map<Element, number>();
+  const made = (copy: Element): number => {
+    let found = madeAt.get(copy);
+    if (found !== undefined) return found;
+    let block = copy.parent;
+    while (block && !locOf(block)) block = block.parent;
+    const from = (block && locOf(block)?.startTag?.endOffset) ?? 0;
+    // The copy that took over what the block held comes first in it and is made by its own tag;
+    // the copies of the elements in between are made by the outer element's tag.
+    const list = triggers.get(copy.parent === block && block?.children[0] === copy ? copy.name : '') ?? [];
+    let lo = 0;
+    let hi = list.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (list[mid] < from) lo = mid + 1;
+      else hi = mid;
+    }
+    while (lo < list.length && !starts.has(list[lo]) && claims.get(list[lo])?.some((el) => inside(el, copy))) lo++;
+    found = lo < list.length ? list[lo] : Infinity;
+    madeAt.set(copy, found);
+    return found;
+  };
+  return (control, form) =>
+    // A control that was the open block itself holds a copy as its first child.
+    isCopy(control.children[0]) ||
+    (copies.get(control) ?? []).some(({ copy, child }) => locOf(control)!.startOffset < made(copy) && !inside(form, child));
 }
 
 const URL_ATTRS: Array<[string, string]> = [
@@ -175,7 +282,10 @@ function splitSrcset(value: string): Array<{ url: string; descriptor: string }> 
     while (i < value.length && !ws.test(value[i])) i++;
     const url = value.slice(start, i);
     if (url.endsWith(',')) {
-      out.push({ url: url.replace(/,+$/, ''), descriptor: '' });
+      // Trimmed by hand: /,+$/ retries from every comma of a long run, which is quadratic.
+      let end = url.length;
+      while (end > 0 && url[end - 1] === ',') end--;
+      out.push({ url: url.slice(0, end), descriptor: '' });
       continue;
     }
     const from = i;

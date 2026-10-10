@@ -53,4 +53,11 @@ describe('srcset URLs may contain commas (finding 51)', () => {
     assert.equal(rewriteSrcset(' http://example.com/a.jpg  480w ,\n /b.jpg 800w ', swap), '/a.jpg  480w, /b.jpg 800w');
     assert.deepEqual(collectUrls(loadHtml('<img srcset="data:image/png;base64,AAA= 1x, /b.png 2x">')), ['/b.png']);
   });
+
+  it('returns at once on a URL with a long run of commas', () => {
+    const t = Date.now();
+    assert.deepEqual(collectUrls(loadHtml(`<img srcset="a${','.repeat(100_000)}b,">`)), [`a${','.repeat(100_000)}b`]);
+    assert.deepEqual(collectUrls(loadHtml(`<img srcset="a${','.repeat(100_000)}">`)), ['a']);
+    assert.ok(Date.now() - t < 1000, `took ${Date.now() - t} ms`);
+  });
 });

@@ -97,6 +97,63 @@ fbq('track', 'PageView');`,
     }
   });
 
+  it('removes the current Yandex Metrika tag and a Baidu snippet', () => {
+    const snippets = [
+      `(function(m,e,t,r,i,k,a){m[i]=m[i]||function(){(m[i].a=m[i].a||[]).push(arguments)};
+m[i].l=1*new Date();
+for (var j = 0; j < document.scripts.length; j++) {if (document.scripts[j].src === r) { return; }}
+k=e.createElement(t),a=e.getElementsByTagName(t)[0],k.async=1,k.src=r,a.parentNode.insertBefore(k,a)})
+(window, document, "script", "https://mc.yandex.ru/metrika/tag.js", "ym");
+ym(12345678, "init", { clickmap:true, trackLinks:true, accurateTrackBounce:true, webvisor:true });`,
+      `var _hmt = _hmt || [];\n(function() {\n  var hm = document.createElement("script");\n  hm.src = "https://hm.baidu.com/hm.js?abc";\n  var s = document.getElementsByTagName("script")[0];\n  s.parentNode.insertBefore(hm, s);\n})();`,
+    ];
+    for (const s of snippets) {
+      const $ = loadHtml(`<html><head><script>${s}</script></head><body><p>x</p></body></html>`);
+      assert.equal(cleanDocument($, { stripTracking: true }).trackersRemoved, 1, s);
+      assert.deepEqual(inlineScripts($).filter((c) => !c.includes('hitCallback')), [], s);
+    }
+  });
+
+  it('cuts a loader out of the site code wrapped around it', () => {
+    const UA = `(function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){(i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)})(window,document,'script','https://www.google-analytics.com/analytics.js','ga');
+ga('create', 'UA-1-1', 'auto'); ga('send', 'pageview');`;
+    const GTM = `(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src='https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);})(window,document,'script','dataLayer','GTM-XXXX');`;
+    const cases = [
+      `if (document.location.hostname.indexOf('example.com') !== -1) {\n${UA}\n}\nsiteInit();`,
+      `if (document.cookie.indexOf('consent=yes') > -1) {\n${GTM}\n}\nsiteInit();`,
+      `setTimeout(function(){\n${UA}\n}, 3000);\nsiteInit();`,
+      `window.addEventListener('load', function(){\n${GTM}\n});\nsiteInit();`,
+      `jQuery(document).ready(function(){\n  siteInit();\n${UA}\n});`,
+      `function loadGTM () {\n  if (window.gtmDidInit) { return false; }\n  window.gtmDidInit = true;\n  ${GTM}\n}\ndocument.addEventListener('scroll', loadGTM, { once: true });\nsiteInit();`,
+      `var mi_track_user = true;\nif ( mi_track_user ) {\n${UA.replace("'ga');", "'__gaTracker');").replace(/\bga\(/g, '__gaTracker(')}\n} else {\nconsole.log( "" );\n}\nsiteInit();`,
+      'var tpl = `<ul class="${cls}">${items.map((i) => `<li>${i}</li>`).join(\'\')}</ul>`;\n' + `${GA_LOADER}\n_gaq.push(['_trackPageview']);\nsiteInit();`,
+      // A ga.js loader written straight into the site's script: the script tag it inserts gets no src.
+      `var _gaq = _gaq || [];\n_gaq.push(['_setAccount', 'UA-1-1']);\nvar ga = document.createElement('script'); ga.async = true;\nga.src = ('https:' == document.location.protocol ? 'https://ssl' : 'http://www') + '.google-analytics.com/ga.js';\nvar s = document.getElementsByTagName('script')[0]; s.parentNode.insertBefore(ga, s);\nfunction siteInit(){ document.body.className += ' js'; }`,
+    ];
+    for (const code of cases) {
+      const $ = loadHtml(`<html><head></head><body><script>${code}</script></body></html>`);
+      assert.equal(cleanDocument($, { stripTracking: true }).trackersRemoved, 1, code);
+      const site = inlineScripts($).find((s) => s.includes('siteInit'));
+      assert.ok(site, code);
+      assert.doesNotMatch(site, /google-analytics\.com|googletagmanager\.com/, code);
+      assert.doesNotThrow(() => new Script(site), code);
+      assert.ok(stubbed($), code);
+    }
+  });
+
+  it('drops a script whole, as before, when a tracker it loads cannot be cut out', () => {
+    const $ = loadHtml(`<html><head></head><body><script>jQuery(function($){ $('.slider').slick(); $.getScript('https://www.google-analytics.com/analytics.js', function(){ ga('create', 'UA-1-1', 'auto'); ga('send', 'pageview'); }); });</script></body></html>`);
+    assert.equal(cleanDocument($, { stripTracking: true }).trackersRemoved, 1);
+    assert.deepEqual(inlineScripts($).filter((c) => !c.includes('hitCallback')), []);
+  });
+
+  it('leaves a site script that only links to a tracker host', () => {
+    const code = `document.getElementById('f').innerHTML = '<a href="https://statcounter.com/">stats</a>'; initMenu();`;
+    const $ = loadHtml(`<html><head></head><body><script>${code}</script></body></html>`);
+    assert.equal(cleanDocument($, { stripTracking: true }).trackersRemoved, 0);
+    assert.deepEqual(inlineScripts($), [code]);
+  });
+
   it('adds nothing when there is no tracker', () => {
     const $ = loadHtml(`<html><head><script>var a = 1;</script></head><body></body></html>`);
     cleanDocument($, { stripTracking: true });

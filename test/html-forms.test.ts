@@ -42,6 +42,31 @@ describe('forms the parser could not nest keep their controls (finding 28)', () 
     assert.match(out, /<input name="b" form="other">/);
   });
 
+  it('leaves controls the parser moved out of the form with no form, as browsers do', () => {
+    // Misnested formatting tags make the parser move the open block; a moved control loses the
+    // form the pointer gave it, and only the ones made after the move keep it.
+    const cases: Array<[string, string[]]> = [
+      [`<form action="/s"><font size=2><div align=center><input name=q><input type=submit></form></font></div>`, ['-', '-']],
+      [`<form action="/s"><a href=#><div><input name=q></form></a></div>`, ['-']],
+      [`<table><form action="/s"><tr><td><font><p>Email: <input name=email></font><input type=submit></td></tr></form></table>`, ['-', '/s']],
+      [`<table><form action="/s"><tr><td><b><button name=go>Go</b></button></td></tr></form></table>`, ['-']],
+      [`<table><form action="/s"><tr><td><b><i><div><input name=x></b><input name=y></div></td></tr></form></table>`, ['-', '/s']],
+      [`<table><form action="/s"><tr><td><font><p></font><input name=q></td></tr></form></table>`, ['/s']],
+      // The form moved along with its controls, so they keep it.
+      [`<font face=Arial><div align=center><table><form action="/f"><tr><td><input name=q></td></tr></table></font></div><input name=after>`, ['/f', '/f']],
+    ];
+    for (const [html, want] of cases) assert.deepEqual(owners(loadHtml(html).html()), want, html);
+  });
+
+  it('reads <script>, <title> and <template> in svg or math as markup', () => {
+    const cases: Array<[string, string[]]> = [
+      [`<table><form action="/z"><tr><td><svg><script>"</form>"</script></svg><input name=a></td></tr></table>`, ['-']],
+      [`<table><form action="/z"><tr><td><math><template></form></template></math><input name=a></td></tr></table>`, ['-']],
+      [`<table><form action="/z"><tr><td><div title="</form>"><input name=a></div title="</form>"><input name=b></td></tr></table>`, ['/z', '/z']],
+    ];
+    for (const [html, want] of cases) assert.deepEqual(owners(loadHtml(html).html()), want, html);
+  });
+
   it('does not reuse an id another element already has', () => {
     const out = loadHtml(`<div id="wbd-form-1"></div><table><form action="/s"><tr><td><input name=q></td></tr></table>`).html();
     assert.match(out, /<form action="\/s" id="wbd-form-2">/);

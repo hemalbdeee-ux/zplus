@@ -86,6 +86,35 @@ describe("the page's own structured data survives the SEO layer (finding 32)", (
       .find((s) => s.includes('"FAQPage"'));
     assert.equal(JSON.parse(faq!)['@context'], 'https://schema.org');
   });
+
+  it('keeps a Yoast FAQ page node, typed ["WebPage","FAQPage"], with its questions', () => {
+    const graph = {
+      '@context': 'https://schema.org',
+      '@graph': [
+        { '@type': 'WebSite', '@id': 'https://example.com/#website', url: 'https://example.com/' },
+        {
+          '@type': ['WebPage', 'FAQPage'],
+          '@id': 'https://example.com/faq/',
+          name: 'FAQ',
+          isPartOf: { '@id': 'https://example.com/#website' },
+          breadcrumb: { '@id': 'https://example.com/faq/#breadcrumb' },
+          mainEntity: [{ '@id': 'https://example.com/faq/#q1' }],
+        },
+        { '@type': 'BreadcrumbList', '@id': 'https://example.com/faq/#breadcrumb', itemListElement: [] },
+        { '@type': 'Question', '@id': 'https://example.com/faq/#q1', name: 'Can I freeze bread?', acceptedAnswer: { '@type': 'Answer', text: 'Yes.' } },
+      ],
+    };
+    const video = { '@context': 'https://schema.org', '@type': 'BlogPosting', headline: 'Shaping', video: { '@type': 'VideoObject', name: 'Shaping a boule' } };
+    const $ = loadHtml(`<html><head><title>FAQ</title><script type="application/ld+json">${JSON.stringify(graph)}</script>
+<script type="application/ld+json">${JSON.stringify(video)}</script></head><body><h1>FAQ</h1></body></html>`);
+    applySeo($, extractMeta($, new URL('http://example.com/faq/'), 'example.com'), SITE);
+    const blocks = $('script[type="application/ld+json"]').toArray().map((el) => JSON.parse($(el).html() ?? ''));
+    const faq = blocks[0]['@graph'];
+    assert.deepEqual(faq[0], { '@type': 'FAQPage', '@id': 'https://example.com/faq/', name: 'FAQ', mainEntity: [{ '@id': 'https://example.com/faq/#q1' }] });
+    assert.equal(faq[1]['@type'], 'Question');
+    assert.equal(faq.length, 2, 'WebSite and BreadcrumbList nodes go, and so do the references to them');
+    assert.deepEqual(blocks[1], { '@context': 'https://schema.org', '@type': 'VideoObject', name: 'Shaping a boule' });
+  });
 });
 
 describe('WordPress static pages are pages, not posts (finding 50)', () => {
