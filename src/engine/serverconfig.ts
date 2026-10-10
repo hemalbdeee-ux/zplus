@@ -47,19 +47,33 @@ function apacheRegex(path: string): string {
   return regexEscape(path.replace(/^\//, ''));
 }
 
-// Apache's config parser only treats a backslash specially before the quote character.
+// mod_rewrite splits its own arguments: a quote always ends a quoted argument (a backslash does not
+// escape it) and a raw newline ends the line, so one such byte in an archived path would make the
+// whole .htaccess invalid. Arguments never contain either: patterns spell them as \xHH escapes
+// (regexEscape) and targets percent-encode them (apacheUrl).
 function apacheQuoted(s: string): string {
-  return `"${s.replace(/"/g, '\\"')}"`;
+  return `"${s}"`;
 }
 
+/** A PCRE pattern matching s literally, with quotes and control characters as \xHH escapes. */
 function regexEscape(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/["\x00-\x1f\x7f]/g, (c) => '\\x' + c.charCodeAt(0).toString(16).padStart(2, '0'));
+}
+
+// Percent-encodes the bytes that cannot appear literally in a quoted mod_rewrite argument.
+function apacheUrl(s: string): string {
+  return s.replace(/["\x00-\x1f\x7f]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'));
 }
 
 function apacheTarget(to: string, dropQuery: boolean): string {
-  let t = to.replace(/\$/g, '\\$').replace(/%/g, '\\%');
+  let t = apacheUrl(to).replace(/\$/g, '\\$').replace(/%/g, '\\%');
   if (dropQuery && !to.includes('?')) t += '?';
   return t;
+}
+
+/** Internal rewrite target: Apache decodes it again, so % and # must be encoded. */
+function apacheFile(file: string): string {
+  return apacheTarget(encodeURI(file).replace(/[#?]/g, encodeURIComponent), false);
 }
 
 function isPermanent(status: number): boolean {
@@ -110,17 +124,25 @@ export function htaccess(r: ServerRules): string {
     out.push('# Original URLs with a query string. Internal rewrite: the URL stays exactly the same.');
     for (const x of queryRoutes) {
       out.push(`RewriteCond %{QUERY_STRING} ${apacheQuoted('^' + regexEscape(x.query!) + '$')}`);
-      out.push(`RewriteRule ${apacheQuoted('^' + apacheRegex(x.path) + '$')} ${apacheQuoted(x.file)} [L]`);
+      out.push(`RewriteRule ${apacheQuoted('^' + apacheRegex(x.path) + '$')} ${apacheQuoted(apacheFile(x.file))} [NS,L]`);
     }
   }
   if (pathRoutes.length) {
     out.push('');
     out.push('# Original URLs stored under another file name. Internal rewrite, the URL stays the same.');
-    for (const x of pathRoutes) out.push(`RewriteRule ${apacheQuoted('^' + apacheRegex(x.path) + '$')} ${apacheQuoted(x.file)} [L]`);
+    // NS: mod_dir looks up /folder/index.html with a subrequest, which must not pick up the route of
+    // the /folder/index.html URL when /folder/ is a different page.
+    for (const x of pathRoutes) out.push(`RewriteRule ${apacheQuoted('^' + apacheRegex(x.path) + '$')} ${apacheQuoted(apacheFile(x.file))} [NS,L]`);
   }
 
   out.push('');
   out.push('# Extensionless URLs: /about is served from about.html without a redirect.');
+  // $1 is decoded and Apache decodes the target again, so a path with % or # (/100%25-cotton,
+  // /tag/c%23) is rewritten from the still-encoded path of the request line instead.
+  out.push('RewriteCond %{REQUEST_FILENAME} !-f');
+  out.push('RewriteCond %{REQUEST_FILENAME}.html -f');
+  out.push('RewriteCond %{THE_REQUEST} ^\\S+\\s+(/[^?\\s]*)');
+  out.push('RewriteRule [%#] %1.html [L]');
   out.push('RewriteCond %{REQUEST_FILENAME} !-f');
   out.push('RewriteCond %{REQUEST_FILENAME}.html -f');
   out.push('RewriteRule ^(.+)$ $1.html [L]');
@@ -144,9 +166,17 @@ function nginxString(s: string): string {
 
 export function nginxConf(r: ServerRules): string {
   const id = r.domain.replace(/[^a-z0-9]/gi, '_');
+  // Plain map keys go into a hash that ignores case and only has room for keys of about 46 bytes, so
+  // /About.html would match the /about.html route and one long URL would stop nginx from loading.
+  // Regex keys are case-sensitive and have no length limit (nginx tries them in turn, about 0.05 µs
+  // each, which is fine for the few thousand rules of a restored site).
+  // Values may contain variables and nginx has no escape for "$", so a literal one is written as a
+  // variable that holds it (a geo value is not compiled).
+  const dollar = `wbd_${id}_dollar`;
+  const needsDollar = r.redirects.some((d) => d.to.includes('$')) || r.routes.some((x) => x.file.includes('$'));
   const map = (name: string, source: string, entries: Array<[string, string]>) => {
     const lines = [`map ${source} $wbd_${id}_${name} {`, '    default "";'];
-    for (const [k, v] of entries) lines.push(`    ${nginxString(k)} ${nginxString(v)};`);
+    for (const [k, v] of entries) lines.push(`    ${nginxString('~^' + regexEscape(k) + '$')} ${nginxString(v.replace(/\$/g, () => `\${${dollar}}`))};`);
     lines.push('}');
     return lines.join('\n');
   };
@@ -166,7 +196,7 @@ export function nginxConf(r: ServerRules): string {
 # (it must be included inside the http { } block), set "root" to the folder holding the site,
 # add your TLS settings, then run: nginx -t && systemctl reload nginx
 
-# Redirects the original site made ($uri: path only; $request_uri: path with query string).
+${needsDollar ? `geo $${dollar} { default "$"; }\n\n` : ''}# Redirects the original site made ($uri: path only; $request_uri: path with query string).
 ${map('r301', '$uri', pathRedirect(true))}
 ${map('r302', '$uri', pathRedirect(false))}
 ${map('q301', '$request_uri', queryRedirect(true))}
@@ -205,9 +235,17 @@ server {
 `;
 }
 
-/** Netlify and Cloudflare Pages. Neither can match an exact query string value. */
+/**
+ * Netlify. It cannot match an exact query string value. Cloudflare Pages reads the same file but is
+ * not a target: it answers every /page.html and /folder/index.html URL with a 308 redirect to /page
+ * and /folder/, a redirect the original site never made.
+ */
 export function netlifyRedirects(r: ServerRules): string {
-  const out = [`# Generated by Wayback Downloader for ${r.domain} (Netlify / Cloudflare Pages).`];
+  const out = [
+    `# Generated by Wayback Downloader for ${r.domain} (Netlify).`,
+    '# Not for Cloudflare Pages: it redirects every /page.html and /folder/index.html URL to /page and',
+    '# /folder/ (308), so those original URLs would not keep their address there.',
+  ];
   const pathRedirects = r.redirects.filter((d) => d.query === undefined);
   if (pathRedirects.length) {
     out.push('', '# Redirects the original site made');
@@ -228,7 +266,7 @@ export function netlifyRedirects(r: ServerRules): string {
 }
 
 export function netlifyHeaders(r: ServerRules): string {
-  const out = [`# Generated by Wayback Downloader for ${r.domain} (Netlify / Cloudflare Pages).`, '/__wbd/*', '  X-Robots-Tag: noindex'];
+  const out = [`# Generated by Wayback Downloader for ${r.domain} (Netlify).`, '/__wbd/*', '  X-Robots-Tag: noindex'];
   for (const t of r.types) out.push(`/${encodeURI(t.file)}`, `  Content-Type: ${t.contentType}`);
   return out.join('\n') + '\n';
 }

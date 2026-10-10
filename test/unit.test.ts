@@ -240,7 +240,7 @@ describe('server rules', () => {
       ],
       types: [],
     });
-    assert.match(text, /RewriteCond %\{QUERY_STRING\} "\^page=contact&x=1\$"\nRewriteRule "\^index\\\.php\$" "__wbd\/q\/abc\.html" \[L\]/);
+    assert.match(text, /RewriteCond %\{QUERY_STRING\} "\^page=contact&x=1\$"\nRewriteRule "\^index\\\.php\$" "__wbd\/q\/abc\.html" \[NS,L\]/);
     assert.match(text, /RewriteCond %\{QUERY_STRING\} \^\$\nRewriteRule "\^index\\\.php\$" "\/" \[R=301,NE,L\]/);
     assert.match(text, /RewriteRule "\^a b\\\.html\$" "\/x\\\$1" \[R=302,NE,L\]/);
   });

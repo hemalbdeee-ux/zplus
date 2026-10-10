@@ -167,7 +167,7 @@ describe('restore oldbakery.example', () => {
     assert.match(ht, /RewriteCond %\{QUERY_STRING\} "\^page=contact\$"/);
     assert.match(ht, /RewriteRule "\^old-page\\\.html\$" "\/about\.php" \[R=301,NE,L\]/);
     const nginx = await readFile(path.join(result.jobDir, 'server', 'nginx.conf'), 'utf8');
-    assert.match(nginx, /"\/index\.php\?page=contact" "\/__wbd\/q\/[0-9a-f]{12}\.html";/);
+    assert.match(nginx, /"~\^\/index\\\\\.php\\\\\?page=contact\$" "\/__wbd\/q\/[0-9a-f]{12}\.html";/);
     assert.match(nginx, /try_files \$uri \$uri\.html \$uri\/ =404;/);
     assert.match(await site('_redirects'), /\/old-page\.html {2}\/about\.php {2}301/);
   });
