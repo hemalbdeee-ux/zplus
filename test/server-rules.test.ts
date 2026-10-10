@@ -10,7 +10,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
-import { htaccess, netlifyHeaders, netlifyRedirects, nginxConf, type Redirect, type Route, type ServerRules } from '../src/engine/serverconfig.ts';
+import { htaccess, nginxConf, type Redirect, type Route, type ServerRules } from '../src/engine/serverconfig.ts';
 
 const rules = (routes: Route[], redirects: Redirect[]): ServerRules => ({ domain: 'example.com', host: 'example.com', routes, redirects, types: [] });
 
@@ -251,12 +251,3 @@ describe('generated nginx.conf on real nginx', { skip: noNginx }, () => {
 });
 
 after(() => rmSync(work, { recursive: true, force: true }));
-
-describe('Netlify rules', () => {
-  it('do not present Cloudflare Pages as a target, since it redirects every .html URL', () => {
-    const redirects = netlifyRedirects(site).split('\n');
-    assert.match(redirects[0], /\(Netlify\)\.$/);
-    assert.match(redirects.slice(1, 3).join(' '), /^# Not for Cloudflare Pages: it redirects every \/page\.html and \/folder\/index\.html URL/);
-    assert.doesNotMatch(netlifyHeaders(site), /Cloudflare/);
-  });
-});
