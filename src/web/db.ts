@@ -22,6 +22,8 @@ export interface Job {
   result: string | null;
   error: string | null;
   ip: string | null;
+  /** How many times a worker has started this job. */
+  attempts: number;
   created_at: number;
   updated_at: number;
   finished_at: number | null;
@@ -43,6 +45,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   result TEXT,
   error TEXT,
   ip TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   finished_at INTEGER
@@ -50,7 +53,12 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs (status, created_at);
 CREATE INDEX IF NOT EXISTS jobs_domain ON jobs (domain, kind, created_at);
 CREATE INDEX IF NOT EXISTS jobs_ip ON jobs (ip, created_at);
+CREATE TABLE IF NOT EXISTS code_failures (ip TEXT NOT NULL, at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS code_failures_ip ON code_failures (ip, at);
 `;
+
+/** A job is started at most this often; one that keeps crashing or hanging its worker is failed, not retried forever. */
+export const MAX_ATTEMPTS = 2;
 
 export class JobStore {
   readonly db: DatabaseSync;
@@ -59,6 +67,9 @@ export class JobStore {
     this.db = new DatabaseSync(file);
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
     this.db.exec(SCHEMA);
+    // CREATE TABLE IF NOT EXISTS leaves databases made before the attempts column as they were.
+    const columns = this.db.prepare('PRAGMA table_info(jobs)').all() as { name: string }[];
+    if (!columns.some((c) => c.name === 'attempts')) this.db.exec('ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
   }
 
   create(input: { kind: JobKind; domain: string; target?: string; maxPages?: number; parentId?: string; ip?: string }): Job {
@@ -76,12 +87,12 @@ export class JobStore {
     return this.db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as Job | undefined;
   }
 
-  /** Takes the oldest queued job and marks it running. */
+  /** Takes the oldest queued job, marks it running and counts the attempt. */
   claim(): Job | undefined {
     const now = Date.now();
     return this.db
       .prepare(
-        `UPDATE jobs SET status = 'running', updated_at = ?
+        `UPDATE jobs SET status = 'running', attempts = attempts + 1, updated_at = ?
          WHERE id = (SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1)
          RETURNING *`,
       )
@@ -109,9 +120,29 @@ export class JobStore {
     this.db.prepare(`UPDATE jobs SET status = 'failed', error = ?, updated_at = ?, finished_at = ? WHERE id = ?`).run(error, now, now, id);
   }
 
-  /** After a restart, running jobs go back to the queue; restores resume from their work folder. */
-  requeueRunning(): number {
-    return Number(this.db.prepare(`UPDATE jobs SET status = 'queued' WHERE status = 'running'`).run().changes);
+  /**
+   * A running job that stopped without a result goes back to the queue (restores resume from their
+   * work folder), unless it has used all its attempts: then the same crash would only happen again.
+   */
+  interrupted(id: string, reason: string): 'queued' | 'failed' {
+    const now = Date.now();
+    const failed = this.db
+      .prepare(`UPDATE jobs SET status = 'failed', error = ?, updated_at = ?, finished_at = ? WHERE id = ? AND status = 'running' AND attempts >= ?`)
+      .run(`Stopped after ${MAX_ATTEMPTS} attempts: ${reason}.`, now, now, id, MAX_ATTEMPTS).changes;
+    if (failed) return 'failed';
+    this.db.prepare(`UPDATE jobs SET status = 'queued', updated_at = ? WHERE id = ? AND status = 'running'`).run(now, id);
+    return 'queued';
+  }
+
+  /** After a restart, every job that was running counts as interrupted. */
+  requeueRunning(): { requeued: number; failed: number } {
+    const counts = { requeued: 0, failed: 0 };
+    const running = this.db.prepare(`SELECT id FROM jobs WHERE status = 'running'`).all() as { id: string }[];
+    for (const { id } of running) {
+      if (this.interrupted(id, 'the server restarted while it was running') === 'failed') counts.failed++;
+      else counts.requeued++;
+    }
+    return counts;
   }
 
   recentScan(domain: string, sinceMs: number): Job | undefined {
@@ -124,6 +155,18 @@ export class JobStore {
     const row = this.db
       .prepare(`SELECT COUNT(*) AS n FROM jobs WHERE ip = ? AND created_at > ? AND (? IS NULL OR kind = ?)`)
       .get(ip, Date.now() - sinceMs, kind ?? null, kind ?? null) as { n: number };
+    return Number(row.n);
+  }
+
+  /** Wrong access codes are counted per address, so the code cannot be guessed by trying many. */
+  recordCodeFailure(ip: string): void {
+    const now = Date.now();
+    this.db.prepare('DELETE FROM code_failures WHERE at < ?').run(now - 86_400_000);
+    this.db.prepare('INSERT INTO code_failures (ip, at) VALUES (?, ?)').run(ip, now);
+  }
+
+  codeFailures(ip: string, sinceMs: number): number {
+    const row = this.db.prepare('SELECT COUNT(*) AS n FROM code_failures WHERE ip = ? AND at > ?').get(ip, Date.now() - sinceMs) as { n: number };
     return Number(row.n);
   }
 

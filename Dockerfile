@@ -1,4 +1,5 @@
-# Wayback Downloader: web app + job worker in one container. Node runs the TypeScript directly.
+# Wayback Downloader: web app + job worker in one container (each job in its own child process).
+# Node runs the TypeScript directly.
 FROM node:22-alpine
 WORKDIR /app
 ENV NODE_ENV=production
