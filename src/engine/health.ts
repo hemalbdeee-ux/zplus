@@ -22,6 +22,8 @@ export interface PageSignals {
   fatal: string | null;
   /** A parked or dead phrase on a page that otherwise looks real ("make an offer"): costs points only. */
   hint?: string;
+  /** Distinct internal paths linked: a menu of pages, not a parking page's /search?q= ads. */
+  paths?: number;
   /** Where a stub homepage (internal meta refresh, frameset, "enter" page) sends visitors. */
   follow?: string;
 }
@@ -78,7 +80,7 @@ const DEAD_SOFT = [
   /\b(403 forbidden|404 not found|500 internal server error|service (temporarily )?unavailable)\b/,
 ];
 const SPAM = /\b(casino|slot gacor|slots?|judi|togel|poker online|viagra|cialis|levitra|replica watches|payday loans?|bandar|sbobet|gacor|maxwin|bokep|escort service|cbd oil)\b/gi;
-const JS_LOCATION = /(?:\blocation\.(?:href|replace|assign)|\b(?:window|document|top|self)\.location)\s*[=(]\s*['"]([^'"]+)['"]/i;
+const JS_LOCATION = /(?:\blocation\.(?:href|replace|assign)|\b(?:window|document|top|self)\.location)\s*[=(]\s*['"]([^'"]+)['"]/gi;
 
 export function analyzePage(html: string, pageUrl: string, domain: string): PageSignals {
   const $ = loadHtml(html);
@@ -136,9 +138,14 @@ export function analyzePage(html: string, pageUrl: string, domain: string): Page
     // Only script code counts, not onclick handlers, and only on a page without navigation: a real
     // page with a nav bar and a button to its Instagram is not a redirect.
     const scripts = words < 100 && internalLinks < 2 ? $('script:not([src])').map((_, el) => $(el).text()).get().join('\n') : '';
-    const jsUrl = JS_LOCATION.exec(scripts)?.[1];
-    const target = toUrl(refreshUrl ?? jsUrl ?? '', pageUrl);
-    if (target && (refreshUrl || jsUrl)) {
+    // Only a web address sends visitors anywhere: `location.href = 'mailto:' + user` hides an email
+    // address, and a page that does so is not a redirect.
+    const web = (href: string | undefined) => {
+      const u = href ? toUrl(href, pageUrl) : null;
+      return u && (u.protocol === 'http:' || u.protocol === 'https:') ? u : null;
+    };
+    const target = web(refreshUrl) ?? [...scripts.matchAll(JS_LOCATION)].map((x) => web(x[1])).find((u) => u) ?? null;
+    if (target) {
       if (!isInternal(target, domain)) fatal = `sends visitors to ${bareHost(target.hostname)}`;
       else if (urlKey(target) !== selfKey) follow = target.toString();
     }
@@ -149,13 +156,13 @@ export function analyzePage(html: string, pageUrl: string, domain: string): Page
     const frames = inside('frame[src]', 'src');
     const iframes = words < 50 ? inside('iframe[src]', 'src') : [];
     const ways = words < 50 ? [...new Map(inside('a[href], area[href]', 'href').map((x) => [urlKey(x.url), x])).values()] : [];
-    // A frame named "contents" is usually the table of contents, not the content.
-    const main = frames.find((f) => /main/i.test(f.name)) ?? frames.find((f) => /\b(content|body)\b/i.test(f.name)) ?? frames[frames.length - 1];
+    // A frame named "contents" is usually the table of contents, not the content, and "mainmenu" the menu.
+    const main = frames.find((f) => /main(?![-_.]?(menu|nav))/i.test(f.name)) ?? frames.find((f) => /\b(content|body)\b/i.test(f.name)) ?? frames[frames.length - 1];
     const pick = main ?? iframes[0] ?? (ways.length <= 3 ? ways[0] : undefined);
     follow = pick?.url.toString();
   }
   const spamHits = hay.match(SPAM)?.length ?? 0;
-  return { words, internalLinks, title, lang, spamHits, fatal, hint, follow };
+  return { words, internalLinks, title, lang, spamHits, fatal, hint, paths: paths.size, follow };
 }
 
 /** Spam words well above what the site itself used: a new owner. */
@@ -165,7 +172,7 @@ function spamTakeover(spamHits: number, baseSpam: number): boolean {
 
 export function scoreSignals(
   s: PageSignals,
-  ctx: { lengthRatio?: number; baseLang?: string; baseSpam?: number },
+  ctx: { lengthRatio?: number; baseLang?: string; baseSpam?: number; baseHint?: string },
 ): { score: number; verdict: Verdict; reasons: string[] } {
   if (s.fatal) return { score: 5, verdict: 'bad', reasons: [s.fatal] };
   const reasons: string[] = [];
@@ -192,8 +199,11 @@ export function scoreSignals(
     score -= 5;
     reasons.push('no title');
   }
-  if (s.hint) {
-    score -= 20;
+  // On a short page with a title and a menu the phrase alone leaves it good; a page without them
+  // looks more like a lander. Nothing when the site said it from the start (a restaurant whose
+  // online ordering stayed "coming soon").
+  if (s.hint && s.hint !== ctx.baseHint) {
+    score -= s.title && (s.paths ?? 0) >= 5 ? 10 : 20;
     reasons.push(s.hint);
   }
   if (ctx.lengthRatio !== undefined) {
@@ -326,27 +336,53 @@ export async function scanHealth(client: ArchiveClient, domain: string, opts: Sc
     return (m.length ?? 0) / refLength;
   };
 
+  // The archive plays the capture nearest in time, however far away it is. The page behind a stub
+  // counts only if it was captured near the stub, or while the same stub was the homepage: a later
+  // owner's one-link page must not borrow a page of the old site from years before.
+  const near = (a: string, b: string) => Math.abs(monthsBetween(a.slice(0, 6), b.slice(0, 6))) <= 12;
+  const sameTime = (m: MonthHealth, stub: { url: string; timestamp: string }, ts: string) =>
+    near(stub.timestamp, ts) || (stub.url === m.original && !!m.digest && captures.some((c) => c.digest === m.digest && near(c.timestamp, ts)));
+
   const probe = async (m: MonthHealth): Promise<void> => {
     if (m.probed || report.probes >= maxProbes) return;
     m.probed = true;
     report.probes++;
     let url = m.original!;
     let res = await client.fetchCapture(m.timestamp!, url);
+    // What visitors saw, and the URL it came from. Unset when that cannot be told.
     let signals: PageSignals | undefined;
+    let scoredAt: string | undefined;
+    // The last stub page on the way, and why the way ended without a page if it did.
+    let stub: { signals: PageSignals; url: string; timestamp: string } | undefined;
+    let failure = 'redirect could not be followed';
     const start = toUrl(url);
     const seen = new Set(start ? [urlKey(start)] : []);
     // Follow the site's own redirects (/ -> /blog -> /blog/) and stub pages to what visitors saw.
     for (let hop = 0; ; hop++) {
       let next: URL | null = null;
       let ts = m.timestamp!;
+      if (res.kind === 'missing') {
+        failure = `capture not playable (${res.reason})`;
+        break;
+      }
       if (res.kind === 'ok') {
-        signals = analyzePage(decodeText(res.body, res.contentType).text, url, domain);
-        scoredUrl.set(m.month, url);
-        next = signals.follow ? toUrl(signals.follow) : null;
+        if (stub && !sameTime(m, stub, res.timestamp)) {
+          failure = `the page it leads to is a capture from ${res.timestamp.slice(0, 4)}-${res.timestamp.slice(4, 6)}`;
+          break;
+        }
+        const s = analyzePage(decodeText(res.body, res.contentType).text, url, domain);
+        if (!s.follow) {
+          signals = s;
+          scoredAt = url;
+          break;
+        }
+        stub = { signals: s, url, timestamp: res.timestamp };
+        next = toUrl(s.follow);
         ts = res.timestamp;
-      } else if (res.kind === 'redirect') {
+      } else {
         next = toUrl(res.location, url);
         ts = res.timestamp;
+        // Not scoredAt: a redirect's digest is that of its body, the same wherever it points.
         if (next && !isInternal(next, domain)) {
           signals = { words: 0, internalLinks: 0, title: '', lang: '', spamHits: 0, fatal: `redirects to ${bareHost(next.hostname)}` };
           break;
@@ -357,13 +393,21 @@ export async function scanHealth(client: ArchiveClient, domain: string, opts: Sc
       url = next.toString();
       res = await client.fetchCapture(ts, url);
     }
+    // A stub whose page cannot be had says nothing about the site: scored on its own, an empty
+    // stub would be bad and vouch for every month with its digest. A real page with a slow refresh
+    // still stands by itself.
+    if (!signals && stub && scoreSignals(stub.signals, {}).verdict === 'good') {
+      signals = stub.signals;
+      scoredAt = stub.url;
+    }
     if (signals) {
       signalsByMonth.set(m.month, signals);
+      if (scoredAt) scoredUrl.set(m.month, scoredAt);
       return;
     }
     // Left unknown: estimated from the months around it later, like a month that was not probed.
     unplayable.add(m);
-    m.reasons = [res.kind === 'missing' ? `capture not playable (${res.reason})` : 'redirect could not be followed'];
+    m.reasons = [failure];
   };
 
   const rescore = () => {
@@ -372,13 +416,15 @@ export async function scanHealth(client: ArchiveClient, domain: string, opts: Sc
     const langs = early.map((s) => s.lang).filter(Boolean);
     const baseLang = langs.length ? langs.sort((a, b) => langs.filter((x) => x === b).length - langs.filter((x) => x === a).length)[0] : undefined;
     const baseSpam = early.length ? Math.min(...early.map((s) => s.spamHits)) : 0;
+    // A phrase every early capture shows is part of the site, like its base level of spam words.
+    const baseHint = early.length && early.every((s) => s.hint === early[0].hint) ? early[0].hint : undefined;
     const itself = probedInOrder.filter((m) => {
       const s = signalsByMonth.get(m.month)!;
       return m.statuscode === '200' && ownContent(m) && !s.fatal && !spamTakeover(s.spamHits, baseSpam) && (!baseLang || !s.lang || s.lang === baseLang);
     });
     refLength = percentile(itself.map((m) => m.length ?? 0), 0.75);
     for (const m of probedInOrder) {
-      const r = scoreSignals(signalsByMonth.get(m.month)!, { lengthRatio: lengthRatio(m), baseLang, baseSpam });
+      const r = scoreSignals(signalsByMonth.get(m.month)!, { lengthRatio: lengthRatio(m), baseLang, baseSpam, baseHint });
       m.score = r.score;
       m.verdict = r.verdict;
       m.reasons = r.reasons;
@@ -502,7 +548,8 @@ function inferUnprobed(
     if (same) {
       m.score = same.score;
       m.verdict = same.verdict;
-      m.reasons = [...note, `same content as ${same.month.slice(0, 4)}-${same.month.slice(4)}`];
+      // With its reasons: the window walk reads them to tell a parked page from an outage.
+      m.reasons = [...note, `same content as ${same.month.slice(0, 4)}-${same.month.slice(4)}`, ...same.reasons];
       continue;
     }
     let before: MonthHealth | undefined;
