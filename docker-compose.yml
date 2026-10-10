@@ -1,0 +1,33 @@
+# Wayback Downloader on a Hostinger VPS (Docker Manager), next to RigConfigurator.
+# Deploy: Docker Manager -> Compose -> "Compose from URL" with the raw URL of this file,
+# or on the VPS: cd wayback-downloader && docker compose up -d --build
+# Requires Traefik ("Deploy Traefik" in Docker Manager), like RigConfigurator.
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wayback-downloader
+    restart: unless-stopped
+    environment:
+      WBD_SITE_URL: https://${WBD_DOMAIN:-waybackdownloader.example}
+      WBD_ACCESS_CODE: ${WBD_ACCESS_CODE:-}
+      WBD_WORKERS: ${WBD_WORKERS:-1}
+      WBD_RETENTION_DAYS: ${WBD_RETENTION_DAYS:-7}
+    volumes:
+      - wbd-data:/data   # SQLite database and job files
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.wbd.rule=Host(`${WBD_DOMAIN:-waybackdownloader.example}`) || Host(`www.${WBD_DOMAIN:-waybackdownloader.example}`)"
+      - "traefik.http.routers.wbd.entrypoints=websecure"
+      - "traefik.http.routers.wbd.tls.certresolver=letsencrypt"
+      - "traefik.http.services.wbd.loadbalancer.server.port=8080"
+      # www -> non-www
+      - "traefik.http.middlewares.wbd-www.redirectregex.regex=^https://www\\.(.*)"
+      - "traefik.http.middlewares.wbd-www.redirectregex.replacement=https://$${1}"
+      - "traefik.http.middlewares.wbd-www.redirectregex.permanent=true"
+      - "traefik.http.routers.wbd.middlewares=wbd-www"
+
+volumes:
+  wbd-data:

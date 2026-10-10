@@ -1,0 +1,13 @@
+<section class="page-head">
+    <div class="wrap narrow">
+        {{#if tag}}<p class="eyebrow">Tag</p>{{/if}}{{#if author}}<p class="eyebrow">Author</p>{{/if}}
+        <h1>{{heading}}</h1>
+        {{#if intro}}<p class="lead">{{intro}}</p>{{/if}}
+    </div>
+</section>
+<section class="band">
+    <div class="wrap">
+        <div class="cards">{{#each posts}}{{> post-card}}{{/each}}</div>
+        {{> pagination}}
+    </div>
+</section>

@@ -1,0 +1,9 @@
+<form class="domain-form" method="post" action="/restore/">
+    <label for="domain">Domain of the old website</label>
+    <div class="domain-row">
+        <input id="domain" name="domain" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="oldsite.com" value="{{domain}}" required>
+        <button class="btn" type="submit">Check snapshots</button>
+    </div>
+    {{#if error}}<p class="form-error" role="alert">{{error}}</p>{{/if}}
+    <p class="form-note">Free: the snapshot check and a 4-page demo restore.</p>
+</form>

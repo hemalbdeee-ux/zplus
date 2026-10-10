@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="{{site.lang}}">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{title}}</title>
+    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="{{asset "style.css"}}">
+{{seo_head}}
+</head>
+<body class="{{bodyClass}}">
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-head">
+    <div class="wrap site-head-inner">
+        <a class="brand" href="/">{{> logo}}<span>{{site.siteName}}</span></a>
+        <nav class="site-nav" aria-label="Main">
+            {{#each site.navigation}}<a href="{{url}}">{{label}}</a>{{/each}}
+        </nav>
+        <a class="btn btn-small" href="/restore/">Restore a site</a>
+    </div>
+</header>
+
+<main id="main">
+{{{body}}}
+</main>
+
+<footer class="site-foot">
+    <div class="wrap site-foot-inner">
+        <p><a class="brand brand-small" href="/">{{> logo}}<span>{{site.siteName}}</span></a></p>
+        <nav aria-label="Footer">
+            {{#each site.secondaryNavigation}}<a href="{{url}}">{{label}}</a>{{/each}}
+            <a href="/rss/">RSS</a>
+        </nav>
+        <p class="muted">© {{site.year}} {{site.siteName}}. Not affiliated with the Internet Archive.</p>
+    </div>
+</footer>
+<script src="{{asset "app.js"}}" defer></script>
+</body>
+</html>

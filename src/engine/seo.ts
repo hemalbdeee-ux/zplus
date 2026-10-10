@@ -92,6 +92,50 @@ export function buildJsonLd(meta: PageMeta, site: SiteContext): Record<string, u
   return out;
 }
 
+/** The seo-head block (what Ghost's {{ghost_head}} prints), as HTML lines. */
+export function seoHead(meta: PageMeta, site: SiteContext, opts: { rssLink?: boolean; indent?: string } = {}): string {
+  const indent = opts.indent ?? '    ';
+  const url = canonicalFor(meta, site);
+  const isArticle = meta.type === 'post';
+  const image = meta.image ? absolute(site.siteUrl, meta.image) : undefined;
+  // Like Ghost: the homepage is shared under the site title, everything else under its own headline.
+  const title = (meta.type === 'home' ? meta.title : meta.headline) || meta.title || site.siteName;
+  const lines: string[] = [];
+  const add = (s: string) => lines.push(s ? indent + s : '');
+
+  if (meta.description) add(`<meta name="description" content="${esc(meta.description)}">`);
+  if (meta.noindex) add('<meta name="robots" content="noindex">');
+  add(`<link rel="canonical" href="${esc(url)}">`);
+  add(`<meta name="referrer" content="no-referrer-when-downgrade">`);
+  add('');
+  add(`<meta property="og:site_name" content="${esc(site.siteName)}">`);
+  add(`<meta property="og:type" content="${isArticle ? 'article' : 'website'}">`);
+  add(`<meta property="og:title" content="${esc(title)}">`);
+  if (meta.description) add(`<meta property="og:description" content="${esc(meta.description)}">`);
+  add(`<meta property="og:url" content="${esc(url)}">`);
+  if (image) add(`<meta property="og:image" content="${esc(image)}">`);
+  if (isArticle && meta.publishedAt) add(`<meta property="article:published_time" content="${meta.publishedAt}">`);
+  if (isArticle && (meta.modifiedAt || meta.publishedAt)) add(`<meta property="article:modified_time" content="${meta.modifiedAt ?? meta.publishedAt}">`);
+  if (isArticle) for (const t of meta.tags) add(`<meta property="article:tag" content="${esc(t)}">`);
+  add('');
+  add(`<meta name="twitter:card" content="${image ? 'summary_large_image' : 'summary'}">`);
+  add(`<meta name="twitter:title" content="${esc(title)}">`);
+  if (meta.description) add(`<meta name="twitter:description" content="${esc(meta.description)}">`);
+  add(`<meta name="twitter:url" content="${esc(url)}">`);
+  if (image) add(`<meta name="twitter:image" content="${esc(image)}">`);
+  if (!meta.noindex) {
+    add('');
+    for (const block of buildJsonLd(meta, site)) {
+      add(`<script type="application/ld+json">\n${jsonLd(block)}\n${indent}</script>`);
+    }
+  }
+  if (site.rssPath && (opts.rssLink ?? true)) {
+    add('');
+    add(`<link rel="alternate" type="application/rss+xml" title="${esc(site.siteName)}" href="${esc(absolute(site.siteUrl, site.rssPath))}">`);
+  }
+  return lines.join('\n');
+}
+
 const REMOVE = [
   'link[rel="canonical"]',
   'meta[property^="og:"]',
@@ -124,41 +168,7 @@ export function applySeo($: Doc, meta: PageMeta, site: SiteContext): void {
   if (!$('head').length) $('html').prepend('<head></head>');
   $('head').prepend('<meta charset="utf-8">\n');
 
-  const url = canonicalFor(meta, site);
-  const isArticle = meta.type === 'post';
-  const image = meta.image ? absolute(site.siteUrl, meta.image) : undefined;
-  // Like Ghost: the homepage is shared under the site title, everything else under its own headline.
-  const title = (meta.type === 'home' ? meta.title : meta.headline) || meta.title || site.siteName;
-  const lines: string[] = [];
-  const add = (s: string) => lines.push('    ' + s);
-
-  if (meta.description) add(`<meta name="description" content="${esc(meta.description)}">`);
-  add(`<link rel="canonical" href="${esc(url)}">`);
-  add(`<meta name="referrer" content="no-referrer-when-downgrade">`);
-  add('');
-  add(`<meta property="og:site_name" content="${esc(site.siteName)}">`);
-  add(`<meta property="og:type" content="${isArticle ? 'article' : 'website'}">`);
-  add(`<meta property="og:title" content="${esc(title)}">`);
-  if (meta.description) add(`<meta property="og:description" content="${esc(meta.description)}">`);
-  add(`<meta property="og:url" content="${esc(url)}">`);
-  if (image) add(`<meta property="og:image" content="${esc(image)}">`);
-  if (isArticle && meta.publishedAt) add(`<meta property="article:published_time" content="${meta.publishedAt}">`);
-  if (isArticle && (meta.modifiedAt || meta.publishedAt)) add(`<meta property="article:modified_time" content="${meta.modifiedAt ?? meta.publishedAt}">`);
-  if (isArticle) for (const t of meta.tags) add(`<meta property="article:tag" content="${esc(t)}">`);
-  add('');
-  add(`<meta name="twitter:card" content="${image ? 'summary_large_image' : 'summary'}">`);
-  add(`<meta name="twitter:title" content="${esc(title)}">`);
-  if (meta.description) add(`<meta name="twitter:description" content="${esc(meta.description)}">`);
-  add(`<meta name="twitter:url" content="${esc(url)}">`);
-  if (image) add(`<meta name="twitter:image" content="${esc(image)}">`);
-  add('');
-  for (const block of buildJsonLd(meta, site)) {
-    add(`<script type="application/ld+json">\n${jsonLd(block)}\n    </script>`);
-  }
-  if (site.rssPath && !$('link[rel="alternate"][type="application/rss+xml"]').length) {
-    add('');
-    add(`<link rel="alternate" type="application/rss+xml" title="${esc(site.siteName)}" href="${esc(absolute(site.siteUrl, site.rssPath))}">`);
-  }
-
-  $('head').append(`\n    <!-- seo-head -->\n${lines.join('\n')}\n    <!-- /seo-head -->\n`);
+  // The page keeps its own robots meta, so the block does not add another one.
+  const block = seoHead({ ...meta, noindex: false }, site, { rssLink: !$('link[rel="alternate"][type="application/rss+xml"]').length });
+  $('head').append(`\n    <!-- seo-head -->\n${block}\n    <!-- /seo-head -->\n`);
 }

@@ -1,0 +1,80 @@
+<section class="hero">
+    <div class="wrap hero-inner">
+        <div class="hero-copy">
+            <p class="eyebrow">Wayback Machine restore</p>
+            <h1>Bring an expired website back with every URL exactly where it was.</h1>
+            <p class="lead">We find the last snapshot in which the site was really itself, skip the parking pages that came after, and rebuild it as fast static HTML. On top goes the SEO layer Ghost uses: canonical tags, structured data, sitemaps and RSS.</p>
+            {{> restore-form}}
+        </div>
+        <figure class="hero-card">
+            <figcaption><span class="mono">oldbakery.example</span><span class="muted">Example · one square per month</span></figcaption>
+            {{> timeline rows=sample}}
+            <p class="pickline">Last good snapshot <span class="mono">20201114083015</span></p>
+        </figure>
+    </div>
+</section>
+
+<section class="band" id="how-it-works">
+    <div class="wrap">
+        <h2>How it works</h2>
+        <ol class="steps">
+            <li><h3>Check the snapshots</h3><p>We score the homepage month by month. Parking pages, suspended hosting, default server pages and spam from a later owner are marked, so you can see when the site was healthy.</p></li>
+            <li><h3>Pick a date</h3><p>The last good snapshot is chosen for you. You can pick any other healthy month. Pages are only taken from the period in which the site was itself.</p></li>
+            <li><h3>Restore</h3><p>Every archived page, image, stylesheet and script is downloaded, cleaned of Wayback leftovers and the old owner's tracking code, and converted to UTF-8.</p></li>
+            <li><h3>Upload</h3><p>You get a ZIP with the site, an <code>.htaccess</code> for Apache and LiteSpeed, an nginx config and a report. Upload it to any hosting.</p></li>
+        </ol>
+    </div>
+</section>
+
+<section class="band band-alt">
+    <div class="wrap split">
+        <div>
+            <h2>The URLs do not change. Not one.</h2>
+            <p>An expired domain is worth its backlinks, and backlinks point at exact addresses. So <code>/about.php</code> stays <code>/about.php</code>, query-string pages keep their query string, and a URL without a trailing slash still has none. Static hosting cannot serve some of these by itself, so the included server rules map them to stored files internally. The address in the browser and in Google stays the same.</p>
+            <p>The only redirects are the ones the original site made, as the archive recorded them.</p>
+        </div>
+        <div class="tbl">
+            <table>
+                <thead><tr><th>Original URL</th><th>After restore</th></tr></thead>
+                <tbody>
+                    <tr><td class="mono">/about.php</td><td><span class="pill good">200</span> same URL</td></tr>
+                    <tr><td class="mono">/index.php?page=contact</td><td><span class="pill good">200</span> same URL</td></tr>
+                    <tr><td class="mono">/blog/2019/05/rye-bread</td><td><span class="pill good">200</span> no slash added</td></tr>
+                    <tr><td class="mono">/?p=123</td><td><span class="pill good">200</span> same URL</td></tr>
+                    <tr><td class="mono">/style.css?ver=1.2</td><td><span class="pill good">200</span> same URL</td></tr>
+                    <tr><td class="mono">/old-page.html</td><td><span class="pill acc">301</span> as in 2018</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</section>
+
+<section class="band">
+    <div class="wrap">
+        <h2>What you get</h2>
+        <ul class="features">
+            <li><h3>The site as it was</h3><p>The healthy version of every page, with its own HTML, images, CSS and JavaScript. The original doctype is kept, so old layouts render the way they did.</p></li>
+            <li><h3>The SEO layer Ghost uses</h3><p>Each page gets canonical, description, Open Graph, Twitter card and JSON-LD in one block before <code>&lt;/head&gt;</code>, like Ghost's <code>ghost_head</code>.</p></li>
+            <li><h3>Sitemaps, RSS, robots.txt</h3><p>A sitemap index with pages, posts, tags and authors, an RSS feed of the blog posts, a clean robots.txt and a 404 page.</p></li>
+            <li><h3>Server rules included</h3><p><code>.htaccess</code> for Apache and LiteSpeed, a config for nginx, and <code>_redirects</code> for Netlify and Cloudflare Pages.</p></li>
+            <li><h3>No old tracking</h3><p>The previous owner's Analytics, AdSense and pixel scripts are removed, so your traffic is not reported to them.</p></li>
+            <li><h3>A clear report</h3><p>Which snapshot was used and why, how many pages came back, and which files the archive never had.</p></li>
+        </ul>
+    </div>
+</section>
+
+{{#if posts.length}}
+<section class="band band-alt">
+    <div class="wrap">
+        <div class="band-head"><h2>Guides</h2><a href="/blog/">All guides</a></div>
+        <div class="cards">{{#each posts}}{{> post-card}}{{/each}}</div>
+    </div>
+</section>
+{{/if}}
+
+<section class="band">
+    <div class="wrap narrow center-form">
+        <h2>Check a domain now</h2>
+        {{> restore-form error=null}}
+    </div>
+</section>

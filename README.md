@@ -15,6 +15,44 @@ npm test                                         # unit + end-to-end tests again
 
 Requires Node.js 22.18 or newer (TypeScript runs natively, there is no build step).
 
+## Web app
+
+```
+npm start                 # http://localhost:8080 against the real web.archive.org
+npm run demo              # same UI against the local fake archive (try oldbakery.example, access code "demo")
+```
+
+Served the way Ghost serves a site: server-rendered Handlebars templates (`src/web/theme/`, with
+`default.hbs` as the layout and `{{seo_head}}` in place of `{{ghost_head}}`), posts and pages as
+Markdown in `content/`, clean `/slug/` URLs with a trailing slash, `/tag/<slug>/`, `/author/<slug>/`,
+`/blog/page/2/`, `/rss/`, a sitemap index and `robots.txt`.
+
+The app flow: `/restore/` (domain) -> `/job/<id>/` health timeline and snapshot choice -> a restore
+job with live progress -> ZIP download and report. App pages are `noindex`. Jobs are stored in SQLite
+(`node:sqlite`, no native module) and run by an in-process worker; after a restart, interrupted jobs
+are requeued and resume from their work folder. Finished jobs are deleted after
+`WBD_RETENTION_DAYS`.
+
+Demo restores (4 pages) are free. A full restore needs `WBD_ACCESS_CODE` until payments are added.
+Each IP may start `WBD_SCAN_LIMIT` scans per hour and `WBD_RESTORE_LIMIT` restores per day; a domain
+scanned in the last 12 hours reuses that scan.
+
+| Variable | Default | |
+| --- | --- | --- |
+| `PORT` | `8080` | |
+| `WBD_SITE_URL` | `http://localhost:8080` | used in canonicals, sitemaps, RSS |
+| `WBD_DATA` | `./data` | SQLite file and job folders |
+| `WBD_ACCESS_CODE` | empty | code for full restores; empty = demos only |
+| `WBD_WORKERS` | `1` | jobs at the same time; keep it low for archive.org |
+| `WBD_RETENTION_DAYS` | `7` | |
+| `WBD_ARCHIVE` | `https://web.archive.org` | |
+
+## Deploy
+
+`docker-compose.yml` follows the RigConfigurator setup on the Hostinger VPS: one container behind
+Traefik (`WBD_DOMAIN`), data in the `wbd-data` volume. Copy `.env.example` to `.env`, set the domain
+and the access code, then `docker compose up -d --build` in this folder.
+
 ## How a restore works
 
 1. **Health scan**: the homepage captures are grouped by month and scored 0 to 100. Parking pages
@@ -78,6 +116,14 @@ src/engine/seo.ts          the seo-head block and JSON-LD
 src/engine/sitemap.ts      sitemaps, RSS, robots.txt
 src/engine/serverconfig.ts .htaccess, nginx.conf, _redirects, _headers
 src/engine/serve.ts        preview server
+src/web/server.ts          web app (Express): public site, app routes, sitemaps, RSS
+src/web/views.ts           Handlebars theme engine and helpers
+src/web/theme/             templates, partials, CSS, JS
+src/web/content.ts         Markdown posts and pages with front matter
+src/web/db.ts              SQLite job store (also the queue)
+src/web/worker.ts          background job runner and cleanup
+content/                   settings, authors, tags, posts, pages
 test/fake-archive.ts       local stand-in for web.archive.org
 test/fixtures/oldbakery.ts a site that was good 2015-2020 and parked from 2021
+test/demo-server.ts        the web app against the fake archive
 ```

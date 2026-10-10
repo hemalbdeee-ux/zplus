@@ -34,6 +34,8 @@ export interface RestoreOptions {
   orphans?: boolean;
   stripTracking?: boolean;
   skipHealth?: boolean;
+  /** A health scan made earlier (the web app scans first, then restores). */
+  health?: HealthReport;
   zip?: boolean;
   archive?: ArchiveOptions;
   onEvent?: (e: RestoreEvent) => void;
@@ -56,8 +58,8 @@ export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
   await mkdir(workDir, { recursive: true });
   const warnings: string[] = [];
 
-  let health: HealthReport | undefined;
-  if (!opts.skipHealth) {
+  let health: HealthReport | undefined = opts.health;
+  if (!health && !opts.skipHealth) {
     emit('health', `checking how ${domain} looked over the years`);
     health = await scanHealth(client, domain, { log: (m) => emit('health', m) });
     await writeFile(path.join(workDir, 'health.json'), JSON.stringify(health, null, 1));

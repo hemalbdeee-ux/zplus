@@ -1,0 +1,5 @@
+[
+  { "slug": "guides", "name": "Guides", "description": "Step-by-step guides for restoring websites from the Wayback Machine." },
+  { "slug": "expired-domains", "name": "Expired domains", "description": "Buying, checking and rebuilding expired domains without losing their backlinks." },
+  { "slug": "seo", "name": "SEO", "description": "What search engines need from a restored website." }
+]

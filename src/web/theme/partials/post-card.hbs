@@ -1,0 +1,5 @@
+<article class="card">
+    <p class="card-meta">{{#if tags.[0]}}<a href="/tag/{{tags.[0].slug}}/">{{tags.[0].name}}</a> · {{/if}}<time datetime="{{this.date}}">{{date this.date}}</time></p>
+    <h3 class="card-title"><a href="/{{slug}}/">{{title}}</a></h3>
+    <p class="card-excerpt">{{excerpt}}</p>
+</article>

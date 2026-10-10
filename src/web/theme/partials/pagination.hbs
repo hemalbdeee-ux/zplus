@@ -1,0 +1,7 @@
+{{#if (or pagination.prevUrl pagination.nextUrl)}}
+<nav class="pagination" aria-label="Pages">
+    {{#if pagination.prevUrl}}<a class="btn btn-ghost" href="{{pagination.prevUrl}}" rel="prev">Newer</a>{{else}}<span></span>{{/if}}
+    <span class="muted">Page {{pagination.page}} of {{pagination.pages}}</span>
+    {{#if pagination.nextUrl}}<a class="btn btn-ghost" href="{{pagination.nextUrl}}" rel="next">Older</a>{{else}}<span></span>{{/if}}
+</nav>
+{{/if}}

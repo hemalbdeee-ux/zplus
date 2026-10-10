@@ -1,0 +1,107 @@
+<section class="page-head page-head-tight">
+    <div class="wrap">
+        <p class="eyebrow">{{#if job.isScan}}Snapshot check{{else}}{{#if job.demo}}Demo restore{{else}}Full restore{{/if}}{{/if}}</p>
+        <h1 class="domain-title">{{job.domain}}</h1>
+    </div>
+</section>
+
+<section class="band band-tight" data-job="{{job.id}}" data-status="{{job.status}}">
+    <div class="wrap">
+
+    {{#if job.active}}
+        <div class="status-card" aria-live="polite">
+            <div class="spinner" aria-hidden="true"></div>
+            <div class="status-text">
+                <h2>{{#if job.isScan}}Checking the archive{{else}}Restoring the site{{/if}}</h2>
+                <p data-field="position">{{#if job.position}}Waiting in line, position {{job.position}}.{{/if}}</p>
+                <p class="mono status-message" data-field="message">{{job.message}}</p>
+                {{#unless job.isScan}}<p data-field="counts">{{number job.done}} URLs done, {{number job.queued}} waiting</p>{{/unless}}
+                <p class="muted">We pause between requests so archive.org does not block us. A snapshot check takes about a minute; a large site can take hours. You can close this page and open the same link later.</p>
+            </div>
+        </div>
+    {{/if}}
+
+    {{#if (eq job.status "failed")}}
+        <div class="notice notice-bad" role="alert">
+            <h2>This did not work</h2>
+            <p>{{job.error}}</p>
+            <p>{{#if job.parentId}}<a href="/job/{{job.parentId}}/">Back to the snapshots</a>{{else}}<a href="/restore/">Try another domain</a>{{/if}}</p>
+        </div>
+    {{/if}}
+
+    {{#if (eq job.status "done")}}
+        {{#if job.isScan}}
+            {{#if job.health.months.length}}
+            <div class="split split-job">
+                <div class="panel">
+                    <h2>Homepage health by month</h2>
+                    {{> timeline rows=job.rows}}
+                    {{#if job.health.lastGood}}
+                    <p>Last good snapshot: <b class="mono">{{job.health.lastGood.timestamp}}</b> (score {{job.health.lastGood.score}}/100).
+                    Pages are taken from {{#if job.health.window.from}}<b>{{ts job.health.window.from}}</b>{{else}}the first capture{{/if}} to {{#if job.health.window.to}}<b>{{ts job.health.window.to}}</b>{{else}}the last capture{{/if}}. Host: <span class="mono">{{job.health.host}}</span>.</p>
+                    {{/if}}
+                </div>
+                <div class="panel panel-form">
+                    {{#if job.choices.length}}
+                    <h2>Restore</h2>
+                    <form class="stack" method="post" action="/job/{{job.id}}/restore">
+                        <label for="target">Snapshot</label>
+                        <select id="target" name="target">
+                            {{#each job.choices}}<option value="{{timestamp}}"{{#if selected}} selected{{/if}}>{{ts timestamp}} · score {{score}}{{#if selected}} · last good{{/if}}</option>{{/each}}
+                        </select>
+                        <fieldset>
+                            <legend>What to restore</legend>
+                            <label class="radio"><input type="radio" name="mode" value="demo" checked> <span><b>Demo</b>: the homepage and 3 more pages, free</span></label>
+                            {{#if job.accessEnabled}}
+                            <label class="radio"><input type="radio" name="mode" value="full"> <span><b>Full site</b>: up to 20,000 URLs</span></label>
+                            <label for="code">Access code for a full restore</label>
+                            <input id="code" name="code" type="password" autocomplete="off">
+                            {{/if}}
+                        </fieldset>
+                        {{#if formError}}<p class="form-error" role="alert">{{formError}}</p>{{/if}}
+                        <button class="btn" type="submit">Restore this snapshot</button>
+                    </form>
+                    {{else}}
+                    <div class="notice notice-bad"><h2>No healthy snapshot</h2><p>None of the archived homepages looks like a real website: they are parking pages, errors or spam. There is nothing worth restoring.</p></div>
+                    {{/if}}
+                </div>
+            </div>
+            {{#if job.probed.length}}
+            <details class="probes">
+                <summary>What we checked ({{job.probed.length}} homepage captures)</summary>
+                <div class="tbl"><table>
+                    <thead><tr><th>Month</th><th>Score</th><th>Result</th><th>Why</th></tr></thead>
+                    <tbody>{{#each job.probed}}<tr><td class="mono">{{ts timestamp}}</td><td>{{score}}</td><td><span class="pill {{verdict}}">{{verdict}}</span></td><td>{{#each reasons}}{{this}}{{#unless @last}}; {{/unless}}{{/each}}</td></tr>{{/each}}</tbody>
+                </table></div>
+            </details>
+            {{/if}}
+            {{else}}
+            <div class="notice notice-bad"><h2>Not in the archive</h2><p>The Wayback Machine has no captures of {{job.domain}}. Check the spelling, or try the domain with or without "www".</p><p><a href="/restore/">Try another domain</a></p></div>
+            {{/if}}
+        {{else}}
+            <div class="result">
+                <h2>The site is ready</h2>
+                <p>Restored from the snapshot of <b>{{ts job.report.target}}</b> for <span class="mono">{{job.report.siteUrl}}</span>. Every original URL works at the same address.</p>
+                <dl class="stats">
+                    <div><dt>Pages</dt><dd>{{number job.report.counts.pages}}</dd></div>
+                    <div><dt>Blog posts</dt><dd>{{number job.report.counts.posts}}</dd></div>
+                    <div><dt>Files</dt><dd>{{number job.report.counts.files}}</dd><dd class="muted">{{mb job.report.counts.bytes}}</dd></div>
+                    <div><dt>Original redirects</dt><dd>{{number job.report.counts.redirects}}</dd></div>
+                    <div><dt>Odd URLs kept</dt><dd>{{number job.report.counts.rewrites}}</dd></div>
+                    <div><dt>Not in the archive</dt><dd>{{number job.report.counts.missing}}</dd></div>
+                </dl>
+                <p class="actions">{{#if job.hasZip}}<a class="btn" href="/job/{{job.id}}/download">Download ZIP</a>{{/if}} <a class="btn btn-ghost" href="/job/{{job.id}}/report">Open the report</a></p>
+                {{#if job.demo}}<p class="notice">This demo contains the homepage and the first pages it links to. A full restore downloads every archived URL of the healthy period.</p>{{/if}}
+                {{#each job.report.warnings}}<p class="notice">{{this}}</p>{{/each}}
+                <h3>Put it online</h3>
+                <ol class="howto">
+                    <li>Unzip the file. The <code>site</code> folder is the website.</li>
+                    <li>Upload the contents of <code>site</code>, including the hidden <code>.htaccess</code>, to your web root (for example <code>public_html</code>).</li>
+                    <li>On nginx, use <code>server/nginx.conf</code> instead of <code>.htaccess</code>.</li>
+                    <li>Point the domain at the hosting, then open a few old URLs from the report to check them.</li>
+                </ol>
+            </div>
+        {{/if}}
+    {{/if}}
+    </div>
+</section>

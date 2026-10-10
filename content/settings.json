@@ -1,0 +1,15 @@
+{
+  "title": "Wayback Downloader",
+  "description": "Restore an expired website from the Wayback Machine with every original URL intact, as fast static HTML with sitemaps, structured data and RSS.",
+  "lang": "en",
+  "navigation": [
+    { "label": "How it works", "url": "/#how-it-works" },
+    { "label": "FAQ", "url": "/faq/" },
+    { "label": "Guides", "url": "/blog/" }
+  ],
+  "secondaryNavigation": [
+    { "label": "FAQ", "url": "/faq/" },
+    { "label": "Guides", "url": "/blog/" },
+    { "label": "Terms", "url": "/terms/" }
+  ]
+}

@@ -1,0 +1,24 @@
+<article class="article">
+    <header class="wrap narrow article-head">
+        <p class="eyebrow">{{#each entry.tags}}<a href="/tag/{{slug}}/">{{name}}</a>{{#unless @last}} · {{/unless}}{{/each}}</p>
+        <h1>{{entry.title}}</h1>
+        <p class="byline">{{#if entry.author}}<a href="/author/{{entry.author.slug}}/">{{entry.author.name}}</a> · {{/if}}<time datetime="{{entry.date}}">{{date entry.date}}</time>{{#if entry.updated}} · updated <time datetime="{{entry.updated}}">{{date entry.updated}}</time>{{/if}}</p>
+    </header>
+    <div class="wrap narrow prose">
+        {{{entry.html}}}
+    </div>
+</article>
+<section class="band band-alt">
+    <div class="wrap narrow center-form">
+        <h2>Check a domain</h2>
+        {{> restore-form domain="" error=null}}
+    </div>
+</section>
+{{#if related.length}}
+<section class="band">
+    <div class="wrap">
+        <h2>More guides</h2>
+        <div class="cards">{{#each related}}{{> post-card}}{{/each}}</div>
+    </div>
+</section>
+{{/if}}

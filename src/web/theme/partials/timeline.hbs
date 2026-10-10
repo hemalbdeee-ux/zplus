@@ -1,0 +1,11 @@
+<div class="tl-scroll">
+<table class="tl">
+    <thead><tr><th scope="col"><span class="sr">Year</span></th><th>J</th><th>F</th><th>M</th><th>A</th><th>M</th><th>J</th><th>J</th><th>A</th><th>S</th><th>O</th><th>N</th><th>D</th></tr></thead>
+    <tbody>
+    {{#each rows}}
+        <tr><th scope="row">{{year}}</th>{{#each cells}}<td class="{{cls}}{{#if pick}} pick{{/if}}" title="{{title}}"><span class="sr">{{title}}</span></td>{{/each}}</tr>
+    {{/each}}
+    </tbody>
+</table>
+</div>
+<p class="legend"><span><i class="good"></i>Real site</span><span><i class="weak"></i>Thin or unclear</span><span><i class="bad"></i>Parked, down or taken over</span><span><i class="none"></i>No capture</span><span><i class="pick-key"></i>Chosen snapshot</span></p>
