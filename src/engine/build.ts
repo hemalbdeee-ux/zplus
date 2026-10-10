@@ -11,7 +11,7 @@
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { decodeText } from './charset.ts';
+import { decodeText, isValidUtf8 } from './charset.ts';
 import { cleanDocument, stripWaybackMarkup } from './clean.ts';
 import { isHtmlType, type Manifest, type Resource } from './crawl.ts';
 import { loadHtml, rewriteCss, visitUrls } from './html.ts';
@@ -29,7 +29,18 @@ import {
   type TypeOverride,
 } from './serverconfig.ts';
 import { robotsTxt, rssFeed, sitemaps, sitemapXsl, type SitemapEntry } from './sitemap.ts';
-import { cleanSearch, decodePath, isInternal, makeRootRelative, pathAndQuery, toUrl, tsToIso, unwrapWayback, unwrapWaybackInText } from './url.ts';
+import {
+  cleanSearch,
+  decodePath,
+  hasNonUtf8Escapes,
+  isInternal,
+  makeRootRelative,
+  pathAndQuery,
+  toUrl,
+  tsToIso,
+  unwrapWayback,
+  unwrapWaybackInText,
+} from './url.ts';
 
 export interface BuildOptions {
   domain: string;
@@ -71,11 +82,17 @@ interface Plan {
   file: string;
   /** Another resource with identical bytes already writes this file. */
   shared?: boolean;
+  /** Same bytes as this plan under a name differing only in letter case: gets a copy of its output. */
+  sameAs?: Plan;
   route?: Route;
 }
 
 const HTML_EXT = new Set(['.html', '.htm', '.xhtml']);
 const SERVER_EXT = new Set(HTML_LIKE_EXT.map((e) => '.' + e));
+// Extensions every server sends as text/html. Servers send .xhtml as application/xhtml+xml, but
+// the rewritten page is HTML, not XML: it is stored as page.xhtml.html, which the extensionless-URL
+// rule serves as text/html.
+const TEXT_HTML_EXT = new Set(['.html', '.htm', ...SERVER_EXT]);
 
 const EXT_MIME: Record<string, string> = {
   '.jpg': 'image/jpeg',
@@ -179,8 +196,39 @@ function plainFile(decoded: string, kind: Kind, ext: string, contentType: string
     if (kind === 'xml') return rel + 'index.xml';
     return null;
   }
-  if (kind === 'html') return HTML_EXT.has(ext) || SERVER_EXT.has(ext) ? rel : rel + '.html';
+  if (kind === 'html') return TEXT_HTML_EXT.has(ext) ? rel : rel + '.html';
   return extFits(ext, kind, contentType) ? rel : null;
+}
+
+/** Apache and nginx merge repeated slashes before they look at a path: //a/b.png is /a/b.png. */
+function sitePath(u: URL): string {
+  return u.pathname.replace(/\/{2,}/g, '/');
+}
+
+function charsetLabel(label: string | undefined): string | undefined {
+  if (!label) return undefined;
+  try {
+    return new TextDecoder(label.trim().toLowerCase()).encoding;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The charset a browser read this script or stylesheet with on the original site, when that was a
+ * legacy one and the bytes must be converted to UTF-8 like the pages. Without a BOM, a charset in
+ * the Content-Type or a CSS @charset, browsers use the encoding of the page that loads the file.
+ */
+function legacyCharset(body: Buffer, contentType: string, kind: Kind, pageCharset: string | undefined): string | undefined {
+  if (!body.some((b) => b > 0x7f)) return undefined;
+  if ((body[0] === 0xef && body[1] === 0xbb && body[2] === 0xbf) || (body[0] === 0xff && body[1] === 0xfe) || (body[0] === 0xfe && body[1] === 0xff)) return undefined;
+  const declared =
+    charsetLabel(/charset\s*=\s*["']?([^"';\s]+)/i.exec(contentType)?.[1]) ??
+    (kind === 'css' ? charsetLabel(/^@charset "([^"]+)";/.exec(body.subarray(0, 64).toString('latin1'))?.[1]) : undefined);
+  // Valid UTF-8 that a page only implies is another charset is far more likely really UTF-8.
+  const implied = pageCharset?.startsWith('utf-16') || isValidUtf8(body) ? undefined : pageCharset;
+  const cs = declared ?? implied;
+  return cs && cs !== 'utf-8' ? cs : undefined;
 }
 
 function shortHash(s: string): string {
@@ -209,59 +257,68 @@ export function planFiles(resources: Resource[], kinds: Map<string, Kind>): Plan
     return qa - qb || a.path.length - b.path.length || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
   });
 
-  // Non-HTML files whose query string does not change the bytes (style.css?ver=1.2) are served from
-  // the plain path: a static server ignores the query string anyway.
+  // A query string that does not change the bytes (style.css?ver=1.2) is served from the plain
+  // path: a static server ignores the query string anyway. That holds only when every capture at the
+  // path, the bare path and HTML pages included, has those bytes (not / plus /?feed=rss2).
   const variants = new Map<string, Set<string>>();
   for (const r of content) {
     const u = new URL(r.url);
-    if (kinds.get(r.key) === 'html') continue;
-    const set = variants.get(u.pathname) ?? new Set<string>();
+    const set = variants.get(sitePath(u)) ?? new Set<string>();
     set.add(r.sha1 ?? r.key);
-    variants.set(u.pathname, set);
+    variants.set(sitePath(u), set);
   }
 
-  const taken = new Map<string, string>();
+  const taken = new Map<string, Plan>();
+  const plainPaths = new Set<string>();
   const plans: Plan[] = [];
   const toRoute = (p: Plan, query?: string) => {
     const u = new URL(p.res.url);
-    const own = path.posix.extname(decodePath(u.pathname)).toLowerCase();
+    const decoded = decodePath(sitePath(u));
+    const own = path.posix.extname(decoded).toLowerCase();
     const ext = p.kind === 'html' ? '.html' : own && !UNSAFE_SEGMENT.test(own) && extFits(own, p.kind, p.res.contentType ?? '') ? own : mimeExt(p.res.contentType ?? '');
     p.file = `__wbd/${query !== undefined ? 'q' : 'f'}/${shortHash(p.res.key)}${ext}`;
     p.shared = false;
-    p.route = { path: decodePath(u.pathname), rawPath: u.pathname, query, file: p.file };
+    p.route = { path: decoded, rawPath: u.pathname, query, file: p.file };
   };
 
   for (const r of ordered) {
     const u = new URL(r.url);
+    const pathname = sitePath(u);
     const kind = kinds.get(r.key) ?? 'other';
     const query = cleanSearch(u.search).slice(1) || undefined;
+    // The server reads //a/b.png as /a/b.png, so one capture serves both: /a/b.png when it was
+    // archived too (shorter paths come first).
+    if (query === undefined && plainPaths.has(pathname)) continue;
+    if (query === undefined) plainPaths.add(pathname);
     const plan: Plan = { res: r, kind, file: '' };
     plans.push(plan);
 
-    const ignorableQuery = query !== undefined && kind !== 'html' && (variants.get(u.pathname)?.size ?? 0) <= 1;
+    const ignorableQuery = query !== undefined && kind !== 'html' && (variants.get(pathname)?.size ?? 0) <= 1;
     if (query !== undefined && !ignorableQuery) {
       toRoute(plan, query);
       continue;
     }
-    const decoded = decodePath(u.pathname);
-    const file = plainFile(decoded, kind, path.posix.extname(decoded).toLowerCase(), r.contentType ?? '');
+    const decoded = decodePath(pathname);
+    const file = !hasNonUtf8Escapes(pathname) && plainFile(decoded, kind, path.posix.extname(decoded).toLowerCase(), r.contentType ?? '');
+    // A query URL never gets a path-only route: that would also answer the bare path.
     if (!file) {
-      toRoute(plan);
+      toRoute(plan, query);
       continue;
     }
     const lower = file.toLowerCase();
     const owner = taken.get(lower);
     if (owner === undefined) {
-      taken.set(lower, r.sha1 ?? r.key);
+      taken.set(lower, plan);
       plan.file = file;
-    } else if (owner === r.sha1) {
+    } else if (r.sha1 !== undefined && owner.res.sha1 === r.sha1 && owner.file === file) {
       plan.file = file;
       plan.shared = true;
-    } else if (ignorableQuery) {
-      // A query variant of a file that already exists with other bytes: route it by its query.
-      toRoute(plan, query);
     } else {
-      toRoute(plan);
+      // Another file already has this name (in some letter case), so this URL gets its own copy.
+      toRoute(plan, query);
+      // /images/a.gif next to /Images/a.gif with the same bytes: Linux servers tell the two apart,
+      // and one file name cannot hold both on a case-insensitive disk.
+      if (r.sha1 !== undefined && owner.res.sha1 === r.sha1) plan.sameAs = owner;
     }
   }
 
@@ -272,7 +329,7 @@ export function planFiles(resources: Resource[], kinds: Map<string, Kind>): Plan
     const parts = p.file.toLowerCase().split('/');
     for (let i = 1; i < parts.length; i++) dirs.add(parts.slice(0, i).join('/'));
   }
-  for (const p of plans) if (!p.route && dirs.has(p.file.toLowerCase())) toRoute(p);
+  for (const p of plans) if (!p.route && dirs.has(p.file.toLowerCase())) toRoute(p, cleanSearch(new URL(p.res.url).search).slice(1) || undefined);
   return plans;
 }
 
@@ -290,6 +347,18 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
   const log = opts.log ?? (() => {});
   const rawDir = path.join(opts.workDir, 'raw');
   const rootRel = makeRootRelative(opts.domain);
+  // Links to the site become root-relative, also when they go through a Wayback copy of it. Captures
+  // are fetched raw, so a Wayback link to another site was put there by the author and stays.
+  const relink = (v: string): string | undefined => {
+    const t = v.trim();
+    const inner = unwrapWayback(t);
+    if (inner !== t) {
+      const u = toUrl(inner);
+      if (!u || !isInternal(u, opts.domain)) return t.startsWith('/web/') ? 'https://web.archive.org' + t : undefined;
+    }
+    const out = rootRel(inner);
+    return out !== t ? out : undefined;
+  };
   const warnings: string[] = [];
   const readRaw = (r: Resource) => readFile(path.join(rawDir, r.file!));
 
@@ -351,18 +420,26 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
   const site: SiteContext = { siteUrl: opts.siteUrl, siteName, siteDescription, logo, rssPath };
   log(`site name: ${siteName}`);
 
-  // 3. Write every file.
+  // 3. Write every file. Pages go first: they tell which charset their scripts and stylesheets were
+  // read with, and those are converted to UTF-8 like the pages.
   const pages: PageRecord[] = [];
   const types: TypeOverride[] = [];
   const cleaned = { wayback: 0, trackers: 0 };
   let phpLeftovers = 0;
+  const planByPath = new Map(plans.map((p) => [p.res.path, p]));
+  const siteCharsets = new Map<string, number>();
+  const fileCharsets = new Map<string, Map<string, number>>();
+  const count = (counts: Map<string, number>, charset: string) => counts.set(charset, (counts.get(charset) ?? 0) + 1);
+  // The charset of most pages that load this file; for a file no page loads directly (an @import,
+  // a script added by a script), the charset of most pages of the site.
+  const pageCharset = (p: Plan) => [...(fileCharsets.get(p.file) ?? siteCharsets)].sort((a, b) => b[1] - a[1])[0]?.[0];
 
-  for (const p of plans) {
-    if (p.shared) continue;
+  for (const p of [...plans.filter((x) => x.kind === 'html'), ...plans.filter((x) => x.kind !== 'html')]) {
+    if (p.shared || p.sameAs) continue;
     const body = await readRaw(p.res);
     if (p.kind === 'html') {
       const pageUrl = new URL(p.res.url);
-      const { text } = decodeText(body, p.res.contentType ?? '');
+      const { text, charset } = decodeText(body, p.res.contentType ?? '');
       // The parser rewrites any doctype to <!DOCTYPE html>; old pages keep their own so browsers
       // render them in the same (often quirks) mode as before.
       const doctype = /<!doctype[^>]*>/i.exec(text.slice(0, 4096))?.[0];
@@ -370,10 +447,20 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
       const stats = cleanDocument($, { stripTracking: opts.stripTracking });
       cleaned.wayback += stats.waybackRemoved;
       cleaned.trackers += stats.trackersRemoved;
-      visitUrls($, (v) => {
-        const t = v.trim();
-        const out = rootRel(unwrapWayback(t));
-        return out !== t ? out : undefined;
+      visitUrls($, relink);
+      count(siteCharsets, charset);
+      $('script[src], link[href]').each((_, el) => {
+        const $el = $(el);
+        if (el.tagName === 'link' && !/(^|\s)stylesheet(\s|$)/i.test($el.attr('rel') ?? '')) return;
+        const u = toUrl($el.attr(el.tagName === 'link' ? 'href' : 'src') ?? '', pageUrl);
+        const target = u && isInternal(u, opts.domain) ? planByPath.get(pathAndQuery(u)) : undefined;
+        if (!target || (target.kind !== 'js' && target.kind !== 'css')) return;
+        const own = charsetLabel($el.attr('charset'));
+        const file = (target.sameAs ?? target).file;
+        if (!fileCharsets.has(file)) fileCharsets.set(file, new Map());
+        count(fileCharsets.get(file)!, own ?? charset);
+        // The file is written as UTF-8 below.
+        if (own && own !== 'utf-8') $el.attr('charset', 'utf-8');
       });
       const meta = extractMeta($, pageUrl, opts.domain, { hasPath });
       applySeo($, meta, site);
@@ -390,27 +477,31 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
       const lastmod = meta.modifiedAt ?? meta.publishedAt ?? tsToIso(p.res.timestamp);
       pages.push({ ...meta, file: p.file, timestamp: p.res.timestamp, lastmod });
     } else if (p.kind === 'css') {
-      const css = rewriteCss(unwrapWaybackInText(body.toString('latin1')), (u) => {
-        const out = rootRel(u);
-        return out !== u ? out : undefined;
-      });
-      await write(p.file, Buffer.from(css, 'latin1'));
+      const cs = legacyCharset(body, p.res.contentType ?? '', 'css', pageCharset(p));
+      // latin1 keeps the bytes exactly as they were when the charset stays.
+      const text = cs ? new TextDecoder(cs).decode(body).replace(/^@charset "[^"]*";/, '@charset "utf-8";') : body.toString('latin1');
+      await write(p.file, Buffer.from(rewriteCss(text, relink), cs ? 'utf8' : 'latin1'));
     } else if (p.kind === 'js' || p.kind === 'xml') {
-      const text = body.toString('latin1');
-      await write(p.file, text.includes('archive.org/web/') ? Buffer.from(unwrapWaybackInText(text), 'latin1') : body);
+      const cs = p.kind === 'js' ? legacyCharset(body, p.res.contentType ?? '', 'js', pageCharset(p)) : undefined;
+      const text = cs ? new TextDecoder(cs).decode(body) : body.toString('latin1');
+      const out = text.includes('archive.org/web/') ? unwrapWaybackInText(text, opts.domain) : text;
+      await write(p.file, cs ? Buffer.from(out, 'utf8') : out !== text ? Buffer.from(out, 'latin1') : body);
     } else {
       await write(p.file, body);
     }
   }
+  for (const p of plans) if (p.sameAs) await write(p.file, await readFile(path.join(root, p.sameAs.file)));
   if (phpLeftovers) warnings.push(`${phpLeftovers} script(s) in .php pages contain "<?"; check them if your host runs PHP with short tags on.`);
 
   // 4. Redirects the original site made.
   const queryPaths = new Set<string>();
   for (const r of manifest.resources) {
     const u = new URL(r.url);
-    if (cleanSearch(u.search)) queryPaths.add(u.pathname);
+    if (cleanSearch(u.search)) queryPaths.add(sitePath(u));
   }
   const redirects: Redirect[] = [];
+  const redirected = new Set<string>();
+  const singleSlash = new Set(manifest.resources.map((r) => pathAndQuery(new URL(r.url))));
   for (const r of manifest.resources) {
     if (r.status === 200 || !r.location) continue;
     const u = new URL(r.url);
@@ -419,11 +510,15 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
     const to = isInternal(loc, opts.domain) ? pathAndQuery(loc) : loc.toString();
     if (to === r.path) continue;
     const query = cleanSearch(u.search).slice(1) || undefined;
+    // //a.php and /a.php are one URL to the server: a redirect at //a.php would also catch /a.php.
+    const key = sitePath(u) + (query !== undefined ? '?' + query : '');
+    if (redirected.has(key) || (sitePath(u) !== u.pathname && singleSlash.has(key))) continue;
+    redirected.add(key);
     redirects.push({
-      path: decodePath(u.pathname),
+      path: decodePath(sitePath(u)),
       rawPath: u.pathname,
       query,
-      noQuery: query === undefined && queryPaths.has(u.pathname),
+      noQuery: query === undefined && queryPaths.has(sitePath(u)),
       to,
       status: r.status,
     });
