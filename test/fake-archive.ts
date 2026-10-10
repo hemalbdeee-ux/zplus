@@ -1,7 +1,8 @@
 // A small stand-in for web.archive.org: the CDX index API and raw "id_" playback, served from
 // fixture captures. It behaves like the real archive in the ways the engine depends on:
-// SURT-style keys that ignore www and scheme, the nearest-timestamp redirect, archived redirects
-// with a Location on the archive, resume keys, and filters.
+// SURT-style keys that ignore www, scheme and case, the nearest-timestamp redirect (no
+// Memento-Datetime), archived redirects with a Location on the archive (with Memento-Datetime),
+// skipped self-redirects, revisit rows, resume keys, and filters.
 
 import { createHash } from 'node:crypto';
 import http from 'node:http';
@@ -14,6 +15,13 @@ export interface FakeCapture {
   type?: string;
   body?: string | Buffer;
   location?: string;
+  /** A deduplicated repeat capture: the CDX row says "warc/revisit" and "-", playback serves the content. */
+  revisit?: boolean;
+}
+
+export interface FakeArchiveOptions {
+  /** Drop a trailing slash from keys as the real SURT canonicalizer does (/blog/ matches /blog). */
+  stripTrailingSlash?: boolean;
 }
 
 export interface FakeArchive {
@@ -24,9 +32,10 @@ export interface FakeArchive {
   close(): Promise<void>;
 }
 
-function surt(u: URL): string {
+function surtKey(u: URL, stripTrailingSlash = false): string {
   const host = u.hostname.toLowerCase().replace(/^www\d{0,3}\./, '');
-  return host.split('.').reverse().join(',') + ')' + (u.pathname + u.search).toLowerCase();
+  const p = stripTrailingSlash && u.pathname.length > 1 ? u.pathname.replace(/\/+$/, '') : u.pathname;
+  return host.split('.').reverse().join(',') + ')' + (p + u.search).toLowerCase();
 }
 
 function httpDate(ts: string): string {
@@ -34,7 +43,8 @@ function httpDate(ts: string): string {
   return d.toUTCString();
 }
 
-export async function startFakeArchive(captures: FakeCapture[]): Promise<FakeArchive> {
+export async function startFakeArchive(captures: FakeCapture[], opts: FakeArchiveOptions = {}): Promise<FakeArchive> {
+  const surt = (u: URL) => surtKey(u, opts.stripTrailingSlash);
   const rows = captures
     .map((c) => {
       const u = new URL(c.url);
@@ -49,6 +59,10 @@ export async function startFakeArchive(captures: FakeCapture[]): Promise<FakeArc
       };
     })
     .sort((a, b) => a.key.localeCompare(b.key) || a.ts.localeCompare(b.ts));
+
+  type Row = (typeof rows)[number];
+  const cdxStatus = (r: Row) => (r.revisit ? '-' : String(r.status));
+  const cdxType = (r: Row) => (r.revisit ? 'warc/revisit' : r.type);
 
   const requests: string[] = [];
   let failures: { status: number; n: number } = { status: 0, n: 0 };
@@ -80,7 +94,7 @@ export async function startFakeArchive(captures: FakeCapture[]): Promise<FakeArc
       const limit = Number(q.get('limit') ?? 100000);
       const page = hits.slice(offset, offset + limit);
       const out: string[][] = [['urlkey', 'timestamp', 'original', 'mimetype', 'statuscode', 'digest', 'length']];
-      for (const r of page) out.push([r.key, r.ts, r.url, r.type, String(r.status), r.digest, String(r.bytes.length + 400)]);
+      for (const r of page) out.push([r.key, r.ts, r.url, cdxType(r), cdxStatus(r), r.digest, String(r.bytes.length + 400)]);
       if (q.get('showResumeKey') === 'true' && offset + limit < hits.length) out.push([], [String(offset + limit)]);
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(page.length ? JSON.stringify(out) : '[]');
@@ -104,8 +118,33 @@ export async function startFakeArchive(captures: FakeCapture[]): Promise<FakeArc
         res.end('<p>Hrm. The Wayback Machine has not archived that URL.</p>');
         return;
       }
-      const closest = list.reduce((best, r) => (Math.abs(Number(r.ts) - Number(ts)) < Math.abs(Number(best.ts) - Number(ts)) ? r : best));
+      const dist = (r: Row) => Math.abs(Number(r.ts) - Number(ts));
+      let closest: Row | undefined = list.reduce((best, r) => (dist(r) < dist(best) ? r : best));
       if (closest.ts !== ts) {
+        res.writeHead(302, { location: `/web/${closest.ts}id_/${closest.url}` });
+        res.end();
+        return;
+      }
+      // Wayback (AccessPoint.handleReplay) skips a 3xx whose Location has the same key (http ->
+      // https, bare -> www) and moves on to the next closest capture: of the two time neighbours a
+      // 200 wins, then the nearer one (DefaultReplayCaptureSelector.findNextClosest).
+      const pool = [...list];
+      let skipped = false;
+      while (closest && closest.status >= 300 && closest.status < 400 && closest.location && surt(new URL(closest.location, closest.url)) === key) {
+        const i = pool.indexOf(closest);
+        const [prev, after] = [pool[i - 1], pool[i + 1]];
+        pool.splice(i, 1);
+        if (!prev || !after) closest = prev ?? after;
+        else if ((prev.status === 200) !== (after.status === 200)) closest = prev.status === 200 ? prev : after;
+        else closest = dist(prev) <= dist(after) ? prev : after;
+        skipped = true;
+      }
+      if (!closest) {
+        res.writeHead(404, { 'content-type': 'text/html' });
+        res.end('<p>Self-Redirect: No Closest Match Found</p>');
+        return;
+      }
+      if (skipped) {
         res.writeHead(302, { location: `/web/${closest.ts}id_/${closest.url}` });
         res.end();
         return;

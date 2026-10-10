@@ -41,6 +41,14 @@ export interface RestoreOptions {
   onEvent?: (e: RestoreEvent) => void;
 }
 
+// A demo is the homepage and a few pages: it needs no more than this many URLs, and only the
+// index entries for the pages it links to.
+const DEMO_MAX_URLS = 200;
+const DEMO_INDEX_URLS = 5_000;
+/** The index is read up to this many URLs per URL of the budget, never more than the cap. */
+const INDEX_PER_URL = 5;
+const INDEX_CAP = 500_000;
+
 export interface RestoreResult {
   jobDir: string;
   siteDir: string;
@@ -48,9 +56,28 @@ export interface RestoreResult {
   report: RestoreReport;
 }
 
+/** https:// plus a bare host is accepted; anything else that is not an http(s) address is refused. */
+export function normalizeSiteUrl(raw: string): string {
+  const s = raw.trim();
+  let u: URL | undefined;
+  try {
+    u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : `https://${s}`);
+  } catch {
+    // reported below
+  }
+  if (!u || (u.protocol !== 'http:' && u.protocol !== 'https:') || !u.hostname || u.search || u.hash || u.username || u.password) {
+    throw new Error(`Not a valid site address: "${raw}". Use for example https://www.example.com`);
+  }
+  return (u.origin + u.pathname).replace(/\/+$/, '');
+}
+
 export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
   const startedAt = Date.now();
   const domain = normalizeDomain(opts.domain);
+  // Checked before any download: the site address is only used in the last build step.
+  const givenSiteUrl = opts.siteUrl !== undefined ? normalizeSiteUrl(opts.siteUrl) : undefined;
+  const demo = opts.maxPages !== undefined;
+  const maxUrls = opts.maxUrls !== undefined && Number.isFinite(opts.maxUrls) && opts.maxUrls >= 1 ? Math.floor(opts.maxUrls) : demo ? DEMO_MAX_URLS : 20_000;
   const emit = (phase: Phase, message: string, extra: Partial<RestoreEvent> = {}) => opts.onEvent?.({ phase, message, ...extra });
   const client = new ArchiveClient({ ...opts.archive, log: (m) => emit('download', m) });
   const jobDir = path.resolve(opts.outDir, domain);
@@ -82,24 +109,43 @@ export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
     warnings.push(`The chosen date ${target.slice(0, 8)} is outside the period the site looked healthy; pages were taken from that period instead.`);
   }
   const host = health?.host ?? domain;
-  const siteUrl = (opts.siteUrl ?? `https://${host}`).replace(/\/+$/, '');
+  const siteUrl = givenSiteUrl ?? `https://${host}`;
 
   emit('index', 'reading the archive index');
-  const index = await buildIndex(client, { domain, target, window, log: (m) => emit('index', m) });
+  const indexLimit = demo ? DEMO_INDEX_URLS : Math.min(INDEX_CAP, maxUrls * INDEX_PER_URL);
+  const index = await buildIndex(client, { domain, target, window, maxIndexUrls: indexLimit, log: (m) => emit('index', m) });
   emit('index', `${index.size} URLs archived in the chosen period`);
+  if (index.size === 0) {
+    throw new Error(`The Wayback Machine has no captures of ${domain} between ${window.from?.slice(0, 8) ?? 'the start'} and ${window.to?.slice(0, 8) ?? 'today'}.`);
+  }
 
   const manifest = await crawl(client, index, {
     domain,
     target,
     window,
     workDir,
-    maxUrls: opts.maxUrls ?? 20_000,
+    maxUrls,
     maxPages: opts.maxPages,
-    orphans: opts.orphans ?? true,
+    orphans: opts.orphans ?? !demo,
     log: (m) => emit('download', m),
     progress: (p) => emit('download', p.current, { done: p.done, queued: p.queued }),
   });
   if (manifest.truncated) warnings.push(`The URL limit was reached; some archived URLs were not downloaded.`);
+  if (index.truncated) {
+    manifest.truncated = true;
+    warnings.push(`The archive lists more than ${indexLimit} URLs for this domain; only the first ${indexLimit} were considered.`);
+  }
+  const refused = manifest.missing.filter((m) => m.transient);
+  if (!manifest.resources.some((r) => r.status === 200)) {
+    throw new Error(
+      refused.length
+        ? `Nothing could be downloaded: archive.org refused or failed every request (${refused[0].reason}). Try again later.`
+        : `Nothing could be downloaded: no URL of ${domain} that was tried has an archived page or file in the chosen period.`,
+    );
+  }
+  if (refused.length) {
+    warnings.push(`${refused.length} URLs could not be downloaded because archive.org refused or failed the request; run the restore again later to fetch them.`);
+  }
 
   emit('build', 'building the site');
   const siteDir = path.join(jobDir, 'site');
