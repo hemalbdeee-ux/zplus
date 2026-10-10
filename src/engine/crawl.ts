@@ -2,6 +2,7 @@
 //
 // 1. The CDX index tells us which URLs exist; for each URL we keep the one capture closest to the
 //    target date inside the good window (earlier captures win ties: the site was healthier then).
+//    On a huge domain the index stops at a size limit, and a linked URL past it is looked up alone.
 // 2. Starting at the homepage we follow links breadth-first, so pages the site actually linked
 //    come first. 3. Pages nobody linked any more ("orphans", often the ones with backlinks) are
 //    added after that, until the URL budget is spent.
@@ -12,7 +13,7 @@ import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { ArchiveClient, Capture, CaptureResult } from './archive.ts';
+import type { ArchiveClient, Capture, CaptureResult, CdxQuery } from './archive.ts';
 import { decodeText } from './charset.ts';
 import { collectUrls, cssUrls, loadHtml } from './html.ts';
 import { isInternal, pathAndQuery, toUrl, tsSeconds, unwrapWayback, urlKey } from './url.ts';
@@ -75,6 +76,12 @@ export interface IndexedCapture extends Capture {
    * Replay of a 3xx can land elsewhere (see crawl), and then this one is fetched instead.
    */
   alt?: Capture;
+  /**
+   * When the chosen capture is a 3xx: the best in-window capture, not a 3xx, of another URL that
+   * the archive files under the same key (/about.html for /About.html, /page for /page/). Replay
+   * skips a 3xx that points inside its own key, so this is where such a redirect went.
+   */
+  twin?: Capture;
 }
 
 /** One capture per URL key; `truncated` is set when reading stopped at the size limit. */
@@ -83,9 +90,14 @@ export type CaptureIndex = Map<string, IndexedCapture> & { truncated?: boolean }
 const SKIP_PATH = /\/(wp-admin|wp-json|cgi-bin|trackback)(\/|$)|\/(wp-login|xmlrpc|wp-cron)\.php|[?&](replytocom|share|action=edit)=/i;
 const GENERATED = new Set(['/robots.txt', '/sitemap.xml']);
 const MAX_QUERY_VARIANTS = 200;
+/** One archive key holds a handful of spellings of a URL; more means the lookup went wrong. */
+const LOOKUP_URLS = 100;
 /** This many archive failures in a row (429, 5xx, network) mean archive.org is refusing us. */
 const MAX_FAILURE_STREAK = 20;
 const REVISIT = 'warc/revisit';
+// What an extension gives away when the CDX type does not say (a revisit row, an unlisted URL).
+const PAGE_EXT = /\.(html?|shtml|xhtml)$/i;
+const FILE_EXT = /\.(css|m?js|json|xml|rss|atom|txt|csv|pdf|zip|gz|png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?|woff2?|ttf|otf|eot|mp3|mp4|m4a|webm|ogg|ogv|wav|flv|swf|docx?|xlsx?|pptx?)$/i;
 
 export function isHtmlType(contentType: string | undefined, mimetype?: string): boolean {
   const t = (contentType || mimetype || '').toLowerCase();
@@ -106,6 +118,13 @@ export function cdxHtml(mimetype: string): boolean | undefined {
   return isHtmlType(undefined, t);
 }
 
+/** Is a URL a page? Its CDX row says, else its extension; undefined when neither does. */
+function guessHtml(cap: Capture | undefined, u: URL): boolean | undefined {
+  const known = cap ? cdxHtml(cap.mimetype) : undefined;
+  if (known !== undefined) return known;
+  return PAGE_EXT.test(u.pathname) ? true : FILE_EXT.test(u.pathname) ? false : undefined;
+}
+
 const isRedirect = (c: Capture) => /^3/.test(c.statuscode);
 
 function rank(c: Capture, targetSec: number): number {
@@ -119,61 +138,99 @@ function inWindow(ts: string, w: { from?: string; to?: string }): boolean {
   return (!w.from || ts >= w.from) && (!w.to || ts <= w.to);
 }
 
-export async function buildIndex(
-  client: ArchiveClient,
-  opts: Pick<CrawlOptions, 'domain' | 'target' | 'window' | 'log'> & { maxIndexUrls?: number },
-): Promise<CaptureIndex> {
+type IndexOptions = Pick<CrawlOptions, 'domain' | 'target' | 'window'>;
+
+/** Collects CDX rows into a CaptureIndex; `limit` caps the number of distinct URLs. */
+function indexer(opts: IndexOptions, limit = Infinity) {
   const targetSec = tsSeconds(opts.target);
   const index: CaptureIndex = new Map();
   // Mimetype of the latest non-revisit row per key, to tell what a revisit pick really is.
   const realType = new Map<string, string>();
-  const limit = opts.maxIndexUrls ?? Infinity;
-  let rows = 0;
-  for await (const page of client.cdx({
-    url: `${opts.domain}/`,
-    matchType: 'prefix',
-    from: opts.window.from,
-    to: opts.window.to,
-    filters: ['!statuscode:[45]..'],
-  })) {
-    for (const c of page) {
-      rows++;
-      if (c.statuscode !== '-' && !/^[23]\d\d$/.test(c.statuscode)) continue;
-      if (!inWindow(c.timestamp, opts.window)) continue;
-      const u = toUrl(c.original);
-      if (!u || !isInternal(u, opts.domain)) continue;
-      const key = urlKey(u);
-      if (cdxHtml(c.mimetype) !== undefined) realType.set(key, c.mimetype);
-      const cur = index.get(key);
-      if (!cur) {
-        // A big domain lists millions of URLs; keeping them all would exhaust memory.
-        if (index.size >= limit) {
-          index.truncated = true;
-          continue;
-        }
-        index.set(key, c);
-        continue;
+
+  const add = (c: Capture): void => {
+    if (c.statuscode !== '-' && !/^[23]\d\d$/.test(c.statuscode)) return;
+    if (!inWindow(c.timestamp, opts.window)) return;
+    const u = toUrl(c.original);
+    if (!u || !isInternal(u, opts.domain)) return;
+    // Never downloaded (see enqueue), so not worth a place in a size-limited index.
+    if (SKIP_PATH.test(pathAndQuery(u)) || GENERATED.has(u.pathname)) return;
+    const key = urlKey(u);
+    if (cdxHtml(c.mimetype) !== undefined) realType.set(key, c.mimetype);
+    const cur = index.get(key);
+    if (!cur) {
+      // A big domain lists millions of URLs; keeping them all would exhaust memory.
+      if (index.size >= limit) {
+        index.truncated = true;
+        return;
       }
-      const r = rank(c, targetSec);
-      if (r < rank(cur, targetSec)) {
-        const entry: IndexedCapture = c;
-        if (isRedirect(c)) entry.alt = isRedirect(cur) ? cur.alt : cur;
-        index.set(key, entry);
-      } else if (isRedirect(cur) && !isRedirect(c) && (!cur.alt || r < rank(cur.alt, targetSec))) {
-        cur.alt = c;
+      index.set(key, c);
+      return;
+    }
+    const r = rank(c, targetSec);
+    if (r < rank(cur, targetSec)) {
+      const entry: IndexedCapture = c;
+      if (isRedirect(c)) entry.alt = isRedirect(cur) ? cur.alt : cur;
+      index.set(key, entry);
+    } else if (isRedirect(cur) && !isRedirect(c) && (!cur.alt || r < rank(cur.alt, targetSec))) {
+      cur.alt = c;
+    }
+  };
+
+  const finish = (): CaptureIndex => {
+    for (const [key, c] of index) {
+      const t = cdxHtml(c.mimetype) === undefined ? realType.get(key) : undefined;
+      if (t) index.set(key, Object.assign({}, c, { mimetype: t }));
+    }
+    // The archive key (CDX urlkey) ignores case, a trailing slash and query order, so it can hold
+    // several of our URLs. Each 3xx pick learns the best other URL under its archive key.
+    const redirects = new Map<string, IndexedCapture[]>();
+    for (const c of index.values()) {
+      if (!isRedirect(c) || !c.urlkey) continue;
+      const group = redirects.get(c.urlkey);
+      if (group) group.push(c);
+      else redirects.set(c.urlkey, [c]);
+    }
+    if (redirects.size) {
+      for (const c of index.values()) {
+        const group = redirects.get(c.urlkey);
+        const best = isRedirect(c) ? c.alt : c;
+        if (!group || !best) continue;
+        for (const p of group) if (p !== c && (!p.twin || rank(best, targetSec) < rank(p.twin, targetSec))) p.twin = best;
       }
     }
-    opts.log?.(`index: ${rows} captures read, ${index.size} distinct URLs`);
-    if (index.truncated) {
-      opts.log?.(`index: stopped reading at ${index.size} distinct URLs`);
+    return index;
+  };
+
+  return { index, add, finish };
+}
+
+async function readIndex(client: ArchiveClient, q: CdxQuery, opts: IndexOptions, limit?: number, log?: (msg: string) => void): Promise<CaptureIndex> {
+  const ix = indexer(opts, limit);
+  let rows = 0;
+  for await (const page of client.cdx({ ...q, from: opts.window.from, to: opts.window.to, filters: ['!statuscode:[45]..'] })) {
+    for (const c of page) {
+      rows++;
+      ix.add(c);
+    }
+    log?.(`index: ${rows} captures read, ${ix.index.size} distinct URLs`);
+    if (ix.index.truncated) {
+      log?.(`index: stopped reading at ${ix.index.size} distinct URLs`);
       break;
     }
   }
-  for (const [key, c] of index) {
-    const t = cdxHtml(c.mimetype) === undefined ? realType.get(key) : undefined;
-    if (t) index.set(key, Object.assign({}, c, { mimetype: t }));
-  }
-  return index;
+  return ix.finish();
+}
+
+export function buildIndex(client: ArchiveClient, opts: IndexOptions & Pick<CrawlOptions, 'log'> & { maxIndexUrls?: number }): Promise<CaptureIndex> {
+  return readIndex(client, { url: `${opts.domain}/`, matchType: 'prefix' }, opts, opts.maxIndexUrls, opts.log);
+}
+
+/**
+ * The index of one URL alone, from an exact CDX query. That lists every URL the archive files
+ * under the same key, so a 3xx pick gets its alt and twin too. For URLs past where the index stopped.
+ */
+export function lookupIndex(client: ArchiveClient, url: string, opts: IndexOptions): Promise<CaptureIndex> {
+  return readIndex(client, { url, matchType: 'exact' }, opts, LOOKUP_URLS);
 }
 
 function hashKey(key: string): string {
@@ -259,14 +316,20 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
       const n = (variants.get(u.pathname) ?? 0) + 1;
       variants.set(u.pathname, n);
       if (n > MAX_QUERY_VARIANTS) {
-        manifest.missing.push({ key, url: u.toString(), reason: `not downloaded: more than ${MAX_QUERY_VARIANTS} unarchived query-string variants of this path`, referrer });
+        // Past a cut-short index "not listed" no longer means "not archived".
+        const unlisted = index.truncated ? 'that the part of the archive index read does not list' : 'that are not archived';
+        manifest.missing.push({ key, url: u.toString(), reason: `not downloaded: more than ${MAX_QUERY_VARIANTS} query-string variants of this path ${unlisted}`, referrer });
         return false;
       }
     }
-    queues[prio].items.push({ key, url: cap?.original ?? u.toString(), referrer, via, html: cap ? cdxHtml(cap.mimetype) : undefined });
+    queues[prio].items.push({ key, url: cap?.original ?? u.toString(), referrer, via, html: guessHtml(cap, u) });
     wake?.();
     return true;
   };
+
+  // Past the demo limit only files a kept page linked to still come along. A listed URL of unknown
+  // type (a revisit row) may be a file too, so it is fetched: handle() drops it if it is a page.
+  const mayBeFile = (item: Item) => item.html === false || (item.html === undefined && index.has(item.key));
 
   const next = (): Item | undefined => {
     for (const q of queues) {
@@ -276,9 +339,7 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
           q.items.splice(0, q.head);
           q.head = 0;
         }
-        // Past the demo limit only files a kept page linked to still come along; an unknown type
-        // may be a page.
-        if (pageLimitReached() && !(item.html === false && item.via === 'link')) continue;
+        if (pageLimitReached() && !(item.via === 'link' && mayBeFile(item))) continue;
         return item;
       }
     }
@@ -318,10 +379,8 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
   };
 
   const handle = async (item: Item) => {
-    const cap = index.get(item.key);
+    let cap = index.get(item.key);
     const reuse = previous.get(item.key);
-    const u = new URL(item.url);
-    const base: Omit<Resource, 'timestamp' | 'status'> = { key: item.key, url: item.url, path: pathAndQuery(u), via: item.via };
 
     // Bodies an earlier version took from outside the window are fetched again.
     if (reuse && inWindow(reuse.timestamp, opts.window)) {
@@ -340,18 +399,45 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
     }
     previous.delete(item.key);
 
+    if (!cap && index.truncated) {
+      // The index stopped early on a big domain: a URL it does not list is looked up on its own, so
+      // it is still taken from the good period and its redirects are read like a listed one's.
+      const u = new URL(item.url);
+      const own = await lookupIndex(client, u.origin + pathAndQuery(u), opts);
+      if (own.size === 0) {
+        manifest.missing.push({ key: item.key, url: item.url, reason: 'not archived in the good period', referrer: item.referrer });
+        return;
+      }
+      cap = own.get(item.key);
+      if (cap && cdxHtml(cap.mimetype) === true && pageLimitReached()) return;
+    }
+    const url = cap?.original ?? item.url;
+    const base: Omit<Resource, 'timestamp' | 'status'> = { key: item.key, url, path: pathAndQuery(new URL(url)), via: item.via };
+
     let used: Capture | undefined = cap;
-    let res = await client.fetchCapture(cap?.timestamp ?? opts.target, item.url);
-    // Replay does not always serve the capture asked for: the archive skips a 3xx whose Location is
-    // the same URL (http -> https, bare -> www) and serves the nearest other capture, which can be
-    // the parked domain. Then the best in-window capture that is not a redirect is fetched instead.
-    if (cap?.alt && !isTransient(res) && (res.kind === 'missing' || !inWindow(res.timestamp, opts.window))) {
-      used = cap.alt;
-      res = await client.fetchCapture(cap.alt.timestamp, cap.alt.original);
+    let res = await client.fetchCapture(cap?.timestamp ?? opts.target, url);
+    if (cap && isRedirect(cap) && !isTransient(res)) {
+      // Replay does not always serve the 3xx asked for: the archive skips one whose Location it
+      // files under the same key and serves the nearest other capture of that key, which can be the
+      // parked domain. The key ignores scheme and www (http -> https: the same URL here) but also
+      // case, a trailing slash and query order (/About.html -> /about.html: a redirect to restore).
+      const landed = res.kind === 'ok' && inWindow(res.timestamp, opts.window) ? toUrl(res.original) : null;
+      const usable = res.kind !== 'missing' && inWindow(res.timestamp, opts.window);
+      if (landed && urlKey(landed) !== item.key) {
+        // Replay moved to another URL under the key: that is where the site's 3xx pointed.
+        res = { kind: 'redirect', timestamp: cap.timestamp, status: Number(cap.statuscode), location: landed.toString() };
+      } else if (!usable && cap.alt) {
+        // The best in-window capture of this URL that is not a redirect, fetched at its exact time.
+        used = cap.alt;
+        res = await client.fetchCapture(cap.alt.timestamp, cap.alt.original);
+      } else if (!usable && cap.twin) {
+        // Nothing usable of this URL itself: the 3xx went to the other URL under its key.
+        res = { kind: 'redirect', timestamp: cap.timestamp, status: Number(cap.statuscode), location: cap.twin.original };
+      }
     }
     failStreak = isTransient(res) ? failStreak + 1 : 0;
     if (res.kind !== 'missing' && !inWindow(res.timestamp, opts.window)) {
-      manifest.missing.push({ key: item.key, url: item.url, reason: 'only archived outside the good period', referrer: item.referrer });
+      manifest.missing.push({ key: item.key, url, reason: 'only archived outside the good period', referrer: item.referrer });
       return;
     }
     if (res.kind === 'ok') {
@@ -365,28 +451,36 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
       await writeFile(path.join(rawDir, file), res.body);
       const sha1 = createHash('sha1').update(res.body).digest('hex');
       manifest.resources.push({ ...base, timestamp: res.timestamp, status: 200, contentType: res.contentType, file, size: res.body.length, sha1 });
-      discover(res.body, res.contentType, item.url, item.key);
+      discover(res.body, res.contentType, url, item.key);
     } else if (res.kind === 'redirect') {
       const status = used && isRedirect(used) && used.timestamp === res.timestamp ? Number(used.statuscode) : res.status;
-      const target = toUrl(res.location, item.url);
+      const target = toUrl(res.location, url);
       manifest.resources.push({ ...base, timestamp: res.timestamp, status: normalizeRedirectStatus(status), location: target?.toString() ?? res.location });
       if (target) enqueue(target, 0, 'link', item.key);
     } else {
-      manifest.missing.push({ key: item.key, url: item.url, reason: res.reason, referrer: item.referrer, transient: res.transient || undefined });
+      manifest.missing.push({ key: item.key, url, reason: res.reason, referrer: item.referrer, transient: res.transient || undefined });
     }
   };
 
   const home = toUrl(`http://${opts.domain}/`)!;
   enqueue(home, 0, 'seed');
 
+  // Orphans past what the URL budget can still take are only counted: queueing every one of a
+  // big index would copy it whole.
+  let unqueued = 0;
   const addOrphans = () => {
-    let added = 0;
+    const room = Math.max(0, opts.maxUrls - processed);
+    const added = [0, 0, 0];
     for (const [key, c] of index) {
       if (seen.has(key)) continue;
       const u = toUrl(c.original);
-      if (u && enqueue(u, cdxHtml(c.mimetype) === false ? 2 : 1, 'index')) added++;
+      if (!u) continue;
+      const prio = guessHtml(c, u) === false ? 2 : 1;
+      if (added[prio] >= room) unqueued++;
+      else if (enqueue(u, prio, 'index')) added[prio]++;
     }
-    if (added) log(`following ${added} more URLs from the archive index that no page links to`);
+    const n = added[1] + added[2] + unqueued;
+    if (n) log(`following ${n} more URLs from the archive index that no page links to`);
   };
 
   const checkpoint = async () => {
@@ -453,7 +547,7 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
     await checkpoint();
     throw failure;
   }
-  const left = queued();
+  const left = queued() + unqueued;
   if (left > 0 || processed >= opts.maxUrls) {
     manifest.truncated = left > 0;
     if (left > 0) log(`URL limit reached: ${left} URLs were not downloaded`);

@@ -45,8 +45,11 @@ export interface RestoreOptions {
 // index entries for the pages it links to.
 const DEMO_MAX_URLS = 200;
 const DEMO_INDEX_URLS = 5_000;
-/** The index is read up to this many URLs per URL of the budget, never more than the cap. */
-const INDEX_PER_URL = 5;
+/**
+ * The index keeps about 0.5 KB per URL, so it stops here (some 230 MB). It is not tied to the URL
+ * budget: the index is sorted by URL, not by importance. A linked URL past the cut is looked up on
+ * its own; only unlinked ones are lost.
+ */
 const INDEX_CAP = 500_000;
 
 export interface RestoreResult {
@@ -112,7 +115,7 @@ export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
   const siteUrl = givenSiteUrl ?? `https://${host}`;
 
   emit('index', 'reading the archive index');
-  const indexLimit = demo ? DEMO_INDEX_URLS : Math.min(INDEX_CAP, maxUrls * INDEX_PER_URL);
+  const indexLimit = demo ? DEMO_INDEX_URLS : INDEX_CAP;
   const index = await buildIndex(client, { domain, target, window, maxIndexUrls: indexLimit, log: (m) => emit('index', m) });
   emit('index', `${index.size} URLs archived in the chosen period`);
   if (index.size === 0) {
@@ -131,9 +134,10 @@ export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
     progress: (p) => emit('download', p.current, { done: p.done, queued: p.queued }),
   });
   if (manifest.truncated) warnings.push(`The URL limit was reached; some archived URLs were not downloaded.`);
-  if (index.truncated) {
+  // A demo takes no unlinked URLs, so a cut-short index costs it nothing.
+  if (index.truncated && !demo) {
     manifest.truncated = true;
-    warnings.push(`The archive lists more than ${indexLimit} URLs for this domain; only the first ${indexLimit} were considered.`);
+    warnings.push(`The archive lists more than ${indexLimit} URLs for this domain. Every linked URL was still looked up, but unlinked ones were only taken from the first ${indexLimit}.`);
   }
   const refused = manifest.missing.filter((m) => m.transient);
   if (!manifest.resources.some((r) => r.status === 200)) {

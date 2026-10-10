@@ -29,7 +29,8 @@ export interface CdxQuery {
 }
 
 export type CaptureResult =
-  | { kind: 'ok'; timestamp: string; status: number; contentType: string; body: Buffer }
+  /** original: the URL the served capture is filed under; the archive can move to another spelling. */
+  | { kind: 'ok'; timestamp: string; original: string; status: number; contentType: string; body: Buffer }
   | { kind: 'redirect'; timestamp: string; status: number; location: string }
   /** transient: the archive itself failed or refused (429, 5xx), so a later try may work. */
   | { kind: 'missing'; status: number; reason: string; transient?: boolean };
@@ -213,6 +214,7 @@ export class ArchiveClient {
     if (!wanted) return { kind: 'missing', status: 0, reason: 'invalid URL' };
     const wantedKey = urlKey(wanted);
     let ts = timestamp;
+    let orig = original;
     let url = `${this.base}/web/${ts}id_/${original}`;
     const visited = new Set<string>();
 
@@ -236,6 +238,7 @@ export class ArchiveClient {
             const nextUrl = `${this.base}/web/${archived.timestamp}id_/${archived.original}`;
             if (visited.has(nextUrl)) return { kind: 'missing', status: res.status, reason: 'redirect loop' };
             ts = archived.timestamp;
+            orig = archived.original;
             url = nextUrl;
             continue;
           }
@@ -251,6 +254,7 @@ export class ArchiveClient {
         return {
           kind: 'ok',
           timestamp: fromHeader ?? ts,
+          original: orig,
           status: 200,
           contentType: res.headers.get('content-type') ?? '',
           body: res.body,

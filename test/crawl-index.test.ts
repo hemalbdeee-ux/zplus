@@ -90,6 +90,27 @@ describe('revisit rows and the demo limit', () => {
     assert.deepEqual(manifest.resources.map((r) => r.path).sort(), ['/', '/logo.png']);
   });
 
+  it('keeps the files of demo pages that are listed only as revisits', async () => {
+    // window.from (after an outage) is later than the first capture of the unchanged CSS and
+    // images, so all their rows in the window are revisits and the index cannot tell their type.
+    const page = (b: string) => html(`<link rel="stylesheet" href="/style.css">${b}<img src="/logo.png"><img src="/pic">`);
+    const twice = (url: string, type: string, body: string | Buffer): FakeCapture[] => [
+      { url, ts: '20170101000000', type, body },
+      { url, ts: '20200601000000', type, body, revisit: true },
+    ];
+    const caps: FakeCapture[] = [
+      { url: `${R}/`, ts: '20200601000000', body: page(Array.from({ length: 10 }, (_, i) => `<a href="/p${i}">p${i}</a>`).join('')) },
+      ...Array.from({ length: 10 }, (_, i): FakeCapture => ({ url: `${R}/p${i}`, ts: '20200601000000', body: page(`page ${i}`) })),
+      ...twice(`${R}/style.css`, 'text/css', 'body{}'),
+      ...twice(`${R}/logo.png`, 'image/png', PNG),
+      ...twice(`${R}/pic`, 'image/png', PNG),
+    ];
+    const { manifest } = await run(caps, { domain: 'revisit.example', target: '20200601000000', window: { from: '20190101000000' }, maxPages: 4 });
+    assert.equal(pagesOf(manifest).length, 4);
+    const files = manifest.resources.filter((r) => !/html/.test(r.contentType ?? '')).map((r) => r.path);
+    assert.deepEqual(files.sort(), ['/logo.png', '/pic', '/style.css']);
+  });
+
   it('puts unlinked pages listed as revisits ahead of images', async () => {
     const caps: FakeCapture[] = [
       { url: `${R}/`, ts: '20200601000000', body: html('home') },
@@ -124,20 +145,97 @@ describe('query-string variants', () => {
 });
 
 describe('index size limit', () => {
-  it('stops reading the index at its limit and says so in the report', async () => {
+  const S = 'http://cut.example';
+  const target = '20190601000000';
+  const window = { from: '20100101000000', to: '20191231235959' };
+  const PARKED = html('<h1>DOMAIN FOR SALE</h1>');
+  // The index is sorted by URL: the filler (and the junk before it) comes first, so a small index
+  // stops before the pages the homepage links to.
+  const caps: FakeCapture[] = [
+    {
+      url: `${S}/`,
+      ts: target,
+      body: html('<a href="/zz-deep">deep</a> <a href="/zz-forum?t=1">t1</a> <a href="/zz-About.html">about</a> <a href="/zz-gone">gone</a> <a href="/zz-news?utm_source=home">news</a>'),
+    },
+    ...Array.from({ length: 20 }, (_, i): FakeCapture => ({ url: `${S}/0/wp-json/x${i}`, ts: '20190101000000', type: 'application/json', body: '{}' })),
+    ...Array.from({ length: 30 }, (_, i): FakeCapture => ({ url: `${S}/a-${String(i).padStart(3, '0')}.html`, ts: '20190101000000', body: html('filler') })),
+    // The capture nearest the target is the parked domain; the in-window one is older.
+    { url: `${S}/zz-deep`, ts: '20150101000000', body: html('REAL deep page') },
+    { url: `${S}/zz-deep`, ts: '20200201000000', body: PARKED },
+    { url: `${S}/zz-forum?t=1`, ts: '20150101000000', body: html('topic 1') },
+    { url: `${S}/zz-forum?t=1`, ts: '20200201000000', body: PARKED },
+    { url: `${S}/zz-news`, ts: '20150101000000', body: html('REAL news') },
+    // A redirect the site made that only changes case: replay skips it.
+    { url: `${S}/zz-About.html`, ts: '20190501000000', status: 301, location: `${S}/zz-about.html` },
+    { url: `${S}/zz-about.html`, ts: '20190502000000', body: html('About') },
+  ];
+
+  it('stops reading at its limit, and junk it never downloads does not count', async () => {
+    const archive = await startFakeArchive(caps);
+    try {
+      const client = new ArchiveClient({ base: archive.base, ...FAST });
+      const index = await buildIndex(client, { domain: 'cut.example', target, window, maxIndexUrls: 10 });
+      assert.equal(index.size, 10);
+      assert.equal(index.truncated, true);
+      assert.ok(![...index.keys()].some((k) => k.includes('wp-json')));
+      const all = await buildIndex(client, { domain: 'cut.example', target, window });
+      assert.ok(!all.truncated && all.size === 36, String(all.size));
+    } finally {
+      await archive.close();
+    }
+  });
+
+  it('looks up a linked URL past the cut on its own', async () => {
+    const archive = await startFakeArchive(caps);
+    try {
+      const client = new ArchiveClient({ base: archive.base, ...FAST });
+      const opts: CrawlOptions = { domain: 'cut.example', target, window, workDir: await mkdtemp(path.join(work, 'w-')), maxUrls: 1000, orphans: true, workers: 2 };
+      const index = await buildIndex(client, { ...opts, maxIndexUrls: 10 });
+      const manifest = await crawl(client, index, opts);
+      const get = (p: string) => manifest.resources.find((r) => r.path === p);
+      for (const p of ['/zz-deep', '/zz-forum?t=1']) {
+        assert.equal(get(p)?.timestamp, '20150101000000', p);
+        assert.match(await readFile(path.join(opts.workDir, 'raw', get(p)!.file!), 'utf8'), /REAL deep page|topic 1/);
+      }
+      assert.deepEqual([get('/zz-About.html')?.status, get('/zz-About.html')?.location], [301, `${S}/zz-about.html`]);
+      assert.equal(get('/zz-about.html')?.status, 200);
+      // Looked up without its tracking parameter, like the index would have listed it.
+      assert.equal(get('/zz-news')?.timestamp, '20150101000000');
+      assert.ok(manifest.missing.some((m) => m.url.endsWith('/zz-gone') && /not archived in the good period/.test(m.reason)));
+      assert.ok(archive.requests.some((r) => r.includes('matchType=exact')));
+    } finally {
+      await archive.close();
+    }
+  });
+
+  it('does not tie the index size to the URL budget', async () => {
     const archive = await startFakeArchive(OLD_BAKERY);
     const out = await mkdtemp(path.join(work, 'r-'));
     try {
-      const client = new ArchiveClient({ base: archive.base, ...FAST });
-      const index = await buildIndex(client, { domain: 'oldbakery.example', target: '20201114083015', window: {}, maxIndexUrls: 10 });
-      assert.equal(index.size, 10);
-      assert.equal(index.truncated, true);
-      const all = await buildIndex(client, { domain: 'oldbakery.example', target: '20201114083015', window: {} });
-      assert.ok(!all.truncated && all.size > 10);
-
       const r = await restore({ domain: 'oldbakery.example', outDir: out, maxUrls: 2, zip: false, archive: { base: archive.base, ...FAST } });
       assert.equal(r.report.truncated, true);
-      assert.ok(r.report.warnings.some((w) => /only the first 10/.test(w)), r.report.warnings.join(' | '));
+      assert.ok(r.report.counts.indexUrls > 10, String(r.report.counts.indexUrls));
+      assert.ok(!r.report.warnings.some((w) => /lists more than/.test(w)), r.report.warnings.join(' | '));
+    } finally {
+      await archive.close();
+    }
+  });
+
+  it('restores the linked pages of a demo past the demo index size', async () => {
+    const big: FakeCapture[] = [
+      { url: `${S}/`, ts: target, body: html('<a href="/zz-deep">deep</a>') },
+      ...Array.from({ length: 5_010 }, (_, i): FakeCapture => ({ url: `${S}/a-${String(i).padStart(5, '0')}.html`, ts: '20190101000000', body: 'x' })),
+      ...caps.filter((c) => c.url.includes('/zz-deep')),
+    ];
+    const archive = await startFakeArchive(big);
+    const out = await mkdtemp(path.join(work, 'r-'));
+    try {
+      const r = await restore({ domain: 'cut.example', outDir: out, target, from: '2010', to: '2019', skipHealth: true, maxPages: 4, zip: false, archive: { base: archive.base, ...FAST } });
+      const manifest = JSON.parse(await readFile(path.join(r.jobDir, '.work', 'manifest.json'), 'utf8')) as Manifest;
+      assert.equal(manifest.resources.find((x) => x.path === '/zz-deep')?.timestamp, '20150101000000');
+      // Nothing is lost to the cut in a demo, which takes no unlinked URLs.
+      assert.equal(r.report.truncated, false);
+      assert.deepEqual(r.report.warnings, []);
     } finally {
       await archive.close();
     }

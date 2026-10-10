@@ -144,7 +144,8 @@ export async function startFakeArchive(captures: FakeCapture[], opts: FakeArchiv
         res.end('<p>Self-Redirect: No Closest Match Found</p>');
         return;
       }
-      if (skipped) {
+      // handleReplayRedirect: a capture at the asked time is served as is, any other is a move.
+      if (skipped && closest.ts !== ts) {
         res.writeHead(302, { location: `/web/${closest.ts}id_/${closest.url}` });
         res.end();
         return;
