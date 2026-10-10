@@ -35,10 +35,12 @@ function decodeSafe(s: string): string {
 /** Query string without tracking parameters, order and encoding kept. Returns '' or '?a=b'. */
 export function cleanSearch(search: string): string {
   if (!search || search === '?') return '';
+  // Names are compared as written (no tool escapes "utm_source"), so that queryPattern() can say
+  // in a server rule exactly what this function does.
   const parts = search
     .slice(1)
     .split('&')
-    .filter((p) => p !== '' && !TRACKING_PARAM.test(decodeSafe(p.split('=')[0])));
+    .filter((p) => p !== '' && !TRACKING_PARAM.test(p.split('=')[0]));
   return parts.length ? '?' + parts.join('&') : '';
 }
 
@@ -47,7 +49,7 @@ function regexEscape(s: string): string {
 }
 
 /**
- * Regular expression (the same in PCRE and JavaScript) for every raw query string that
+ * Regular expression (the same in PCRE and JavaScript) for exactly the raw query strings that
  * cleanSearch() turns into `query` ('' for none): empty segments and tracking parameters may sit
  * anywhere. Server rules need it because the archived URL (and a visitor's click with ?fbclid=)
  * carries the raw query, while routes and redirects are keyed by the cleaned one.
@@ -141,6 +143,18 @@ export function hasNonUtf8Escapes(pathname: string): boolean {
 /** The path as Apache and nginx see it once decoded: raw bytes, whatever the charset. */
 export function decodePathBytes(pathname: string): Buffer {
   return Buffer.from(pathname.replace(/%([0-9a-f]{2})/gi, (_m, hex: string) => String.fromCharCode(parseInt(hex, 16))), 'latin1');
+}
+
+/**
+ * Regular expression (PCRE, unanchored) for a path as Apache and nginx match it: slashes merged,
+ * escapes decoded, bytes outside printable ASCII written as \xHH. A Latin-1 path ("/caf%E9.html")
+ * is the byte 0xE9 to the server, which a UTF-8 config file cannot hold as text.
+ */
+export function pathBytesPattern(pathname: string): string {
+  return regexEscape(decodePathBytes(pathname.replace(/\/{2,}/g, '/')).toString('latin1')).replace(
+    /[\x00-\x1f\x7f-\xff]/g,
+    (c) => '\\x' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'),
+  );
 }
 
 /** Percent-decoded path for the file system ("/a%20b/" -> "/a b/"). */

@@ -11,6 +11,7 @@ import path from 'node:path';
 import { after, describe, it } from 'node:test';
 import { buildSite, planFiles } from '../src/engine/build.ts';
 import type { Manifest, Resource } from '../src/engine/crawl.ts';
+import type { Redirect, Route } from '../src/engine/serverconfig.ts';
 import { createPreviewServer } from '../src/engine/serve.ts';
 import {
   cleanSearch,
@@ -19,6 +20,7 @@ import {
   makeRootRelative,
   parseTimestamp,
   pathAndQuery,
+  pathBytesPattern,
   queryPattern,
   tsToIso,
   unwrapWaybackInText,
@@ -165,15 +167,16 @@ describe('build: URLs that differ only in letter case', () => {
     assert.equal(files['/style.css?ver=1'], 'style.css');
   });
 
-  it('serves both spellings, with one page in the sitemap', async () => {
+  it('serves every spelling, with one page in the sitemap', async () => {
     const gif = Buffer.from('GIF89a MARK[logo]');
     const { get, result } = await build([
       { url: 'http://example.com/Default.aspx', type: 'text/html', body: page('default') },
       { url: 'http://example.com/default.aspx', type: 'text/html', body: page('default') },
+      { url: 'http://example.com/DEFAULT.ASPX', type: 'text/html', body: page('default') },
       { url: 'http://example.com/Images/logo.gif', type: 'image/gif', body: gif },
       { url: 'http://example.com/images/logo.gif', type: 'image/gif', body: gif },
     ]);
-    for (const p of ['/Default.aspx', '/default.aspx']) {
+    for (const p of ['/Default.aspx', '/default.aspx', '/DEFAULT.ASPX']) {
       const r = await get(p);
       assert.equal(r.status, 200, p);
       assert.match(r.text, /MARK\[default\]/, p);
@@ -181,6 +184,7 @@ describe('build: URLs that differ only in letter case', () => {
     }
     for (const p of ['/Images/logo.gif', '/images/logo.gif']) assert.deepEqual((await get(p)).body, gif, p);
     assert.equal(result.pages.filter((pg) => pg.path.toLowerCase() === '/default.aspx').length, 1);
+    assert.equal((await get('/DeFault.aspx')).status, 404);
   });
 });
 
@@ -234,9 +238,11 @@ describe('build: Latin-1 percent escapes in a path', () => {
     assert.deepEqual(decodePathBytes('/caf%E9.html'), Buffer.from([0x2f, 0x63, 0x61, 0x66, 0xe9, 0x2e, 0x68, 0x74, 0x6d, 0x6c]));
     const { result, site, get } = await build([
       { url: 'http://example.com/', type: 'text/html', body: page('home') },
+      { url: 'http://example.com/about.html', type: 'text/html', body: page('about') },
       { url: 'http://example.com/caf%E9.html', type: 'text/html', body: page('latin1') },
       { url: 'http://example.com/m%FCsli/', type: 'text/html', body: page('latin1dir') },
       { url: 'http://example.com/caf%C3%A9.html', type: 'text/html', body: page('utf8') },
+      { url: 'http://example.com/alt%E9.html', type: 'text/html', status: 301, location: 'http://example.com/about.html' },
     ]);
     const files = await readdir(site, { recursive: true });
     assert.ok(!files.some((f) => f.includes('%')), files.join(', '));
@@ -245,9 +251,22 @@ describe('build: Latin-1 percent escapes in a path', () => {
       result.routes.map((r) => r.rawPath).sort(),
       ['/caf%E9.html', '/m%FCsli/'],
     );
+    assert.deepEqual(result.redirects.map((d) => [d.rawPath, d.to]), [['/alt%E9.html', '/about.html']]);
+    // What Apache and nginx compare these addresses with: the decoded byte, not "%E9".
+    const bytes = (raw: string) => decodePathBytes(raw).toString('latin1');
+    for (const raw of [...result.routes.map((r) => r.rawPath), '/alt%E9.html', '/caf%C3%A9.html']) {
+      const re = new RegExp('^' + pathBytesPattern(raw) + '$');
+      assert.ok(re.test(bytes(raw)), raw);
+      assert.ok(!re.test(raw), raw);
+      assert.match(pathBytesPattern(raw), /^[\x20-\x7e]+$/);
+    }
+    assert.equal(pathBytesPattern('/caf%E9.html'), '/caf\\xE9\\.html');
+    assert.equal(pathBytesPattern('//m%fcsli//'), '/m\\xFCsli/');
+    assert.equal(pathBytesPattern('/caf%C3%A9.html'), '/caf\\xC3\\xA9\\.html');
     assert.match((await get('/caf%E9.html')).text, /MARK\[latin1\]/);
     assert.match((await get('/m%FCsli/')).text, /MARK\[latin1dir\]/);
     assert.match((await get('/caf%C3%A9.html')).text, /MARK\[utf8\]/);
+    assert.equal((await get('/alt%E9.html')).status, 301);
   });
 });
 
@@ -363,6 +382,45 @@ describe('build: doubled slashes in a path', () => {
     assert.deepEqual(result.redirects, []);
     assert.match((await get('/old.php')).text, /MARK\[old\]/);
   });
+
+  it('answers query URLs and redirects at the merged address too', async () => {
+    const H = 'http://example.com';
+    const { get, read, result } = await build([
+      { url: `${H}/`, type: 'text/html', body: page('home').replace('</body>', `<a id="p" href="${H}//?p=123">post</a><a id="l" href="${H}//list.php">list</a></body>`) },
+      { url: `${H}//?p=123`, type: 'text/html', body: page('post123') },
+      { url: `${H}///?p=123`, type: 'text/html', body: page('post123b') },
+      { url: `${H}//index.php?page_id=5`, type: 'text/html', body: page('page5') },
+      { url: `${H}/index.php`, type: 'text/html', body: page('indexphp') },
+      { url: `${H}//list.php`, type: 'text/html', status: 301, location: `${H}/` },
+      { url: `${H}//list.php?p=2`, type: 'text/html', body: page('list2') },
+      { url: `${H}//go.php?id=1`, type: 'text/html', status: 302, location: `${H}/index.php` },
+      { url: `${H}//Both.php?x=1`, type: 'text/html', body: page('Both') },
+      { url: `${H}/both.php?x=1`, type: 'text/html', body: page('both') },
+    ]);
+    // Links lose the doubled slash, and nginx matches query rules on the raw request.
+    const html = (await read('index.html')).toString('utf8');
+    assert.match(html, /<a id="p" href="\/\?p=123">/);
+    assert.match(html, /<a id="l" href="\/list\.php">/);
+    const rules = JSON.parse((await read('__wbd/routes.json')).toString('utf8')) as { routes: Route[]; redirects: Redirect[] };
+    const key = (x: Route | Redirect) => x.rawPath + (x.query !== undefined ? '?' + x.query : '');
+    assert.deepEqual(rules.routes.map(key).sort(), [
+      '///?p=123', '//?p=123', '//Both.php?x=1', '//index.php?page_id=5', '//list.php?p=2',
+      '/?p=123', '/both.php?x=1', '/index.php?page_id=5', '/list.php?p=2',
+    ]);
+    assert.deepEqual(rules.redirects.map(key).sort(), ['//go.php?id=1', '//list.php', '/go.php?id=1', '/list.php']);
+    // No two server keys may differ only in letter case (nginx map keys ignore it).
+    const all = [...rules.routes, ...rules.redirects].map((x) => key(x).toLowerCase());
+    assert.equal(new Set(all).size, all.length);
+    // The report lists what the original site had.
+    assert.deepEqual(result.redirects.map(key).sort(), ['//go.php?id=1', '//list.php']);
+    assert.match((await get('/?p=123')).text, /MARK\[post123\]/);
+    assert.match((await get('/index.php?page_id=5')).text, /MARK\[page5\]/);
+    assert.match((await get('/index.php')).text, /MARK\[indexphp\]/);
+    assert.match((await get('/list.php?p=2')).text, /MARK\[list2\]/);
+    assert.equal((await get('/list.php')).status, 301);
+    assert.equal((await get('/go.php?id=1')).status, 302);
+    assert.match((await get('/both.php?x=1')).text, /MARK\[both\]/);
+  });
 });
 
 describe('url: dates for --target, --from and --to', () => {
@@ -397,6 +455,8 @@ describe('url: query patterns for server rules', () => {
     const raws = [
       'a=1&b=2', 'a=1&&b=2', '&a=1&b=2&', 'a=1&b=2&utm_source=x', 'fbclid=1&a=1&UTM_Medium=e&b=2', 'a=1&gclid', 'a=1',
       'a=1&b=2&c=3', 'b=2&a=1', 'a=12&b=2', 'xa=1&b=2', 'a=1&b=2x', '', 'fbclid=IwAR0abc', '&&', 'x=1', 'utm_=1', 'a.1&b=2',
+      // Escaped names are not tracking parameters to either side.
+      'a=1&b=2&utm%5Fsource=x', '%66bclid=1&a=1&b=2', 'utm%5Fsource=x', 'a=1&GCLID=2&b=2&_gl=', 'A=1&b=2',
     ];
     for (const query of ['a=1&b=2', 'a=1', '', 'x=1']) {
       const re = new RegExp(queryPattern(query));

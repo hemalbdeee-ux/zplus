@@ -524,6 +524,21 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
     });
   }
 
+  // nginx matches query routes and query redirects on the raw request, where //?p=1 is not /?p=1;
+  // Apache merges the slashes, and links to //?p=1 are written as /?p=1. So the merged address
+  // gets the same rule, unless it was archived itself. nginx map keys ignore letter case: a rule
+  // must not repeat another key in any case.
+  const keys = new Set(manifest.resources.map((r) => pathAndQuery(new URL(r.url)).toLowerCase()));
+  const withMerged = <T extends Route | Redirect>(x: T, byRawPath: boolean): T[] => {
+    const rawPath = x.rawPath.replace(/\/{2,}/g, '/');
+    const key = (rawPath + (x.query !== undefined ? '?' + x.query : '')).toLowerCase();
+    if (!byRawPath || rawPath === x.rawPath || keys.has(key)) return [x];
+    keys.add(key);
+    return [x, { ...x, rawPath }];
+  };
+  const serverRoutes = routes.flatMap((x) => withMerged(x, x.query !== undefined));
+  const serverRedirects = redirects.flatMap((d) => withMerged(d, d.query !== undefined || d.noQuery === true));
+
   // 5. Sitemaps, feed, robots.txt, 404 page.
   const indexable = pages.filter((pg) => !pg.noindex && pg.type !== 'archive' && (!pg.canonicalPath || pg.canonicalPath === pg.path));
   const entry = (pg: PageRecord): SitemapEntry => ({ path: pg.path, lastmod: pg.lastmod, image: pg.image });
@@ -551,13 +566,13 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
   if (!takenFiles.has('404.html')) await write('404.html', notFoundPage(siteName, home ? pages.find((pg) => pg.path === '/')?.lang : undefined));
 
   // 6. Server rules.
-  const rules: ServerRules = { domain: opts.domain, host: new URL(opts.siteUrl).host, routes, redirects, types };
+  const rules: ServerRules = { domain: opts.domain, host: new URL(opts.siteUrl).host, routes: serverRoutes, redirects: serverRedirects, types };
   await write('.htaccess', htaccess(rules));
   await write('_redirects', netlifyRedirects(rules));
   await write('_headers', netlifyHeaders(rules));
   await write(
     '__wbd/routes.json',
-    JSON.stringify({ domain: opts.domain, siteUrl: opts.siteUrl, routes, redirects, types }, null, 1),
+    JSON.stringify({ domain: opts.domain, siteUrl: opts.siteUrl, routes: serverRoutes, redirects: serverRedirects, types }, null, 1),
   );
   await writeFile(path.join(opts.serverDir, 'nginx.conf'), nginxConf(rules));
 
