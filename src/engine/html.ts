@@ -2,7 +2,7 @@
 
 import * as cheerio from 'cheerio';
 import type { CheerioAPI } from 'cheerio';
-import type { AnyNode } from 'domhandler';
+import type { AnyNode, Element } from 'domhandler';
 
 export type Doc = CheerioAPI;
 
@@ -17,7 +17,106 @@ export function removeNode($: Doc, el: AnyNode): void {
 }
 
 export function loadHtml(html: string): Doc {
-  return cheerio.load(html);
+  if (!/<form[\s/>]/i.test(html)) return cheerio.load(html);
+  const $ = cheerio.load(html, { sourceCodeLocationInfo: true });
+  keepFormOwners($, html);
+  return $;
+}
+
+// Old table layouts put forms where the parser cannot nest them: <table><form><tr><td><input>, or
+// a form closed by </td> with its submit button in the next cell. Browsers still tie those controls
+// to the form through the parser's form pointer, which lasts until the next </form> tag. The DOM
+// keeps no trace of that, so once the page is written back out the controls belong to no form and
+// the submit button does nothing. Such controls get form="<id of the form>", which says the same.
+const LISTED = new Set(['button', 'fieldset', 'input', 'object', 'output', 'select', 'textarea']);
+const RAW_TEXT = new Set(['script', 'style', 'textarea', 'title', 'xmp', 'iframe', 'noembed', 'noframes', 'noscript', 'plaintext']);
+
+interface SourceLoc {
+  startOffset: number;
+  endOffset: number;
+  startTag?: { startOffset: number; endOffset: number };
+  endTag?: { startOffset: number };
+}
+const locOf = (n: AnyNode) => (n as { sourceCodeLocation?: SourceLoc | null }).sourceCodeLocation ?? undefined;
+const isElement = (n: AnyNode): n is Element => n.type === 'tag' || n.type === 'script' || n.type === 'style';
+
+function keepFormOwners($: Doc, html: string): void {
+  // Source ranges that cannot hold a </form> tag: start tags, comments, the doctype and raw-text
+  // content. Plain text nodes are left out because the parser merges text across a stray </form>.
+  const opaque: Array<[number, number]> = [];
+  const forms: Element[] = [];
+  const controls: Element[] = [];
+  const ids = new Map<string, number>();
+  const walk = (nodes: AnyNode[]) => {
+    for (const n of nodes) {
+      const loc = locOf(n);
+      if (!isElement(n)) {
+        if (loc && n.type !== 'text') opaque.push([loc.startOffset, loc.endOffset]);
+        continue;
+      }
+      // Template content is a separate tree: its forms never set the pointer, its </form> never clears it.
+      if (n.name === 'template') {
+        if (loc) opaque.push([loc.startOffset, loc.endOffset]);
+        continue;
+      }
+      if (n.attribs.id) ids.set(n.attribs.id, (ids.get(n.attribs.id) ?? 0) + 1);
+      if (loc?.startTag) {
+        opaque.push([loc.startTag.startOffset, loc.startTag.endOffset]);
+        if (RAW_TEXT.has(n.name)) opaque.push([loc.startTag.endOffset, loc.endTag?.startOffset ?? loc.endOffset]);
+        if (n.name === 'form') forms.push(n);
+        else if (LISTED.has(n.name) && n.attribs.form === undefined) controls.push(n);
+      }
+      walk(n.children);
+    }
+  };
+  walk($.root().get(0)?.children ?? []);
+  if (!forms.length || !controls.length) return;
+
+  opaque.sort((a, b) => a[0] - b[0]);
+  const merged: Array<[number, number]> = [];
+  for (const r of opaque) {
+    const last = merged[merged.length - 1];
+    if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
+    else merged.push([r[0], r[1]]);
+  }
+  const formEnds: number[] = [];
+  let k = 0;
+  for (const m of html.matchAll(/<\/form[\s/>]/gi)) {
+    while (k < merged.length && merged[k][1] <= m.index) k++;
+    if (!(k < merged.length && merged[k][0] <= m.index)) formEnds.push(m.index);
+  }
+
+  // Each form's span runs from its start tag to the next </form>; the spans do not overlap, so
+  // one sweep over forms, end tags and controls in source order finds every control in each.
+  const at = (el: Element) => locOf(el)!.startOffset;
+  forms.sort((a, b) => at(a) - at(b));
+  controls.sort((a, b) => at(a) - at(b));
+  let e = 0;
+  let c = 0;
+  let made = 0;
+  for (const form of forms) {
+    const from = locOf(form)!.startTag!.endOffset;
+    while (e < formEnds.length && formEnds[e] < from) e++;
+    const to = e < formEnds.length ? formEnds[e] : Infinity;
+    while (c < controls.length && at(controls[c]) < from) c++;
+    const orphans: Element[] = [];
+    for (let j = c; j < controls.length && at(controls[j]) < to; j++) {
+      let p = controls[j].parent;
+      while (p && p !== form) p = p.parent;
+      if (!p) orphans.push(controls[j]);
+    }
+    if (!orphans.length) continue;
+    let id = form.attribs.id;
+    if (id && ids.get(id) !== 1) continue; // form="..." would find another element first
+    if (!id) {
+      do {
+        id = `wbd-form-${++made}`;
+      } while (ids.has(id));
+      ids.set(id, 1);
+      form.attribs.id = id;
+    }
+    for (const el of orphans) el.attribs.form = id;
+  }
 }
 
 const URL_ATTRS: Array<[string, string]> = [
@@ -60,15 +159,37 @@ const META_URL_NAMES = /^(og:image|og:image:url|og:image:secure_url|og:url|og:vi
 /** Called for each URL; return a new value to replace it, or undefined to keep it. */
 export type UrlVisitor = (url: string) => string | undefined;
 
+/**
+ * Splits a srcset the way browsers do: a URL is a run of non-whitespace (so commas inside it, as in
+ * /cdn-cgi/image/width=400,quality=75/a.jpg or a data: URL, stay), and its descriptor runs to the
+ * next comma outside parentheses. The descriptor keeps its leading whitespace.
+ */
 function splitSrcset(value: string): Array<{ url: string; descriptor: string }> {
-  return value
-    .split(/,(?=\s*[^\s,]+(?:\s+[\d.]+[wx])?\s*(?:,|$))/)
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .map((part) => {
-      const m = /^(\S+)(\s+.*)?$/.exec(part);
-      return { url: m?.[1] ?? part, descriptor: m?.[2] ?? '' };
-    });
+  const out: Array<{ url: string; descriptor: string }> = [];
+  const ws = /[\t\n\f\r ]/;
+  let i = 0;
+  while (i < value.length) {
+    while (i < value.length && (ws.test(value[i]) || value[i] === ',')) i++;
+    if (i >= value.length) break;
+    const start = i;
+    while (i < value.length && !ws.test(value[i])) i++;
+    const url = value.slice(start, i);
+    if (url.endsWith(',')) {
+      out.push({ url: url.replace(/,+$/, ''), descriptor: '' });
+      continue;
+    }
+    const from = i;
+    let depth = 0;
+    for (; i < value.length; i++) {
+      const c = value[i];
+      if (c === '(') depth++;
+      else if (c === ')' && depth > 0) depth--;
+      else if (c === ',' && depth === 0) break;
+    }
+    out.push({ url, descriptor: value.slice(from, i).trimEnd() });
+    i++;
+  }
+  return out;
 }
 
 export function rewriteSrcset(value: string, visit: UrlVisitor): string {
@@ -81,16 +202,23 @@ export function rewriteSrcset(value: string, visit: UrlVisitor): string {
   return changed ? parts.join(', ') : value;
 }
 
-const CSS_URL = /url\(\s*(['"]?)([^'")]+?)\1\s*\)/gi;
+// Whitespace is captured inside a lookahead and then matched by backreference, so each run of it
+// can be matched only one way: no backtracking blow-up on url( followed by thousands of spaces.
+const CSS_URL = /url\((?=(\s*))\1(?:"([^"]*)"|'([^']*)'|([^'"()\s]*))(?=(\s*))\5\)/gi;
 const CSS_IMPORT = /@import\s+(['"])([^'"]+)\1/gi;
 
 export function rewriteCss(css: string, visit: UrlVisitor): string {
-  const replace = (whole: string, quote: string, url: string) => {
-    if (/^data:/i.test(url)) return whole;
+  const swap = (whole: string, url: string) => {
+    if (!url || /^data:/i.test(url)) return whole;
     const next = visit(url);
-    return next === undefined || next === url ? whole : whole.replace(url, () => next);
+    if (next === undefined || next === url) return whole;
+    // The URL is the last thing in the match apart from its closing quote, spaces and paren.
+    const at = whole.lastIndexOf(url);
+    return whole.slice(0, at) + next + whole.slice(at + url.length);
   };
-  return css.replace(CSS_URL, replace).replace(CSS_IMPORT, replace);
+  return css
+    .replace(CSS_URL, (whole: string, _ws: string, dq?: string, sq?: string, bare?: string) => swap(whole, dq ?? sq ?? bare ?? ''))
+    .replace(CSS_IMPORT, (whole: string, _q: string, url: string) => swap(whole, url));
 }
 
 export function cssUrls(css: string): string[] {
@@ -131,7 +259,8 @@ export function visitUrls($: Doc, visit: UrlVisitor): void {
       const next = guarded(content);
       if (next !== undefined && next !== content) $el.attr('content', next);
     } else if (($el.attr('http-equiv') ?? '').toLowerCase() === 'refresh') {
-      const m = /^(\s*\d*\s*;\s*url\s*=\s*)(['"]?)(.+?)\2\s*$/i.exec(content);
+      // Trimmed first and with no two whitespace runs side by side, so the match stays linear.
+      const m = /^((?:\d+\s*)?;\s*url\s*=\s*)(['"]?)(.+?)\2$/i.exec(content.trim());
       if (m) {
         const next = guarded(m[3]);
         if (next !== undefined && next !== m[3]) $el.attr('content', m[1] + next);
@@ -161,7 +290,7 @@ export function collectUrls($: Doc): string[] {
   return out;
 }
 
-const HIDDEN = new Set(['script', 'style', 'noscript', 'template', 'svg', 'head', 'iframe', 'object']);
+const HIDDEN = new Set(['script', 'style', 'noscript', 'noembed', 'template', 'svg', 'head', 'iframe', 'object']);
 const BLOCK = new Set([
   'address', 'article', 'aside', 'blockquote', 'br', 'dd', 'div', 'dl', 'dt', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2',
   'h3', 'h4', 'h5', 'h6', 'header', 'hr', 'li', 'main', 'nav', 'ol', 'p', 'pre', 'section', 'table', 'td', 'th', 'tr', 'ul', 'option',
@@ -170,11 +299,18 @@ const BLOCK = new Set([
 /** Text a visitor would read, with block elements separated so words do not run together. */
 export function visibleText($: Doc): string {
   const parts: string[] = [];
+  const body = $('body').get(0);
   const walk = (nodes: AnyNode[]) => {
     for (const n of nodes) {
       if (n.type === 'text') parts.push((n as unknown as { data: string }).data);
       else if ((n.type === 'tag' || n.type === 'script' || n.type === 'style') && 'name' in n) {
         if (HIDDEN.has(n.name)) continue;
+        if (n.name === 'noframes') {
+          // Raw markup to the parser, and never shown by a browser with frames. A frameset page (no
+          // <body>) has nothing else to read, so that markup is read as a page of its own.
+          if (!body) parts.push(' ', visibleText(loadHtml($(n).text())), ' ');
+          continue;
+        }
         const block = BLOCK.has(n.name);
         if (block) parts.push(' ');
         walk((n as unknown as { children: AnyNode[] }).children);
@@ -182,7 +318,6 @@ export function visibleText($: Doc): string {
       }
     }
   };
-  const body = $('body').get(0);
   walk(body ? [body] : ($.root().get(0) as unknown as { children: AnyNode[] }).children);
   return parts.join('').replace(/\s+/g, ' ').trim();
 }

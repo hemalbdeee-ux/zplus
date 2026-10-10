@@ -142,7 +142,6 @@ const REMOVE = [
   'meta[property^="article:"]',
   'meta[name^="twitter:"]',
   'meta[property^="twitter:"]',
-  'script[type="application/ld+json"]',
   'meta[name="description" i]',
   'meta[name="generator" i]',
   'meta[charset]',
@@ -155,8 +154,47 @@ const REMOVE = [
   'link[type="text/xml+oembed"]',
 ];
 
+// The JSON-LD types the seo-head block writes; the page's own nodes of these types make way for it.
+const REGENERATED = new Set(['WebSite', 'WebPage', 'CollectionPage', 'ProfilePage', 'Article', 'BlogPosting', 'NewsArticle', 'BreadcrumbList']);
+
+type LdNode = Record<string, unknown>;
+const isNode = (v: unknown): v is LdNode => !!v && typeof v === 'object' && !Array.isArray(v);
+
+/** What stays of one node: all of it, or only its mainEntity (a Recipe, FAQPage, ...) when the seo-head writes its type. */
+function keepLd(node: unknown): unknown[] {
+  if (!isNode(node) || ![node['@type']].flat().some((t) => typeof t === 'string' && REGENERATED.has(t))) return [node];
+  const context = node['@context'];
+  return [node.mainEntity ?? []]
+    .flat()
+    .filter(isNode)
+    .flatMap((n) => keepLd(context && !('@context' in n) ? { '@context': context, ...n } : n));
+}
+
+/**
+ * Removes the page's own JSON-LD that the seo-head block replaces and keeps the rest: the Recipe,
+ * Product, FAQPage, Event or LocalBusiness markup that earned the page its rich results. Yoast and
+ * plugins put those in one @graph, so this works node by node.
+ */
+function pruneJsonLd($: Doc): void {
+  $('script[type="application/ld+json"]').each((_, el) => {
+    let data: unknown;
+    try {
+      data = JSON.parse($(el).html() ?? '');
+    } catch {
+      return; // Unreadable: leave the site's markup as it was.
+    }
+    const graph = isNode(data) && Array.isArray(data['@graph']) ? (data['@graph'] as unknown[]) : undefined;
+    const nodes = graph ?? (Array.isArray(data) ? data : [data]);
+    const kept = nodes.flatMap(keepLd);
+    if (kept.length === nodes.length && kept.every((n, i) => n === nodes[i])) return;
+    if (!kept.length) removeNode($, el);
+    else $(el).text(`\n${jsonLd(graph ? { ...(data as LdNode), '@graph': kept } : Array.isArray(data) || kept.length > 1 ? kept : kept[0])}\n`);
+  });
+}
+
 export function applySeo($: Doc, meta: PageMeta, site: SiteContext): void {
   for (const sel of REMOVE) $(sel).each((_, el) => removeNode($, el));
+  pruneJsonLd($);
   $('meta[http-equiv]').each((_, el) => {
     if (($(el).attr('http-equiv') ?? '').toLowerCase() === 'content-type') removeNode($, el);
   });
