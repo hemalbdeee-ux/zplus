@@ -399,9 +399,10 @@ server {
     server_name ${r.domain} www.${r.domain};
     root /var/www/${r.domain}/site;
     index index.html index.xml;
-    # Pages and text files are UTF-8. Feeds and scripts are left to say what they are, as Apache does.
+    # Pages and text files are UTF-8 (text/html is always among the charset_types). Feeds and
+    # scripts are left to say what they are, as Apache does.
     charset utf-8;
-    charset_types text/html text/plain;
+    charset_types text/plain;
     error_page 404 /404.html;
 
     include mime.types;
@@ -474,18 +475,23 @@ export function netlifyRedirects(r: ServerRules): string {
   const servedAsIs = (f: string) => f.endsWith('.html') && !/(^|\/)index\.html$/.test(f) && files.has(f.slice(0, -'.html'.length));
   const asIs = [...files].filter(servedAsIs).map((f): RedirectLine => ['/' + encodeFile(f), '/' + encodeFile(f), 200]);
   // A folder holding index.xml and no index.html (a WordPress /feed/, the generated /rss/): Apache,
-  // nginx and the preview serve it from there, Pages and Netlify only look for index.html.
+  // nginx and the preview serve it from there, Pages and Netlify only look for index.html. WordPress
+  // links a comment feed from every post, so these lines go after the redirects and routes: past
+  // 2,000 plain lines, Pages leaves out a feed rather than a page.
+  const isFeed = (f: string) => /(^|\/)index\.xml$/.test(f) && !files.has(f.slice(0, -'xml'.length) + 'html');
   const feeds = [...files]
-    .filter((f) => /(^|\/)index\.xml$/.test(f) && !files.has(f.slice(0, -'xml'.length) + 'html'))
+    .filter(isFeed)
     .flatMap((f) => fresh(['/' + encodeFile(f.slice(0, -'index.xml'.length))]).map((p): RedirectLine => [p, '/' + encodeFile(f), 200]));
   // Other spellings of those files' URLs (//p.html) are rewritten to the URL Pages serves the file at.
-  const aliases = (r.fileAliases ?? []).flatMap((a) => fresh([a.rawPath]).map((f): RedirectLine => [f, servedAsIs(a.file) ? '/' + encodeFile(a.file) : pagesTarget(a.file), 200]));
+  const alias = (a: FileAlias) => fresh([a.rawPath]).map((f): RedirectLine => [f, servedAsIs(a.file) ? '/' + encodeFile(a.file) : pagesTarget(a.file), 200]);
+  const aliases = (r.fileAliases ?? []).filter((a) => !isFeed(a.file)).flatMap(alias);
+  const feedAliases = (r.fileAliases ?? []).filter((a) => isFeed(a.file)).flatMap(alias);
   const home: RedirectLine = ['/index.html', '/', 200];
   section('# The home page, before any line Netlify reads as one for it', [...redirects, ...routes].filter(root));
   section('# For Cloudflare Pages, which redirects x.html to /x and x/index.html to /x/ by itself', [home, ...asIs].filter(([f]) => !taken.has(f)));
-  section('# Folders served from their index.xml, which Pages and Netlify do not look for', feeds);
   section('# Redirects the original site made', redirects.filter((l) => !root(l)));
   section('# Original URLs served from another file (rewrite, the URL stays the same)', [...routes.filter((l) => !root(l)), ...aliases]);
+  section('# Folders served from their index.xml, which Pages and Netlify do not look for', [...feeds, ...feedAliases]);
   // Pages tries patterns in file order and reads only 100: the two below go after the .html ones
   // they would hide and before the rest.
   const html = patterns.filter(([f]) => f.endsWith('.html'));

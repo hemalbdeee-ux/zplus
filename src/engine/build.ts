@@ -278,7 +278,10 @@ function fileCharset(body: Buffer, contentType: string, kind: Kind, pageCharset:
   if (!body.some((b) => b > 0x7f) || hasBom(body)) return undefined;
   // Not text after all: a .docx is "officedocument...xml", a text/plain URL can hold anything.
   if (body.includes(0) || (kind === 'xml' && !/^\s*</.test(body.subarray(0, 256).toString('latin1')))) return undefined;
-  const cs = legacyCharset(body, contentType, kind, pageCharset) ?? detectCharset(body, 'charset=utf-8');
+  // Without a BOM or a NUL byte the text is no UTF-16, whatever its label says (.NET wrote
+  // encoding="utf-16" on UTF-8 files): as for a label in a page, it is read as UTF-8 if it is that.
+  const label = legacyCharset(body, contentType, kind, pageCharset);
+  const cs = (label?.startsWith('utf-16') ? undefined : label) ?? detectCharset(body, 'charset=utf-8');
   return cs === 'utf-8' ? undefined : cs;
 }
 
@@ -332,14 +335,51 @@ function decodeXmlText(s: string): string {
   });
 }
 
+/** Deeper XML than this is read as HTML: xhtmlAsHtml writes it back level by level. */
+const XML_DEPTH_MAX = 500;
+
+/**
+ * One piece of markup as the XML parser of cheerio splits it: comment, CDATA, processing
+ * instruction, doctype (without an internal subset), text, end tag ($1) or start tag ($2) with
+ * quoted attributes, "/" in $3 when it closes itself.
+ */
+const XML_TOKEN =
+  /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?[^>]*>|<![Dd][Oo][Cc][Tt][Yy][Pp][Ee][^>[]*>|[^<]+|<\/([A-Za-z_:][-\w.:]*)\s*>|<([A-Za-z_:][-\w.:]*)(?:\s+[A-Za-z_:][-\w.:]*\s*=\s*(?:"[^"]*"|'[^']*'))*\s*(\/?)>/y;
+
+/**
+ * True when the elements of the markup nest as XML requires: every tag closed, in order, and no
+ * element inside a <script> or <style>. Anything else was written for the HTML parser (<br> left
+ * open, a script with "i<n" and no CDATA), which reads it as the author saw it in most browsers.
+ */
+function isWellFormedXml(xml: string): boolean {
+  const open: string[] = [];
+  let raw = 0;
+  for (XML_TOKEN.lastIndex = 0; XML_TOKEN.lastIndex < xml.length; ) {
+    const m = XML_TOKEN.exec(xml);
+    if (!m) return false;
+    const [, end, start, closed] = m;
+    if (end !== undefined) {
+      if (open.pop() !== end) return false;
+      if (end === 'script' || end === 'style') raw--;
+    } else if (start !== undefined) {
+      if (raw > 0 || open.length >= XML_DEPTH_MAX) return false;
+      if (closed) continue;
+      open.push(start);
+      if (start === 'script' || start === 'style') raw++;
+    }
+  }
+  return open.length === 0;
+}
+
 /**
  * A page served as application/xhtml+xml, read as browsers read it, with the XML parser: there
  * <script src="a.js"/> is an empty element and <![CDATA[ ]]> plain text, where the HTML parser takes
  * the first for a script holding the rest of the page. Written back as HTML that means the same,
  * which the build reads and servers send as text/html. XML always renders in standards mode, so
- * the page gets <!DOCTYPE html>, whatever doctype it had.
+ * the page gets <!DOCTYPE html>, whatever doctype it had. Markup that is no XML stays as it is.
  */
 function xhtmlAsHtml(xml: string): string {
+  if (!isWellFormedXml(xml)) return xml;
   const $ = cheerio.load(xml, { xml: { decodeEntities: false } });
   // Text stays as written, as the HTML parser reads its references the same way, except inside
   // <script> and <style>, where HTML reads none.
@@ -351,12 +391,12 @@ function xhtmlAsHtml(xml: string): string {
           const data = n.children.map((c) => ('data' in c ? c.data : '')).join('');
           return raw ? data : data.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         }
-        // A comment in a script is no part of its code in XML.
-        if (n.type === 'comment') return raw ? '' : `<!--${n.data}-->`;
+        // In a script or style, a comment ("<!-- ... //-->") stays: browsers that got the page as
+        // text/html ran and applied what it holds, and so does the HTML parser that reads it now.
+        if (n.type === 'comment') return `<!--${n.data}-->`;
         if (n.type === 'tag' || n.type === 'script' || n.type === 'style') {
           const attrs = Object.entries(n.attribs).map(([k, v]) => ` ${k}="${v.replace(/"/g, '&quot;')}"`);
           const inner = write(n.children, raw || n.name === 'script' || n.name === 'style');
-          // Markup that was no XML (<br> left open) keeps what the parser put inside.
           return `<${n.name}${attrs.join('')}>${inner}${VOID_ELEMENTS.has(n.name) ? '' : `</${n.name}>`}`;
         }
         return ''; // the doctype and processing instructions

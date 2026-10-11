@@ -181,11 +181,12 @@ export function mergeSlashes(pathname: string): string {
 }
 
 /**
- * The address Apache and nginx look a path up by: slashes merged and escapes decoded to bytes (one
- * character per byte). "/caf%E9.html", "/caf%e9.html" and "//caf%E9.html" are one address to them.
+ * The address Apache and nginx look a path up by: escapes decoded to bytes (one character per byte)
+ * and slashes merged. "/caf%E9.html", "/caf%e9.html" and "//caf%E9.html" are one address to them.
+ * They merge the slashes an escape decodes to as well: "/b/%2Fx" is "/b/x".
  */
 export function serverPath(pathname: string): string {
-  return decodePathBytes(mergeSlashes(pathname)).toString('latin1');
+  return mergeSlashes(decodePathBytes(pathname).toString('latin1'));
 }
 
 /** The path as sent, with every escape in capitals: "%e9" and "%E9" are the same byte. */

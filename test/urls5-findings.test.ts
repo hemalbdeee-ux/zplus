@@ -3,14 +3,17 @@
 //   (8,191 bytes per line) is left out of that file and named in the warnings, instead of stopping
 //   nginx from loading or making Apache answer 500 for every URL (finding 0).
 // - A folder served from index.xml (WordPress /feed/, the generated /rss/) gets a _redirects line,
-//   as Pages and Netlify only look for index.html (finding 1).
+//   as Pages and Netlify only look for index.html, after the redirects and routes, so that past
+//   2,000 lines Pages leaves out feeds, not pages (finding 1).
 // - A path with an escaped slash (/tag/AC%2FDC) is a route keyed by the address nginx and Pages
-//   read, not a file literally named "AC%2FDC" (finding 2).
+//   read, not a file literally named "AC%2FDC"; next to another slash (/b/%2Fleading) the two are
+//   merged once decoded, as nginx and Apache do (finding 2).
 // - _headers names a .php page by its URL as archived (/Q%26A.asp, /caf%c3%a9.php) (finding 3).
 // - Legacy-charset feeds and text files are converted to UTF-8, and nginx labels only pages and text
-//   as UTF-8, as Apache does (findings 4 and 19).
-// - A page served as application/xhtml+xml is read as XML (<script/> is empty) (finding 21), and a
-//   doctype after a long comment, or after a commented-out one, is kept (finding 25).
+//   as UTF-8, as Apache does (findings 4 and 19). A UTF-16 label on bytes with no NUL is not taken.
+// - A page served as application/xhtml+xml is read as XML (<script/> is empty) when it is well-formed,
+//   as HTML otherwise (finding 21), and a doctype after a long comment, or after a commented-out
+//   one, is kept (finding 25).
 // nginx, Apache (APACHE2_ROOT as in urls-servers.test.ts) and `wrangler pages dev` run when installed.
 
 import assert from 'node:assert/strict';
@@ -26,8 +29,8 @@ import { after, before, describe, it } from 'node:test';
 import { buildSite, type BuildResult } from '../src/engine/build.ts';
 import type { Manifest, Resource } from '../src/engine/crawl.ts';
 import { createPreviewServer } from '../src/engine/serve.ts';
-import { htaccess, nginxConf, type Redirect, type Route } from '../src/engine/serverconfig.ts';
-import { pathAndQuery, urlKey } from '../src/engine/url.ts';
+import { htaccess, netlifyRedirects, nginxConf, pagesOverflow, type Redirect, type Route } from '../src/engine/serverconfig.ts';
+import { pathAndQuery, serverPath, urlKey } from '../src/engine/url.ts';
 
 const H = 'http://example.com';
 const page = (mark: string) => `<!doctype html><html><head><title>${mark} | Example</title></head><body><p>MARK[${mark}]</p></body></html>`;
@@ -61,6 +64,9 @@ const captures: Capture[] = [
   // Finding 2.
   { url: `${H}/tag/AC%2FDC`, body: page('acdc') },
   { url: `${H}/files/a%2Fb.pdf`, type: 'application/pdf', body: 'PDF MARK[pdf]' },
+  // Next to another slash, which nginx and Apache merge with it once decoded.
+  { url: `${H}/share/http%3A%2F%2Fexample.org%2Fpage`, body: page('share') },
+  { url: `${H}/b/%2Fleading`, body: page('leading') },
   // Finding 3.
   { url: `${H}/caf%c3%a9.php`, body: page('cafe') },
   { url: `${H}/Q%26A.asp`, body: page('qa') },
@@ -71,6 +77,9 @@ const captures: Capture[] = [
   { url: `${H}/news.rss`, type: 'application/rss+xml; charset=ISO-8859-1', body: latin1('<?xml version="1.0"?>\n<rss version="2.0"><channel><title>Caf\xe9 MARK[news]</title></channel></rss>\n') },
   { url: `${H}/u8.xml`, type: 'text/xml; charset=utf-8', body: Buffer.from('<?xml version="1.0" encoding="ISO-8859-1"?><rss><channel><title>Caf\u00e9 MARK[u8]</title></channel></rss>') },
   { url: `${H}/notes.txt`, type: 'text/plain', body: latin1('Caf\xe9 au lait MARK[notes]\n') },
+  // What .NET writes: UTF-8 bytes under a UTF-16 declaration, which browsers read as UTF-8.
+  { url: `${H}/u16.xml`, type: 'text/xml', body: Buffer.from('<?xml version="1.0" encoding="utf-16"?>\n<rss><channel><title>Caf\u00e9 MARK[u16]</title></channel></rss>\n') },
+  { url: `${H}/u16b.xml`, type: 'text/xml', body: latin1('<?xml version=\'1.0\' encoding=\'UTF-16\'?><rss><channel><title>Caf\xe9 MARK[u16b]</title></channel></rss>') },
   { url: `${H}/report.docx`, type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', body: Buffer.from([0x50, 0x4b, 0x03, 0x04, 0xe9, 0x00, 0xff]) },
 ];
 
@@ -84,6 +93,8 @@ const expected: Array<[string, string]> = [
   ['/caf%C3%A9/feed/', '200 cafefeed'],
   ['/tag/AC%2FDC', '200 acdc'],
   ['/files/a%2Fb.pdf', '200 pdf'],
+  ['/share/http%3A%2F%2Fexample.org%2Fpage', '200 share'],
+  ['/b/%2Fleading', '200 leading'],
   ['/caf%c3%a9.php', '200 cafe'],
   ['/Q%26A.asp', '200 qa'],
   ['/feed.xml', '200 latin1feed'],
@@ -234,8 +245,24 @@ describe('a folder served from index.xml', () => {
     ]) {
       assert.ok(lines.includes(want), want);
     }
-    // Before the redirects, routes and patterns: Pages reads only the first 2,000 plain lines.
-    assert.ok(lines.indexOf('/rss/  /rss/index.xml  200') < lines.findIndex((l) => l.includes('/__wbd/')));
+    // After the redirects and routes, which lead to pages, before the patterns: past 2,000 plain
+    // lines, Pages leaves out a feed rather than a page.
+    const at = (l: string) => lines.indexOf(l);
+    assert.ok(lines.findLastIndex((l) => l.includes('/__wbd/')) < at('/feed/  /feed/index.xml  200'));
+    assert.ok(at('/caf%c3%a9/feed/  /caf%C3%A9/feed/index.xml  200') < at('/*/index.html  /:splat/  200'));
+    assert.ok(at('/rss/  /rss/index.xml  200') < at('/*/index.html  /:splat/  200'));
+  });
+
+  it('comes after every redirect and route, so Pages leaves out feeds first', () => {
+    const files = ['index.html', ...Array.from({ length: 2100 }, (_, i) => [`post-${i}/index.html`, `post-${i}/feed/index.xml`]).flat()];
+    const redirects: Redirect[] = Array.from({ length: 5 }, (_, i) => ({ path: `/old-${i}/`, rawPath: `/old-${i}/`, to: `/post-${i}/`, status: 301 }));
+    const routes: Route[] = [{ path: '/tag/AC/DC', rawPath: '/tag/AC%2FDC', file: '__wbd/f/a.html' }];
+    const text = netlifyRedirects({ domain: 'example.com', host: 'example.com', routes, redirects, types: [], files });
+    const plain = text.split('\n').filter((l) => l.startsWith('/') && !l.includes('*'));
+    for (const d of redirects) assert.ok(plain.indexOf(`${d.rawPath}  ${d.to}  301`) < 2000, d.rawPath);
+    assert.ok(plain.indexOf('/tag/AC%2FDC  /__wbd/f/a  200') < 2000);
+    assert.ok(plain.indexOf('/post-0/feed/  /post-0/feed/index.xml  200') < 2000);
+    assert.equal(pagesOverflow(text, ''), plain.length - 2000);
   });
 
   it('does not get one next to an index.html', async () => {
@@ -264,7 +291,15 @@ describe('an escaped slash in a path', () => {
     assert.match(find('/files/a%2Fb.pdf')?.file ?? '', /^__wbd\/f\/\w+\.pdf$/);
     assert.ok(!existsSync(path.join(siteDir, 'tag')));
     assert.ok(!existsSync(path.join(siteDir, 'files')));
-    assert.ok(result.warnings.some((w) => w.startsWith('2 original URL(s) such as http://example.com/tag/AC%2FDC') && w.includes('AllowEncodedSlashes On')));
+    assert.ok(result.warnings.some((w) => w.startsWith('4 original URL(s) such as http://example.com/tag/AC%2FDC') && w.includes('AllowEncodedSlashes On')));
+  });
+
+  it('is keyed by the address nginx and Apache read, with the slashes merged once decoded', async () => {
+    assert.equal(serverPath('/b/%2Fleading'), '/b/leading');
+    assert.equal(serverPath('//share/http%3A%2F%2Fexample.org'), '/share/http:/example.org');
+    const conf = await readFile(path.join(serverDir, 'nginx.conf'), 'utf8');
+    assert.match(conf, /"~\^\/b\/leading\$"/);
+    assert.match(conf, /"~\^\/share\/http:\/example\\\\\.org\/page\$"/);
   });
 
   it('has a raw-path line for Cloudflare Pages', async () => {
@@ -290,11 +325,14 @@ describe('legacy-charset feeds and text files', () => {
     // Read as UTF-8 under its Content-Type: the declaration that said otherwise is corrected.
     assert.equal((await site('u8.xml')).toString('utf8'), '<?xml version="1.0" encoding="UTF-8"?><rss><channel><title>Café MARK[u8]</title></channel></rss>');
     assert.equal((await site('notes.txt')).toString('utf8'), 'Café au lait MARK[notes]\n');
+    // A UTF-16 label on bytes with no NUL cannot be true: UTF-8 stays as it is, other bytes are windows-1252.
+    assert.equal((await site('u16.xml')).toString('utf8'), '<?xml version="1.0" encoding="UTF-8"?>\n<rss><channel><title>Café MARK[u16]</title></channel></rss>\n');
+    assert.equal((await site('u16b.xml')).toString('utf8'), "<?xml version='1.0' encoding='UTF-8'?><rss><channel><title>Café MARK[u16b]</title></channel></rss>");
     assert.deepEqual(await site('report.docx'), Buffer.from([0x50, 0x4b, 0x03, 0x04, 0xe9, 0x00, 0xff]));
   });
 
   it('are not labelled UTF-8 by nginx unless they are pages or text', async () => {
-    assert.match(await readFile(path.join(serverDir, 'nginx.conf'), 'utf8'), /^ {4}charset utf-8;\n(?: {4}#.*\n)? {4}charset_types text\/html text\/plain;$/m);
+    assert.match(await readFile(path.join(serverDir, 'nginx.conf'), 'utf8'), /^ {4}charset utf-8;\n(?: {4}#.*\n)* {4}charset_types text\/plain;$/m);
   });
 });
 
@@ -334,6 +372,41 @@ describe('a page served as application/xhtml+xml', () => {
       assert.match(html, /<script type="text\/javascript">if \(1 < 2 && true\) document\.title \+= '!';<\/script>/);
       assert.match(html, /<script type="text\/javascript"> if \(1 < 2\) document\.title \+= '\?'; <\/script>/);
       assert.equal(r.pages.find((pg) => pg.path === '/notes')?.description, 'Notes on things & more');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('is read as HTML when it is no XML, as browsers that got it as text/html read it', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'wbd-urls5-xhtml2-'));
+    const xhtml = (head: string, body: string) =>
+      `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">\n` +
+      `<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T | Example</title>${head}</head><body>${body}</body></html>`;
+    const loop = 'for (var i=0;i<n;i++) { if (a&&b) x(i); }';
+    const pages: Record<string, string> = {
+      // Each <br> left open would hold the rest of the page in XML: thousands of levels.
+      breaks: xhtml('', `<p>${'line<br>'.repeat(3000)}MARK[breaks]</p>`),
+      paras: xhtml('', '<div><p>one<p>two<p>three</div><p>MARK[paras]</p>'),
+      loop: xhtml(`<script type="text/javascript">${loop}</script><style type="text/css">p { color: red }</style>`, '<p>MARK[loop]</p>'),
+      deep: xhtml('', `${'<div>'.repeat(600)}MARK[deep]${'</div>'.repeat(600)}`),
+      // XML: the script is empty, the comments in a script and a style keep what they hold.
+      hidden: xhtml(
+        '<script type="text/javascript" src="/a.js"/><style type="text/css"><!-- p { color: red } --></style><script type="text/javascript"><!--\nwindow.a = 1;\n//--></script>',
+        '<p>MARK[hidden]</p>',
+      ),
+    };
+    try {
+      await build([{ url: `${H}/`, body: page('home') }, ...Object.entries(pages).map(([name, body]) => ({ url: `${H}/${name}`, type: 'application/xhtml+xml', body }))], dir);
+      const out = (name: string) => readFileSync(path.join(dir, 'site', `${name}.html`), 'utf8');
+      assert.equal(out('breaks').match(/<br>/g)?.length, 3000);
+      assert.match(out('breaks'), /<br>MARK\[breaks\]<\/p>/);
+      assert.match(out('paras'), /<div><p>one<\/p><p>two<\/p><p>three<\/p><\/div><p>MARK\[paras\]<\/p>/);
+      assert.ok(out('loop').includes(`<script type="text/javascript">${loop}</script><style type="text/css">p { color: red }</style>`), out('loop'));
+      assert.match(out('deep'), /MARK\[deep\]/);
+      const hidden = out('hidden');
+      assert.match(hidden, /<script type="text\/javascript" src="\/a\.js"><\/script><style type="text\/css"><!-- p \{ color: red \} --><\/style>/);
+      assert.match(hidden, /<script type="text\/javascript"><!--\nwindow\.a = 1;\n\/\/--><\/script>/);
+      assert.match(hidden, /<body><p>MARK\[hidden\]<\/p>/);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -404,6 +477,7 @@ describe('the fifth-round site on nginx', { skip: nginxProbe.error || nginxProbe
     assert.equal((await probe(port, '/feed.xml')).type, 'text/xml');
     assert.equal((await probe(port, '/news.rss')).type, 'application/rss+xml');
     assert.equal((await probe(port, '/notes.txt')).type, 'text/plain; charset=utf-8');
+    assert.equal((await probe(port, '/')).type, 'text/html; charset=utf-8');
   });
 });
 
