@@ -1,8 +1,8 @@
 {
-  "name": "wayback-downloader",
+  "name": "zplus",
   "version": "0.1.0",
   "private": true,
-  "description": "Recover expired websites from the Wayback Machine and deliver them as Ghost-style, SEO-ready static sites.",
+  "description": "zplus.ai: capture an expired website from the Wayback Machine with every original URL intact, as a static site with a Ghost-style SEO layer.",
   "type": "module",
   "engines": {
     "node": ">=22.18"

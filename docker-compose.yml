@@ -17,6 +17,10 @@ services:
       WBD_RETENTION_DAYS: ${WBD_RETENTION_DAYS:-7}
     volumes:
       - wbd-data:/data   # SQLite database and job files
+    # Caps so a big restore can never slow down other sites on the same VPS (RigConfigurator).
+    cpus: ${WBD_CPUS:-1.0}
+    mem_limit: ${WBD_MEMORY:-1g}
+    pids_limit: 256
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.zplus.rule=Host(`${WBD_DOMAIN:-zplus.ai}`) || Host(`www.${WBD_DOMAIN:-zplus.ai}`)"
