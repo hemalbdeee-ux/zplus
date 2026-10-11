@@ -25,6 +25,11 @@
         <div class="notice notice-bad" role="alert">
             <h2>This did not work</h2>
             <p>{{job.error}}</p>
+            {{#if job.canRetry}}
+            <form method="post" action="/job/{{job.id}}/retry"><button class="btn" type="submit">Try again</button></form>
+            <p class="form-note">The restore continues where it stopped: what it has downloaded is kept.</p>
+            {{else}}{{#if job.recheck}}{{> recheck domain=job.domain}}{{/if}}{{/if}}
+            {{#if job.retriesUsed}}<p>This restore has already been run again {{job.retriesUsed}} times, as often as one restore can be, so it cannot continue here. A new restore from the snapshots starts over.</p>{{/if}}
             <p>{{#if job.parentId}}<a href="/job/{{job.parentId}}/">Back to the snapshots</a>{{else}}<a href="/restore/">Try another domain</a>{{/if}}</p>
         </div>
     {{/if}}
@@ -62,9 +67,11 @@
                         {{#if formError}}<p class="form-error" role="alert">{{formError}}</p>{{/if}}
                         <button class="btn" type="submit">Restore this snapshot</button>
                     </form>
+                    {{else}}{{#if job.refusal}}
+                    <div class="notice notice-bad"><h2>No healthy snapshot found yet</h2><p>None of the homepages we could check looks like a real website, but archive.org refused {{job.refusal.refused}} of the {{job.refusal.checked}} captures we asked for{{#if job.refusal.reason}} ({{job.refusal.reason}}){{/if}}. The site may be among those, so checking again later may find it.</p>{{> recheck domain=job.domain}}</div>
                     {{else}}
                     <div class="notice notice-bad"><h2>No healthy snapshot</h2><p>None of the archived homepages looks like a real website: they are parking pages, errors or spam. There is nothing worth restoring.</p></div>
-                    {{/if}}
+                    {{/if}}{{/if}}
                 </div>
             </div>
             {{#if job.probed.length}}
@@ -92,7 +99,7 @@
                     <div><dt>Not in the archive</dt><dd>{{number job.report.counts.missing}}</dd></div>
                 </dl>
                 <p class="actions">{{#if job.hasZip}}<a class="btn" href="/job/{{job.id}}/download">Download ZIP</a>{{/if}} <a class="btn btn-ghost" href="/job/{{job.id}}/report">Open the report</a></p>
-                {{#if job.demo}}<p class="notice">This demo contains the homepage and the first pages it links to. A <a href="/job/{{job.parentId}}/">full restore</a> downloads every archived URL of the healthy period.</p>{{/if}}
+                {{#if job.demo}}<p class="notice">This demo contains the homepage and the first pages it links to. A {{#if job.parentId}}<a href="/job/{{job.parentId}}/">full restore</a>{{else}}full restore{{/if}} downloads every archived URL of the healthy period.</p>{{/if}}
                 {{#each job.report.warnings}}<p class="notice">{{this}}</p>{{/each}}
                 <h3>Put it online</h3>
                 <ol class="howto">

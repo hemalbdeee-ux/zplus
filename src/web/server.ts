@@ -13,7 +13,7 @@ import type { PageMeta } from '../engine/meta.ts';
 import { robotsTxt, rssFeed, sitemaps, sitemapXsl, type SitemapEntry } from '../engine/sitemap.ts';
 import { normalizeDomain } from '../engine/url.ts';
 import { Content, paginate, type Entry } from './content.ts';
-import { JobStore, type Job } from './db.ts';
+import { JobStore, MAX_RETRIES, type Job } from './db.ts';
 import { Theme, type ViewContext } from './views.ts';
 import { JobRunner, type RestoreJobResult, type ScanResult } from './worker.ts';
 
@@ -56,6 +56,10 @@ const PER_PAGE = 10;
 const MONTHS = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split(' ');
 /** Wrong access codes allowed per address and hour before every full restore is refused. */
 const CODE_TRIES = 5;
+/** A scan of a domain is reused for this long, for everyone who asks for the same domain. */
+const SCAN_REUSE_MS = 12 * 3600_000;
+/** docker stop kills the container 10 s after SIGTERM; the server is done before that. */
+const SHUTDOWN_MS = 8000;
 
 function codeMatches(given: string, expected: string): boolean {
   const a = Buffer.from(given);
@@ -130,6 +134,17 @@ function snapshotChoices(h: HealthReport) {
     .reverse()
     .slice(0, 36)
     .map((m) => ({ timestamp: m.timestamp!, score: m.score, selected: m.timestamp === h.lastGood?.timestamp }));
+}
+
+/**
+ * A finished scan that found no healthy snapshot while archive.org refused some of the captures it
+ * asked for: the snapshot it is looking for may be among those, so the scan is no answer.
+ */
+function refusedScan(job: Job): { refused: number; checked: number; reason?: string } | undefined {
+  if (job.kind !== 'scan' || job.status !== 'done' || !job.result) return undefined;
+  const r = JSON.parse(job.result) as ScanResult;
+  if (r.health.lastGood || !r.refused) return undefined;
+  return { refused: r.refused, checked: r.refused + (r.played ?? 0), reason: r.lastRefusal };
 }
 
 /** Example timeline for the homepage: a site that was fine until late 2020, then parked. */
@@ -365,8 +380,9 @@ export async function createApp(config: WebConfig) {
         raw ? 422 : 200,
       );
     }
-    const recent = store.recentScan(domain, 12 * 3600_000);
-    if (recent) return res.redirect(303, `/job/${recent.id}/`);
+    // A scan archive.org partly refused is not reused: asking again is how to get an answer.
+    const recent = store.recentScan(domain, SCAN_REUSE_MS);
+    if (recent && !refusedScan(recent)) return res.redirect(303, `/job/${recent.id}/`);
     const ip = clientKey(req.ip);
     if (store.countByIp(ip, 3600_000, 'scan') >= config.scanLimit) {
       return render(res, 'restore', { title: `Restore a website · ${s.title}`, seo: meta({ path: '/restore/', noindex: true }), error: 'Too many checks from your address in the last hour. Please try again later.', domain: raw }, 429);
@@ -390,6 +406,9 @@ export async function createApp(config: WebConfig) {
 
   const jobView = (job: Job) => {
     const result = job.result ? JSON.parse(job.result) : undefined;
+    // The scan a restore was made from is kept as long as the restore (JobRunner.sweep), except in
+    // a database swept before that rule: then the restore cannot run again (worker.ts scanGone).
+    const scanGone = job.kind === 'restore' && !!job.parent_id && store.get(job.parent_id)?.status !== 'done';
     const view: Record<string, unknown> = {
       id: job.id,
       kind: job.kind,
@@ -404,9 +423,14 @@ export async function createApp(config: WebConfig) {
       position: store.queuePosition(job.id),
       isScan: job.kind === 'scan',
       demo: job.max_pages !== null,
-      parentId: job.parent_id,
+      parentId: scanGone ? null : job.parent_id,
       codeRequired: !!config.accessCode,
       codeTries: CODE_TRIES,
+      // A failed restore runs again where it stopped; a scan, or a restore whose scan is gone, is
+      // asked for again from the start.
+      canRetry: job.status === 'failed' && store.canRetry(job.id),
+      recheck: job.status === 'failed' && (job.kind === 'scan' || scanGone),
+      retriesUsed: job.status === 'failed' && job.kind === 'restore' && !scanGone && job.retries >= MAX_RETRIES ? job.retries : 0,
     };
     if (job.kind === 'scan' && result) {
       const h = (result as ScanResult).health;
@@ -414,6 +438,7 @@ export async function createApp(config: WebConfig) {
       view.rows = timelineRows(h);
       view.choices = snapshotChoices(h);
       view.probed = h.months.filter((m) => m.probed);
+      view.refusal = refusedScan(job);
     }
     if (job.kind === 'restore' && result) {
       const r = result as RestoreJobResult;
@@ -468,6 +493,15 @@ export async function createApp(config: WebConfig) {
     res.redirect(303, `/job/${job.id}/`);
   });
 
+  // A restore that failed (archive.org refused too many downloads, say) runs again under the same id:
+  // it continues from its work folder instead of downloading everything again, and it is not another
+  // restore for the daily limit. MAX_RETRIES keeps one job from being run again and again.
+  app.post('/job/:id/retry', loadJob, (_req, res) => {
+    const job = res.locals.job as Job;
+    if (store.retry(job.id)) runner.tick();
+    res.redirect(303, `/job/${job.id}/`);
+  });
+
   // With root, send checks only the path below it for dotfiles, so a data folder like ~/.local/share/wbd works.
   app.get('/job/:id/download', loadJob, (_req, res) => {
     const job = res.locals.job as Job;
@@ -518,7 +552,24 @@ export async function createApp(config: WebConfig) {
 
 if (process.argv[1] === import.meta.filename) {
   const config = configFromEnv();
-  const { app, runner, content } = await createApp(config);
+  const { app, store, runner, content } = await createApp(config);
   runner.start();
-  app.listen(config.port, () => console.log(`${content.settings.title} on ${config.siteUrl} (port ${config.port})`));
+  const server = app.listen(config.port, () => console.log(`${content.settings.title} on ${config.siteUrl} (port ${config.port})`));
+  // A deploy (docker stop) or Ctrl-C: running jobs stop and go back to the queue without using up an
+  // attempt, so the next start resumes them. A second signal ends the process at once, as does the
+  // timer, before docker would kill it.
+  let closing = false;
+  const shutdown = (signal: NodeJS.Signals) => {
+    if (closing) process.exit(1);
+    closing = true;
+    console.error(`${signal}: stopping`);
+    setTimeout(() => process.exit(1), SHUTDOWN_MS).unref();
+    server.close();
+    void runner.shutdown().finally(() => {
+      store.close();
+      process.exit(0);
+    });
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 }
