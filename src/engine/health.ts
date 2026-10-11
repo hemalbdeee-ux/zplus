@@ -5,7 +5,7 @@
 // capture restores that junk. This module scores the homepage month by month and returns the last
 // good snapshot plus the time window in which the site was itself.
 
-import type { ArchiveClient, Capture } from './archive.ts';
+import type { ArchiveClient, Capture, CaptureResult } from './archive.ts';
 import { decodeText } from './charset.ts';
 import { countWords, loadHtml, visibleText } from './html.ts';
 import { bareHost, isInternal, toUrl, urlKey } from './url.ts';
@@ -24,12 +24,15 @@ export interface PageSignals {
   hint?: string;
   /** Distinct internal paths linked: a menu of pages, not a parking page's /search?q= ads. */
   paths?: number;
+  /** Those paths (the first 100), to tell the site's own menu from a later owner's page. */
+  menu?: string[];
   /** Where a stub homepage (internal meta refresh, frameset, "enter" page) sends visitors. */
   follow?: string;
 }
 
 export interface MonthHealth {
   month: string; // YYYYMM
+  /** Days with a capture: the index is read one capture a day. */
   captures: number;
   timestamp?: string;
   original?: string;
@@ -162,7 +165,7 @@ export function analyzePage(html: string, pageUrl: string, domain: string): Page
     follow = pick?.url.toString();
   }
   const spamHits = hay.match(SPAM)?.length ?? 0;
-  return { words, internalLinks, title, lang, spamHits, fatal, hint, paths: paths.size, follow };
+  return { words, internalLinks, title, lang, spamHits, fatal, hint, paths: paths.size, menu: [...paths].slice(0, 100), follow };
 }
 
 /** Spam words well above what the site itself used: a new owner. */
@@ -291,18 +294,71 @@ export function groupByMonth(captures: Capture[]): MonthHealth[] {
 /** Redirects and stub pages followed from the homepage before giving up. */
 const MAX_HOPS = 5;
 
+/** Reasons that mean another owner: the window walk never takes them for an outage of the site. */
+const NEW_OWNER = /parked|redirects to|sends visitors|spam/;
+
 export interface ScanOptions {
   maxProbes?: number;
   log?: (msg: string) => void;
 }
 
+/** What a probe found on the way from the homepage to the page visitors saw. */
+interface Outcome {
+  /** What visitors saw. */
+  signals?: PageSignals;
+  /** The URL that content came from; unset for a redirect off the site. */
+  scoredAt?: string;
+  /** The stub page on the way (without one, an internal redirect), scored itself when the page behind it cannot be had. */
+  stub?: { signals: PageSignals; url?: string };
+  /** What the homepage capture was: its digest, or where it redirected. */
+  via?: string;
+  /** Where the stub (or the redirect) sends visitors. */
+  leads?: string;
+  /** The months of the stub's capture and of the page's, when the archive played them apart. */
+  span?: [string, string];
+  /** Why the way ended without a page. */
+  failure?: string;
+  /** How the archive failed or refused (429, 5xx). That says nothing about the site. */
+  refused?: string;
+  /** The archive would not play what was there before; the stub is not scored as itself either. */
+  unsure?: boolean;
+}
+
+interface Stub {
+  signals: PageSignals;
+  url: string;
+  timestamp: string;
+  /** The homepage capture itself, whose neighbours the archive's index lists. */
+  home: boolean;
+}
+
+/** The archive itself failed or refused. A client that does not say is judged by the status it got. */
+function refusedByArchive(res: { status: number; reason: string; transient?: boolean }): boolean {
+  return res.transient ?? ((res.status === 429 || res.status >= 500) && res.reason === `HTTP ${res.status}`);
+}
+
+function tsTime(ts: string): number {
+  return Date.UTC(Number(ts.slice(0, 4)), Number(ts.slice(4, 6)) - 1, Number(ts.slice(6, 8)) || 1, Number(ts.slice(8, 10)) || 0, Number(ts.slice(10, 12)) || 0);
+}
+
+const WEEK = 7 * 24 * 3600 * 1000;
+
 export async function scanHealth(client: ArchiveClient, domain: string, opts: ScanOptions = {}): Promise<HealthReport> {
   const log = opts.log ?? (() => {});
   const maxProbes = opts.maxProbes ?? 14;
 
+  // One capture a day is enough to tell the months apart. A busy homepage has hundreds a day, and
+  // keeping every row ran the free scan of a large site out of memory. The archive collapses them;
+  // what a server sends anyway is collapsed here, keeping the day's content capture over a redirect.
   const captures: Capture[] = [];
-  for await (const page of client.cdx({ url: `${domain}/`, matchType: 'exact' })) captures.push(...page);
-  log(`homepage: ${captures.length} captures in the archive`);
+  for await (const page of client.cdx({ url: `${domain}/`, matchType: 'exact', collapse: ['timestamp:8'] })) {
+    for (const c of page) {
+      const last = captures[captures.length - 1];
+      if (!last || last.timestamp.slice(0, 8) !== c.timestamp.slice(0, 8)) captures.push(c);
+      else if (!isContent(last.statuscode) && isContent(c.statuscode)) captures[captures.length - 1] = c;
+    }
+  }
+  log(`homepage: captured on ${captures.length} days`);
 
   const months = groupByMonth(captures);
   const report: HealthReport = { domain, months, window: {}, host: domain, probes: 0 };
@@ -317,15 +373,22 @@ export async function scanHealth(client: ArchiveClient, domain: string, opts: Sc
   }
 
   const candidates = months.filter((m) => isContent(m.statuscode) || /^3/.test(m.statuscode ?? ''));
-  const signalsByMonth = new Map<string, PageSignals>();
-  // The URL whose content was scored: the homepage itself, or where its redirects or stub page led.
-  const scoredUrl = new Map<string, string>();
-  // Probes the archive could not play back. They say nothing about the site.
-  const unplayable = new Set<MonthHealth>();
-  const scored = (m: MonthHealth) => signalsByMonth.has(m.month);
-  // Only a month scored from its own capture vouches for other captures with the same digest. A
-  // redirect's digest is that of its (often empty) body, not of the page it leads to.
-  const ownContent = (m: MonthHealth) => scored(m) && scoredUrl.get(m.month) === m.original;
+  const outcomes = new Map<string, Outcome>();
+  // Set by settle(): the months whose page counts, the URL it came from (the homepage itself, or where
+  // its redirects or stub led), and the months scored from their stub because the page behind it
+  // cannot be had. Other probed months are left unknown and estimated like months not probed.
+  const pages = new Map<string, PageSignals>();
+  const scoredUrl = new Map<string, string | undefined>();
+  const fromStub = new Set<string>();
+  const notes = new Map<string, string>();
+  const scored = (m: MonthHealth) => pages.has(m.month);
+  // A month scored from its own capture can stand for every capture with the same digest. A
+  // redirect's digest is that of its (often empty) body, not of the page it leads to, and a stub's is
+  // the stub's. A homepage stub scored as itself stands for its digest too: no month with it got its page.
+  const ownContent = (m: MonthHealth) => scored(m) && !fromStub.has(m.month) && scoredUrl.get(m.month) === m.original;
+  const vouches = (m: MonthHealth) => scored(m) && scoredUrl.get(m.month) === m.original;
+  let refused = 0;
+  let refusal = '';
 
   // The usual size of the homepage, set in rescore() from months that look like the site itself.
   // Taken over all months it would come from a later, heavier spam site and make the real one look thin.
@@ -336,24 +399,67 @@ export async function scanHealth(client: ArchiveClient, domain: string, opts: Sc
     return (m.length ?? 0) / refLength;
   };
 
+  // A request that failed even after the client's retries (a timeout, a dropped connection) is the
+  // archive failing as well, not the site. Only a cancelled scan stops here.
+  const play = async (ts: string, url: string): Promise<CaptureResult> => {
+    try {
+      return await client.fetchCapture(ts, url);
+    } catch (err) {
+      if (client.signal?.aborted) throw err;
+      return { kind: 'missing', status: 0, reason: (err as Error).message, transient: true };
+    }
+  };
+
   // The archive plays the capture nearest in time, however far away it is. The page behind a stub
-  // counts only if it was captured near the stub, or while the same stub was the homepage: a later
-  // owner's one-link page must not borrow a page of the old site from years before.
-  const near = (a: string, b: string) => Math.abs(monthsBetween(a.slice(0, 6), b.slice(0, 6))) <= 12;
-  const sameTime = (m: MonthHealth, stub: { url: string; timestamp: string }, ts: string) =>
-    near(stub.timestamp, ts) || (stub.url === m.original && !!m.digest && captures.some((c) => c.digest === m.digest && near(c.timestamp, ts)));
+  // counts only if that stub was in place when the page was captured: a later owner's one-link page
+  // must not borrow a page of the old site, however soon after it came. When the archive would not
+  // play what was there then: why, and whether that was the archive failing.
+  const looked = new Map<string, { leads?: string; missing?: { reason: string; refused: boolean } }>();
+  const stubInPlace = async (stub: Stub, at: string): Promise<boolean | { reason: string; refused: boolean }> => {
+    let ts = at;
+    let original = stub.url;
+    if (stub.home) {
+      // The archive's index says what the homepage was then; only another capture needs a look.
+      const gap = (c: Capture) => Math.abs(tsTime(c.timestamp) - tsTime(at));
+      let near: Capture | undefined;
+      for (const c of captures) if ((isContent(c.statuscode) || /^3/.test(c.statuscode)) && (!near || gap(c) < gap(near))) near = c;
+      const self = captures.find((c) => c.timestamp === stub.timestamp);
+      if (!near || near.timestamp === stub.timestamp || (self && near.digest === self.digest)) return true;
+      ts = near.timestamp;
+      original = near.original;
+    } else if (Math.abs(tsTime(stub.timestamp) - tsTime(at)) <= WEEK) {
+      // Fetched in the same crawl: there was no time for the site to change.
+      return true;
+    }
+    const key = `${ts} ${original}`;
+    let seen = looked.get(key);
+    if (!seen) {
+      const res = await play(ts, original);
+      if (res.kind === 'ok') seen = { leads: analyzePage(decodeText(res.body, res.contentType).text, original, domain).follow };
+      else if (res.kind === 'redirect') seen = { leads: toUrl(res.location, original)?.toString() };
+      else seen = { missing: { reason: res.reason, refused: refusedByArchive(res) } };
+      looked.set(key, seen);
+    }
+    if (seen.missing) return seen.missing;
+    const a = seen.leads ? toUrl(seen.leads) : null;
+    const b = stub.signals.follow ? toUrl(stub.signals.follow) : null;
+    return !!a && !!b && urlKey(a) === urlKey(b);
+  };
 
   const probe = async (m: MonthHealth): Promise<void> => {
     if (m.probed || report.probes >= maxProbes) return;
     m.probed = true;
     report.probes++;
+    const o: Outcome = {};
+    outcomes.set(m.month, o);
     let url = m.original!;
-    let res = await client.fetchCapture(m.timestamp!, url);
-    // What visitors saw, and the URL it came from. Unset when that cannot be told.
-    let signals: PageSignals | undefined;
-    let scoredAt: string | undefined;
-    // The last stub page on the way, and why the way ended without a page if it did.
-    let stub: { signals: PageSignals; url: string; timestamp: string } | undefined;
+    let res = await play(m.timestamp!, url);
+    const to = res.kind === 'redirect' ? toUrl(res.location, url) : null;
+    o.via = to ? `to ${urlKey(to)}` : m.digest || m.month;
+    // The last stub page on the way, and the first internal redirect.
+    let stub: Stub | undefined;
+    let redirect: string | undefined;
+    let redirectKey: string | undefined;
     let failure = 'redirect could not be followed';
     const start = toUrl(url);
     const seen = new Set(start ? [urlKey(start)] : []);
@@ -363,20 +469,33 @@ export async function scanHealth(client: ArchiveClient, domain: string, opts: Sc
       let ts = m.timestamp!;
       if (res.kind === 'missing') {
         failure = `capture not playable (${res.reason})`;
+        if (refusedByArchive(res)) o.refused = res.reason;
         break;
       }
       if (res.kind === 'ok') {
-        if (stub && !sameTime(m, stub, res.timestamp)) {
-          failure = `the page it leads to is a capture from ${res.timestamp.slice(0, 4)}-${res.timestamp.slice(4, 6)}`;
-          break;
+        if (stub) {
+          const inPlace = await stubInPlace(stub, res.timestamp);
+          const when = `${res.timestamp.slice(0, 4)}-${res.timestamp.slice(4, 6)}`;
+          if (typeof inPlace === 'object') {
+            failure = `the page it leads to is a capture from ${when}, and the archive did not play what ${stub.home ? 'the homepage' : 'the page before it'} was then (${inPlace.reason})`;
+            if (inPlace.refused) o.refused = inPlace.reason;
+            o.unsure = true;
+            break;
+          }
+          if (!inPlace) {
+            failure = `the page it leads to is a capture from ${when}, when ${stub.home ? 'the homepage' : 'the page before it'} was another page`;
+            break;
+          }
+          const span = [...(o.span ?? []), stub.timestamp.slice(0, 6), res.timestamp.slice(0, 6)].sort();
+          o.span = [span[0], span[span.length - 1]];
         }
         const s = analyzePage(decodeText(res.body, res.contentType).text, url, domain);
         if (!s.follow) {
-          signals = s;
-          scoredAt = url;
+          o.signals = s;
+          o.scoredAt = url;
           break;
         }
-        stub = { signals: s, url, timestamp: res.timestamp };
+        stub = { signals: s, url, timestamp: res.timestamp, home: hop === 0 };
         next = toUrl(s.follow);
         ts = res.timestamp;
       } else {
@@ -384,62 +503,149 @@ export async function scanHealth(client: ArchiveClient, domain: string, opts: Sc
         ts = res.timestamp;
         // Not scoredAt: a redirect's digest is that of its body, the same wherever it points.
         if (next && !isInternal(next, domain)) {
-          signals = { words: 0, internalLinks: 0, title: '', lang: '', spamHits: 0, fatal: `redirects to ${bareHost(next.hostname)}` };
+          o.signals = { words: 0, internalLinks: 0, title: '', lang: '', spamHits: 0, fatal: `redirects to ${bareHost(next.hostname)}` };
           break;
+        }
+        if (next && redirect === undefined) {
+          redirect = next.pathname + next.search;
+          redirectKey = urlKey(next);
         }
       }
       if (!next || hop >= MAX_HOPS || seen.has(urlKey(next))) break;
       seen.add(urlKey(next));
       url = next.toString();
-      res = await client.fetchCapture(ts, url);
+      res = await play(ts, url);
     }
-    // A stub whose page cannot be had says nothing about the site: scored on its own, an empty
-    // stub would be bad and vouch for every month with its digest. A real page with a slow refresh
-    // still stands by itself.
-    if (!signals && stub && scoreSignals(stub.signals, {}).verdict === 'good') {
-      signals = stub.signals;
-      scoredAt = stub.url;
+    if (stub) {
+      o.stub = { signals: stub.signals, url: stub.url };
+      const target = toUrl(stub.signals.follow!);
+      if (target) o.leads = urlKey(target);
+    } else if (redirect !== undefined) {
+      o.stub = { signals: { words: 0, internalLinks: 0, title: '', lang: '', spamHits: 0, fatal: `its redirect to ${redirect} leads nowhere` } };
+      o.leads = redirectKey;
     }
-    if (signals) {
-      signalsByMonth.set(m.month, signals);
-      if (scoredAt) scoredUrl.set(m.month, scoredAt);
+    if (o.signals) return;
+    // A real page with a slow refresh stands by itself.
+    if (stub && scoreSignals(stub.signals, {}).verdict === 'good') {
+      o.signals = stub.signals;
+      o.scoredAt = stub.url;
       return;
     }
-    // Left unknown: estimated from the months around it later, like a month that was not probed.
-    unplayable.add(m);
-    m.reasons = [failure];
+    o.failure = failure;
+    if (o.refused) {
+      refused++;
+      refusal ||= o.refused;
+    }
+  };
+
+  // Which probed months count, and with what. An archive failure says nothing about the site, so such
+  // a month is left unknown. A stub (or redirect) whose page cannot be had is scored as itself, an
+  // empty page: that is a later owner's lander (`location.href = "/lander"`, never archived). Not when
+  // the same stub, or one leading to the same page, led to its page in another month: then it is the
+  // site's own, and the archive lost the page this time.
+  const settle = () => {
+    pages.clear();
+    scoredUrl.clear();
+    fromStub.clear();
+    notes.clear();
+    const own = new Map<string, PageSignals>();
+    for (const m of months) {
+      const o = outcomes.get(m.month);
+      if (m.digest && o?.signals && o.scoredAt === m.original) own.set(m.digest, o.signals);
+    }
+    // The homepage was another page: a real one, or a parked, spam or redirect page of another owner.
+    const another = (k: MonthHealth) => {
+      const o = outcomes.get(k.month);
+      const s = o?.signals && (o.scoredAt === k.original || o.scoredAt === undefined) ? o.signals : k.digest ? own.get(k.digest) : undefined;
+      if (!s) return false;
+      return s.fatal ? NEW_OWNER.test(s.fatal) : spamTakeover(s.spamHits, 0) || scoreSignals(s, {}).verdict === 'good';
+    };
+    for (const m of months) {
+      const o = outcomes.get(m.month);
+      if (!o) continue;
+      if (!o.signals) {
+        notes.set(m.month, o.failure ?? '');
+        continue;
+      }
+      // A page captured apart from its stub, with another page on the homepage in between: the same
+      // stub again after a parked spell is a later owner's.
+      const span = o.span;
+      if (span && months.some((k) => k.month > span[0] && k.month < span[1] && k.digest !== m.digest && another(k))) {
+        notes.set(m.month, `the page it leads to and the stub were captured in ${span[0].slice(0, 4)}-${span[0].slice(4)} and ${span[1].slice(0, 4)}-${span[1].slice(4)}, with another page on the homepage in between`);
+        continue;
+      }
+      pages.set(m.month, o.signals);
+      scoredUrl.set(m.month, o.scoredAt);
+    }
+    for (const m of months) {
+      const o = outcomes.get(m.month);
+      if (!o?.stub || o.refused || o.unsure || pages.has(m.month)) continue;
+      const sibling = (k: MonthHealth) => {
+        const ok = outcomes.get(k.month);
+        return k !== m && !!ok && (ok.via === o.via || (!!o.leads && ok.leads === o.leads)) && pages.has(k.month) && !fromStub.has(k.month) && !!scoredUrl.get(k.month);
+      };
+      if (months.some(sibling)) continue;
+      pages.set(m.month, o.stub.signals);
+      scoredUrl.set(m.month, o.stub.url);
+      fromStub.add(m.month);
+    }
   };
 
   const rescore = () => {
-    const probedInOrder = months.filter(scored);
-    const early = probedInOrder.slice(0, 3).map((m) => signalsByMonth.get(m.month)!).filter((s) => !s.fatal);
+    settle();
+    const scoredInOrder = months.filter(scored);
+    // The site's base line comes from its first pages, not from a stub scored as itself.
+    const early = scoredInOrder.filter((m) => !fromStub.has(m.month)).slice(0, 3).map((m) => pages.get(m.month)!).filter((s) => !s.fatal);
     const langs = early.map((s) => s.lang).filter(Boolean);
     const baseLang = langs.length ? langs.sort((a, b) => langs.filter((x) => x === b).length - langs.filter((x) => x === a).length)[0] : undefined;
     const baseSpam = early.length ? Math.min(...early.map((s) => s.spamHits)) : 0;
-    // A phrase every early capture shows is part of the site, like its base level of spam words.
+    // A phrase every early capture shows is part of the site, like its base level of spam words. Only
+    // on the site's own pages, though: a later owner's lander that repeats it ("related links" over
+    // its ads) has another title or another menu.
     const baseHint = early.length && early.every((s) => s.hint === early[0].hint) ? early[0].hint : undefined;
-    const itself = probedInOrder.filter((m) => {
-      const s = signalsByMonth.get(m.month)!;
+    const titles = new Set(early.map((s) => s.title));
+    const menu = new Set(early.flatMap((s) => s.menu ?? []));
+    const sameSite = (s: PageSignals) => titles.has(s.title) && (s.menu ?? []).filter((p) => menu.has(p)).length >= Math.min(3, menu.size);
+    const itself = scoredInOrder.filter((m) => {
+      const s = pages.get(m.month)!;
       return m.statuscode === '200' && ownContent(m) && !s.fatal && !spamTakeover(s.spamHits, baseSpam) && (!baseLang || !s.lang || s.lang === baseLang);
     });
     refLength = percentile(itself.map((m) => m.length ?? 0), 0.75);
-    for (const m of probedInOrder) {
-      const r = scoreSignals(signalsByMonth.get(m.month)!, { lengthRatio: lengthRatio(m), baseLang, baseSpam, baseHint });
+    for (const m of months) {
+      if (!m.probed) continue;
+      const s = pages.get(m.month);
+      if (!s) {
+        m.score = null;
+        m.verdict = 'none';
+        m.reasons = [notes.get(m.month) ?? ''];
+        continue;
+      }
+      const r = scoreSignals(s, { lengthRatio: lengthRatio(m), baseLang, baseSpam, baseHint: baseHint && sameSite(s) ? baseHint : undefined });
       m.score = r.score;
       m.verdict = r.verdict;
       m.reasons = r.reasons;
+      const note = notes.get(m.month);
+      if (fromStub.has(m.month) && note) m.reasons.push(note.startsWith('the page it leads to') ? note : `the page it leads to: ${note}`);
     }
   };
 
   // 1. Spread probes over the whole history.
   const firstRound = Math.max(2, Math.ceil(maxProbes * 0.6));
   const spread = pickSpread(candidates, firstRound);
-  for (const m of spread) await probe(m);
+  // Every probe so far refused after the client's own retries: archive.org is blocking or down, and
+  // each further probe would take another minute of back-off for nothing. The first, last and middle
+  // captures go first, so a stretch of old captures the archive cannot serve does not look like that.
+  const blocked = () => refused >= 3 && refused === report.probes;
+  const order = spread.length ? [spread[0], spread[spread.length - 1], spread[Math.floor(spread.length / 2)], ...spread] : [];
+  for (const m of new Set(order)) {
+    if (blocked()) break;
+    await probe(m);
+  }
   rescore();
 
   // 2. Narrow down the month the site stopped being good. Every pass probes a month that was not
   // probed before, so the loop ends.
-  while (report.probes < maxProbes) {
+  while (report.probes < maxProbes && !blocked()) {
     const good = candidates.filter((m) => m.probed && m.verdict === 'good');
     const lastGood = good[good.length - 1];
     let next: MonthHealth | undefined;
@@ -454,7 +660,7 @@ export async function scanHealth(client: ArchiveClient, domain: string, opts: Sc
     } else {
       // No good month yet: probe the middle of the longest stretch of unknown months between two
       // probes. A month with the digest of one already scored would score the same, so it is skipped.
-      const known = new Set(months.filter((m) => m.digest && ownContent(m)).map((m) => m.digest));
+      const known = new Set(months.filter((m) => m.digest && vouches(m)).map((m) => m.digest));
       let best: MonthHealth[] = [];
       let run: MonthHealth[] = [];
       for (const m of [...candidates, undefined]) {
@@ -470,11 +676,16 @@ export async function scanHealth(client: ArchiveClient, domain: string, opts: Sc
     rescore();
   }
 
-  inferUnprobed(months, lengthRatio, scored, ownContent);
+  inferUnprobed(months, lengthRatio, scored, vouches);
 
-  // 3. Last good snapshot and the window around it.
-  const goods = months.filter((m) => m.verdict === 'good' && m.timestamp && !unplayable.has(m));
+  // 3. Last good snapshot and the window around it. A month the archive could not play is never the
+  // snapshot, whatever its neighbours say.
+  const goods = months.filter((m) => m.verdict === 'good' && m.timestamp && !(m.probed && !scored(m)));
   const last = goods[goods.length - 1];
+  if (!last && refused && refused * 2 >= report.probes) {
+    // Most probes were refused, so "no capture looks like a real website" would be a guess.
+    throw new Error(`archive.org refused or failed ${refused} of the ${report.probes} homepage captures tried (${refusal}), so the scan cannot tell when ${domain} was a real website. Try again later.`);
+  }
   if (last) {
     report.lastGood = { month: last.month, timestamp: last.timestamp!, score: last.score ?? 0, original: last.original! };
     const i = months.indexOf(last);
@@ -487,7 +698,7 @@ export async function scanHealth(client: ArchiveClient, domain: string, opts: Sc
     // Walk back to where the site began. A parked, spam or redirected month means another owner. Bad
     // months between good ones (HTTP errors, a maintenance page) are an outage of the same site,
     // unless they went on for half a year.
-    const newOwner = (m: MonthHealth) => m.reasons.some((r) => /parked|redirects to|sends visitors|spam/.test(r));
+    const newOwner = (m: MonthHealth) => m.reasons.some((r) => NEW_OWNER.test(r));
     for (let j = i - 1; j >= 0; j--) {
       if (months[j].verdict !== 'bad') continue;
       let k = j;
@@ -508,7 +719,7 @@ export async function scanHealth(client: ArchiveClient, domain: string, opts: Sc
   // has no content captures; then the URLs the probes ended up on decide.
   const inWindow = (ts: string) => (!report.window.from || ts >= report.window.from) && (!report.window.to || ts <= report.window.to);
   let urls = captures.filter((c) => isContent(c.statuscode) && inWindow(c.timestamp)).map((c) => c.original);
-  if (!urls.length) urls = months.filter((m) => m.timestamp && inWindow(m.timestamp) && scoredUrl.has(m.month)).map((m) => scoredUrl.get(m.month)!);
+  if (!urls.length) urls = months.filter((m) => m.timestamp && inWindow(m.timestamp)).flatMap((m) => scoredUrl.get(m.month) ?? []);
   if (!urls.length && report.lastGood) urls = [report.lastGood.original];
   const www = urls.filter((u) => /^(https?:\/\/)?www\d{0,3}\./i.test(u)).length;
   report.host = www > urls.length / 2 ? `www.${domain}` : domain;
@@ -528,17 +739,17 @@ function pickSpread<T>(items: T[], n: number): T[] {
 
 /**
  * Estimates months that were not probed, or whose capture could not be played back. `scored` tells
- * which months have a verdict from their content; `ownContent` which of them can stand for every
+ * which months have a verdict from their content; `vouches` which of them can stand for every
  * capture with the same digest.
  */
 function inferUnprobed(
   months: MonthHealth[],
   lengthRatio: (m: MonthHealth) => number | undefined,
   scored: (m: MonthHealth) => boolean,
-  ownContent: (m: MonthHealth) => boolean,
+  vouches: (m: MonthHealth) => boolean,
 ): void {
   const byDigest = new Map<string, MonthHealth>();
-  for (const m of months) if (m.digest && ownContent(m)) byDigest.set(m.digest, m);
+  for (const m of months) if (m.digest && vouches(m)) byDigest.set(m.digest, m);
 
   for (let i = 0; i < months.length; i++) {
     const m = months[i];
