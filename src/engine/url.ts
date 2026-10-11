@@ -181,11 +181,12 @@ export function mergeSlashes(pathname: string): string {
 }
 
 /**
- * The address Apache and nginx look a path up by: slashes merged and escapes decoded to bytes (one
- * character per byte). "/caf%E9.html", "/caf%e9.html" and "//caf%E9.html" are one address to them.
+ * The address Apache and nginx look a path up by: escapes decoded to bytes (one character per byte)
+ * and slashes merged. "/caf%E9.html", "/caf%e9.html" and "//caf%E9.html" are one address to them.
+ * They merge the slashes an escape decodes to as well: "/b/%2Fx" is "/b/x".
  */
 export function serverPath(pathname: string): string {
-  return decodePathBytes(mergeSlashes(pathname)).toString('latin1');
+  return mergeSlashes(decodePathBytes(pathname).toString('latin1'));
 }
 
 /** The path as sent, with every escape in capitals: "%e9" and "%E9" are the same byte. */
@@ -205,14 +206,26 @@ export function pathBytesPattern(pathname: string): string {
   );
 }
 
+/** A segment that decodes to "/" or NUL, which no file name holds: decodePath keeps it as written. */
+function keepsEscapes(seg: string): boolean {
+  const d = decodeSafe(seg);
+  return d.includes('/') || d.includes('\0');
+}
+
+/**
+ * True when a segment holds an escaped slash (or NUL): "/tag/AC%2FDC". nginx and Cloudflare Pages
+ * decode it and look up /tag/AC/DC, Apache refuses it unless the server allows encoded slashes, so
+ * a file named "AC%2FDC" would never be found.
+ */
+export function hasEncodedSlash(pathname: string): boolean {
+  return pathname.split('/').some(keepsEscapes);
+}
+
 /** Percent-decoded path for the file system ("/a%20b/" -> "/a b/"). */
 export function decodePath(pathname: string): string {
   return pathname
     .split('/')
-    .map((seg) => {
-      const d = decodeSafe(seg);
-      return d.includes('/') || d.includes('\0') ? seg : d;
-    })
+    .map((seg) => (keepsEscapes(seg) ? seg : decodeSafe(seg)))
     .join('/');
 }
 
