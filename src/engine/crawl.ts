@@ -174,14 +174,14 @@ function indexer(opts: IndexOptions, limit = Infinity) {
     // Never downloaded (see enqueue), so not worth a place in a size-limited index.
     if (SKIP_PATH.test(pathAndQuery(u)) || GENERATED.has(u.pathname)) return;
     const key = urlKey(u);
-    if (cdxHtml(c.mimetype) !== undefined) realType.set(key, c.mimetype);
     const cur = index.get(key);
-    if (!cur) {
+    if (!cur && index.size >= limit) {
       // A big domain lists millions of URLs; keeping them all would exhaust memory.
-      if (index.size >= limit) {
-        index.truncated = true;
-        return;
-      }
+      index.truncated = true;
+      return;
+    }
+    if (cdxHtml(c.mimetype) !== undefined) realType.set(key, c.mimetype);
+    if (!cur) {
       index.set(key, c);
       return;
     }
@@ -226,7 +226,13 @@ function indexer(opts: IndexOptions, limit = Infinity) {
 async function readIndex(client: ArchiveClient, q: CdxQuery, opts: IndexOptions, limit?: number, log?: (msg: string) => void): Promise<CaptureIndex> {
   const ix = indexer(opts, limit);
   let rows = 0;
-  for await (const page of client.cdx({ ...q, from: opts.window.from, to: opts.window.to, filters: ['!statuscode:[45]..'] })) {
+  // Status and window are checked here, not on the server: archive.org's CDX server counts rows a
+  // filter or from/to drops against its per-request read cap and then ends the listing without a
+  // resume key, so a site with many 404 rows, or a long history outside the window, would look
+  // complete after the first page. Only an exact lookup may narrow by time: there "from" is where
+  // the read starts and "to" ends it, so nothing is skipped.
+  const narrow = q.matchType === 'exact' ? { from: opts.window.from, to: opts.window.to } : {};
+  for await (const page of client.cdx({ ...q, ...narrow })) {
     for (const c of page) {
       rows++;
       ix.add(c);

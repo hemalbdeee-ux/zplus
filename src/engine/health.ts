@@ -348,21 +348,18 @@ export async function scanHealth(client: ArchiveClient, domain: string, opts: Sc
   const maxProbes = opts.maxProbes ?? 14;
 
   // One capture a day is enough to tell the months apart. A busy homepage has hundreds a day, and
-  // keeping every row ran the free scan of a large site out of memory. The archive collapses them;
-  // what a server sends anyway is collapsed here, keeping the day's content capture over the rest.
+  // keeping every row ran the free scan of a large site out of memory, so rows are reduced to one
+  // a day as they stream in, keeping the day's page over its redirects and errors.
+  // The query itself stays unfiltered: archive.org's CDX server counts rows that collapse, filter
+  // or from/to drop against its per-request read cap and then ends the listing without a resume
+  // key, so a narrowed query of a busy homepage silently stops years early.
   const byDay = new Map<string, Capture>();
   const keep = (c: Capture) => {
     const day = c.timestamp.slice(0, 8);
     const had = byDay.get(day);
     if (!had || (!isContent(had.statuscode) && isContent(c.statuscode))) byDay.set(day, c);
   };
-  const homeIndex = { url: `${domain}/`, matchType: 'exact' as const, collapse: ['timestamp:8'] };
-  for await (const page of client.cdx(homeIndex)) for (const c of page) keep(c);
-  // The archive keeps the first capture of a day, often the http -> https or www redirect taken
-  // seconds before the page, or a CDN error. Those days are asked again for their pages alone.
-  if ([...byDay.values()].some((c) => !isContent(c.statuscode))) {
-    for await (const page of client.cdx({ ...homeIndex, filters: ['!statuscode:[345]..'] })) for (const c of page) if (isContent(c.statuscode)) keep(c);
-  }
+  for await (const page of client.cdx({ url: `${domain}/`, matchType: 'exact' })) for (const c of page) keep(c);
   const captures = [...byDay.values()].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
   byDay.clear();
   log(`homepage: captured on ${captures.length} days`);

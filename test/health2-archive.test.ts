@@ -1,5 +1,5 @@
-// Round-2 health cases about the archive itself: the homepage index of a busy site is read one
-// capture a day, and a scan whose playback archive.org refuses says so instead of calling the
+// Round-2 health cases about the archive itself: the homepage index of a busy site is reduced to one
+// capture a day as it streams in (never narrowed on the server, see cdx-readlimit.test.ts), and a scan whose playback archive.org refuses says so instead of calling the
 // domain a site that never was.
 
 import assert from 'node:assert/strict';
@@ -29,13 +29,14 @@ const PARKED = '<html><body><h1>parked</h1><p>This domain may be for sale!</p></
 const site = (): FakeCapture[] => monthRange('201001', '202112').map((m) => ({ url: 'http://example.com/', ts: `${m}10120000`, body: m < '202001' ? GOOD : PARKED }));
 
 describe('health2: the homepage index of a busy site', () => {
-  it('asks the archive for one capture a day', async () => {
+  it('reads the homepage index without narrowing it on the server', async () => {
     const archive = await startFakeArchive(site());
     try {
       await scanHealth(new ArchiveClient({ base: archive.base, ...FAST }), 'example.com');
       const cdx = archive.requests.filter((r) => r.startsWith('/cdx/'));
       assert.equal(cdx.length, 1);
-      assert.equal(new URL(cdx[0], 'http://archive.local').searchParams.get('collapse'), 'timestamp:8');
+      const params = new URL(cdx[0], 'http://archive.local').searchParams;
+      for (const name of ['collapse', 'filter', 'from', 'to']) assert.equal(params.get(name), null, name);
     } finally {
       await archive.close();
     }
@@ -64,7 +65,8 @@ describe('health2: the homepage index of a busy site', () => {
       },
     } as unknown as ArchiveClient;
     const h = await scanHealth(client, 'example.com');
-    assert.deepEqual(asked?.collapse, ['timestamp:8']);
+    assert.equal(asked?.collapse, undefined);
+    assert.equal(asked?.filters, undefined);
     assert.equal(h.lastGood?.month, '201912');
     assert.equal(h.window.to, '20191231235959');
     // One capture for each of the 28 days, and the day's page rather than its redirect.

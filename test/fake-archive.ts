@@ -22,6 +22,12 @@ export interface FakeCapture {
 export interface FakeArchiveOptions {
   /** Drop a trailing slash from keys as the real SURT canonicalizer does (/blog/ matches /blog). */
   stripTrailingSlash?: boolean;
+  /**
+   * The CDX server's per-request read cap (150000 on archive.org). As in CDXServer.java, every
+   * row read counts, including rows that from/to, filter or collapse then drop, and a resume key
+   * is printed only when a full page was written. Default: no cap.
+   */
+  readLimit?: number;
 }
 
 export interface FakeArchive {
@@ -85,19 +91,56 @@ export async function startFakeArchive(captures: FakeCapture[], opts: FakeArchiv
         const [field, ...re] = (neg ? f.slice(1) : f).split(':');
         return { neg, field, re: new RegExp(`^(?:${re.join(':')})$`) };
       });
-      let hits = rows.filter((r) => (match === 'exact' ? r.key === key : r.key.startsWith(key)) && r.ts >= from && r.ts <= to);
-      hits = hits.filter((r) =>
-        filters.every((f) => {
-          const v = f.field === 'statuscode' ? String(r.status) : f.field === 'mimetype' ? r.type : '';
-          return f.re.test(v) !== f.neg;
-        }),
-      );
-      const offset = Number(q.get('resumeKey') ?? 0);
-      const limit = Number(q.get('limit') ?? 100000);
-      const page = hits.slice(offset, offset + limit);
+      const collapse = q.getAll('collapse').map((c) => {
+        const [field, n] = c.split(':');
+        return { field, n: n ? Number(n) : undefined, last: undefined as string | undefined };
+      });
+      const field = (r: Row, name: string) =>
+        name === 'statuscode' ? cdxStatus(r) : name === 'mimetype' ? cdxType(r) : name === 'timestamp' ? r.ts : name === 'urlkey' ? r.key : name === 'digest' ? r.digest : '';
+      const inRange = (r: Row) => (match === 'exact' ? r.key === key : r.key.startsWith(key));
+      const readLimit = opts.readLimit ?? Infinity;
+      const limit = Math.min(Number(q.get('limit') ?? 100000), readLimit);
+      // Seek like CDXServer: to the resume key, else to "<key> <from>", else to the key itself.
+      const resume = q.get('resumeKey');
+      const [seekKey, seekTs] = resume ? resume.split(' ') : [key, q.get('from') ? from : ''];
+      let i = rows.findIndex((r) => r.key > seekKey || (r.key === seekKey && r.ts >= (seekTs ?? '')));
+      if (i < 0) i = rows.length;
+      const page: Row[] = [];
+      let allCount = 0;
+      let last: Row | undefined;
+      for (; i < rows.length && page.length < limit && allCount < readLimit; i++) {
+        const r = rows[i];
+        if (!inRange(r)) {
+          if (r.key > key && !r.key.startsWith(key)) break;
+          continue;
+        }
+        allCount++;
+        last = r;
+        if (r.ts < from) continue;
+        if (r.ts > to) {
+          if (match === 'exact') break;
+          continue;
+        }
+        if (!filters.every((f) => f.re.test(field(r, f.field)) !== f.neg)) continue;
+        if (
+          collapse.length &&
+          !collapse.every((c) => {
+            const v = field(r, c.field).slice(0, c.n);
+            const keep = v !== c.last;
+            c.last = v;
+            return keep;
+          })
+        )
+          continue;
+        page.push(r);
+      }
       const out: string[][] = [['urlkey', 'timestamp', 'original', 'mimetype', 'statuscode', 'digest', 'length']];
       for (const r of page) out.push([r.key, r.ts, r.url, cdxType(r), cdxStatus(r), r.digest, String(r.bytes.length + 400)]);
-      if (q.get('showResumeKey') === 'true' && offset + limit < hits.length) out.push([], [String(offset + limit)]);
+      if (q.get('showResumeKey') === 'true' && last && page.length >= limit) {
+        // CDXServer: "<urlkey> <timestamp with its last character incremented>".
+        const ts = last.ts.slice(0, -1) + String.fromCharCode(last.ts.charCodeAt(last.ts.length - 1) + 1);
+        out.push([], [`${last.key} ${ts}`]);
+      }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(page.length ? JSON.stringify(out) : '[]');
       return;
