@@ -9,7 +9,7 @@
 // escapes decoded to bytes (//a.php, /caf%e9.html), the query string without tracking parameters
 // and empty segments (?id=3&fbclid=x, ?a=1&&b=2). The preview server (serve.ts) does the same.
 
-import { mergeSlashes, pathBytesPattern, queryPattern, TRACKING_NAME } from './url.ts';
+import { droppedRunPattern, mergeSlashes, pathBytesPattern, QUERY_PASSES } from './url.ts';
 
 export interface Route {
   /** Decoded path, e.g. "/index.php". */
@@ -88,7 +88,7 @@ function rawPattern(rawPath: string): string {
 // Apache compares query strings in WBD_QUERY, which the rules at the top set to "&" + the query
 // without tracking parameters and empty segments + "&": one cheap pattern per rule, where a
 // pattern that skips them itself is ten times longer, and Apache compiles every pattern of
-// .htaccess again on each request.
+// .htaccess again on each request. nginx keeps the same string in a variable.
 const QUERY_VAR = 'WBD_QUERY';
 
 function queryCond(query: string): string {
@@ -159,13 +159,16 @@ export function htaccess(r: ServerRules): string {
   if ([...r.redirects, ...r.routes].some((x) => x.query !== undefined || ('noQuery' in x && x.noQuery))) {
     out.push('');
     out.push('# Query strings are compared the way the URLs were archived: without tracking parameters');
-    out.push(`# (utm_*, fbclid, ...) and empty segments. ${QUERY_VAR} holds "&" + that query + "&".`);
-    out.push(`RewriteCond %{ENV:${QUERY_VAR}} ^$`);
+    out.push(`# (utm_*, fbclid, ...) and empty segments. ${QUERY_VAR} holds "&" + that query + "&". Each pair`);
+    out.push(`# of lines drops one run of them; a fixed number, not an [N] loop, so no query costs much.`);
     out.push(`RewriteRule ^ - [E=${QUERY_VAR}:&%{QUERY_STRING}&]`);
-    out.push(`RewriteCond %{ENV:${QUERY_VAR}} ^(.*?&)(?:${TRACKING_NAME})(?:=[^&]*)?&(.*)$ [NC]`);
-    out.push(`RewriteRule ^ - [E=${QUERY_VAR}:%1%2,N]`);
-    out.push(`RewriteCond %{ENV:${QUERY_VAR}} ^(.*?&)&+(.*)$`);
-    out.push(`RewriteRule ^ - [E=${QUERY_VAR}:%1%2,N]`);
+    for (let i = 0; i < QUERY_PASSES; i++) {
+      out.push(`RewriteCond %{ENV:${QUERY_VAR}} ${apacheQuoted(droppedRunPattern())} [NC]`);
+      out.push(`RewriteRule ^ - [E=${QUERY_VAR}:%1%2]`);
+    }
+    // Runs left over: no rule matches, and each rule would copy the whole query to find out.
+    out.push(`RewriteCond %{ENV:${QUERY_VAR}} ${apacheQuoted(droppedRunPattern())} [NC]`);
+    out.push(`RewriteRule ^ - [E=${QUERY_VAR}:-]`);
   }
 
   // Rules for one raw spelling only go first: the rule of the address they share would catch them.
@@ -252,34 +255,52 @@ export function nginxConf(r: ServerRules): string {
     lines.push('}');
     return lines.join('\n');
   };
-  // $uri is the path as nginx reads it (slashes merged, escapes decoded); "$uri?$args" adds the raw
-  // query, which queryPattern() compares without tracking parameters and empty segments; an exact
-  // rule compares the path as sent ($request_uri).
-  const QUERY = '"$uri?$args"';
-  const pathKey = (x: Route | Redirect) => `~^${pathBytesPattern(x.rawPath)}$`;
-  const queryKey = (x: Route | Redirect) => `~^${pathBytesPattern(x.rawPath)}\\?${queryPattern(x.query ?? '').slice(1)}`;
-  const exactKey = (x: Route | Redirect) =>
-    `~^${rawPattern(x.rawPath)}` +
-    (x.query !== undefined ? `\\?${queryPattern(x.query).slice(1)}` : 'noQuery' in x && x.noQuery ? `(?:\\?${queryPattern('').slice(1, -1)})?$` : '(?:\\?.*)?$');
   const byQuery = (x: Route | Redirect) => x.query !== undefined || ('noQuery' in x && x.noQuery === true);
+  const v = (name: string) => `$wbd_${id}_${name}`;
+  // $uri is the path as nginx reads it (slashes merged, escapes decoded). The query is compared as
+  // Apache compares WBD_QUERY: each map below drops one run of tracking parameters and empty
+  // segments from "&" + $args + "&", once per request, where a key that skipped them itself would
+  // scan a long query once per rule. A rule for one spelling only compares the path as sent.
+  const passes: string[] = [];
+  if ([...r.redirects, ...r.routes].some(byQuery)) {
+    let source = '"&$args&"';
+    for (let i = 1; i <= QUERY_PASSES; i++) {
+      const name = i === QUERY_PASSES ? 'args' : `args${i}`;
+      passes.push(`map ${source} ${v(name)} {\n    default ${source};\n    ${nginxString('~*' + droppedRunPattern())} $1$2;\n}`);
+      source = v(name);
+    }
+  }
+  const args = passes.length ? v('args') : '';
+  const QUERY = `"$uri?${args}"`;
+  const pathKey = (x: Route | Redirect) => `~^${pathBytesPattern(x.rawPath)}$`;
+  const queryPart = (x: Route | Redirect) => (x.query ? `&${regexEscape(x.query)}&$` : '&$');
+  const queryKey = (x: Route | Redirect) => `~^${pathBytesPattern(x.rawPath)}\\?${queryPart(x)}`;
+  const exactKey = (x: Route | Redirect) => `~^${rawPattern(x.rawPath)}\\?${byQuery(x) ? queryPart(x) : ''}`;
   const redirects = (perm: boolean, pick: (d: Redirect) => boolean, key: (d: Redirect) => string) =>
     r.redirects.filter((d) => isPermanent(d.status) === perm && pick(d)).map((d) => [key(d), d.to] as [string, string]);
   const routes = (pick: (x: Route) => boolean, key: (x: Route) => string) => r.routes.filter(pick).map((x) => [key(x), '/' + x.file] as [string, string]);
   const exactRedirects = r.redirects.some((d) => d.exact);
   const exactRoutes = r.routes.some((x) => x.exact);
-  const v = (name: string) => `$wbd_${id}_${name}`;
+  const EXACT = `"${v('path')}?${args}"`;
 
   return `# Generated by zplus.ai for ${r.domain}.
 # Keeps every original URL working exactly as before. Put this file in /etc/nginx/conf.d/
 # (it must be included inside the http { } block), set "root" to the folder holding the site,
 # add your TLS settings, then run: nginx -t && systemctl reload nginx
 
-${needsDollar ? `geo $${dollar} { default "$"; }\n\n` : ''}# Redirects the original site made ($uri: path only; "$uri?$args": path and query string;
-# $request_uri: one spelling only, doubled slashes and all).
+${needsDollar ? `geo $${dollar} { default "$"; }\n\n` : ''}${
+  passes.length
+    ? `# Query strings are compared the way the URLs were archived: without tracking parameters (utm_*,
+# fbclid, ...) and empty segments. Each map drops one run of them; a fixed number, so no query
+# costs much.
+${passes.join('\n')}
+
+`
+    : ''
+}${exactRedirects || exactRoutes ? `# The path as sent, doubled slashes and all.\nmap $request_uri ${v('path')} {\n    "~^([^?]*)" $1;\n}\n\n` : ''}# Redirects the original site made. $uri is the path as nginx reads it (slashes merged, escapes
+# decoded); a rule for one spelling only compares the path as sent.
 ${[
-  ...(exactRedirects
-    ? [map('x301', '$request_uri', redirects(true, (d) => !!d.exact, exactKey)), map('x302', '$request_uri', redirects(false, (d) => !!d.exact, exactKey))]
-    : []),
+  ...(exactRedirects ? [map('x301', EXACT, redirects(true, (d) => !!d.exact, exactKey)), map('x302', EXACT, redirects(false, (d) => !!d.exact, exactKey))] : []),
   map('q301', QUERY, redirects(true, (d) => !d.exact && byQuery(d), queryKey)),
   map('q302', QUERY, redirects(false, (d) => !d.exact && byQuery(d), queryKey)),
   map('r301', '$uri', redirects(true, (d) => !d.exact && !byQuery(d), pathKey)),
@@ -288,7 +309,7 @@ ${[
 
 # Original URLs served from another file (internal rewrite, the URL stays the same).
 ${[
-  ...(exactRoutes ? [map('route_x', '$request_uri', routes((x) => !!x.exact, exactKey))] : []),
+  ...(exactRoutes ? [map('route_x', EXACT, routes((x) => !!x.exact, exactKey))] : []),
   map('route_q', QUERY, routes((x) => !x.exact && x.query !== undefined, queryKey)),
   map('route_p', '$uri', routes((x) => !x.exact && x.query === undefined, pathKey)),
 ].join('\n')}
@@ -342,25 +363,35 @@ export function netlifyRedirects(r: ServerRules): string {
     patterns.push(...lines.filter(([from]) => PAGES_PATTERN.test(from)));
     if (plain.length) out.push('', title, ...plain.map((x) => x.join('  ')));
   };
-  // Neither host can tell //a.php from /a.php in a rule ("//a.php" never matches): a rule is written
-  // for the address Apache and nginx give it, and one for a single raw spelling is left out.
-  const pathRedirects = r.redirects.filter((d) => d.query === undefined && !d.exact);
-  const pathRoutes = r.routes.filter((x) => x.query === undefined && !x.exact);
-  const from = (x: Route | Redirect) => mergeSlashes(x.rawPath);
+  // Cloudflare Pages compares a line with the path as sent (only //a.php matches "//a.php"), though
+  // it merges slashes to find a file; Netlify takes no line for a path with doubled slashes. So a
+  // rule gets a line for the address Apache and nginx give it plus one for its own doubled slashes,
+  // and a rule for one spelling only gets just its own.
+  const pathRedirects = r.redirects.filter((d) => d.query === undefined);
+  const pathRoutes = r.routes.filter((x) => x.query === undefined);
+  const from = (x: Route | Redirect) => (x.exact ? [x.rawPath] : [...new Set([mergeSlashes(x.rawPath), x.rawPath])]);
+  const taken = new Set<string>();
+  const fresh = (x: Route | Redirect) =>
+    from(x).filter((f) => {
+      if (taken.has(f)) return false;
+      taken.add(f);
+      return true;
+    });
+  const redirects = pathRedirects.flatMap((d) => fresh(d).map((f): RedirectLine => [f, d.to, isPermanent(d.status) ? 301 : 302]));
+  const routes = pathRoutes.flatMap((x) => fresh(x).map((f): RedirectLine => [f, pagesTarget(x.file), 200]));
 
   // Every other .html URL, for Pages: x/index.html is rewritten to /x/ and x.html to /x, except
   // next to a file x, where Pages serves x.html as it is and /x would serve x. Netlify serves an
   // existing file before it reads a rule that is not forced, so these change nothing there. They
   // go first: Pages reads only the first 2,000 plain lines.
-  const taken = new Set([...pathRedirects, ...pathRoutes].map(from));
   const files = new Set(r.files);
   const asIs = [...files]
     .filter((f) => f.endsWith('.html') && !/(^|\/)index\.html$/.test(f) && files.has(f.slice(0, -'.html'.length)))
     .map((f): RedirectLine => ['/' + encodeFile(f), '/' + encodeFile(f), 200]);
   const home: RedirectLine = ['/index.html', '/', 200];
   section('# For Cloudflare Pages, which redirects x.html to /x and x/index.html to /x/ by itself', [home, ...asIs].filter(([f]) => !taken.has(f)));
-  section('# Redirects the original site made', pathRedirects.map((d) => [from(d), d.to, isPermanent(d.status) ? 301 : 302]));
-  section('# Original URLs served from another file (rewrite, the URL stays the same)', pathRoutes.map((x) => [from(x), pagesTarget(x.file), 200]));
+  section('# Redirects the original site made', redirects);
+  section('# Original URLs served from another file (rewrite, the URL stays the same)', routes);
   // Pages tries patterns in file order and reads only 100: the two below go after the .html ones
   // they would hide and before the rest.
   const html = patterns.filter(([f]) => f.endsWith('.html'));
@@ -369,10 +400,10 @@ export function netlifyRedirects(r: ServerRules): string {
   const rest = patterns.filter(([f]) => !f.endsWith('.html'));
   if (rest.length) out.push('', '# Paths that Cloudflare Pages reads as patterns (* or :name)', ...rest.map((x) => x.join('  ')));
 
-  const others = [...r.redirects, ...r.routes].filter((x) => x.query !== undefined || x.exact);
+  const others = [...r.redirects, ...r.routes].filter((x) => x.query !== undefined);
   if (others.length) {
-    out.push('', `# ${others.length} URLs with a query string or a doubled slash need Apache, LiteSpeed or nginx (see .htaccess):`);
-    for (const x of others.slice(0, 50)) out.push(`#   ${x.rawPath}${x.query !== undefined ? '?' + x.query : ''}`);
+    out.push('', `# ${others.length} URLs with a query string need Apache, LiteSpeed or nginx (see .htaccess):`);
+    for (const x of others.slice(0, 50)) out.push(`#   ${x.rawPath}?${x.query}`);
     if (others.length > 50) out.push(`#   ... and ${others.length - 50} more`);
   }
   return out.join('\n') + '\n';

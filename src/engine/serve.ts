@@ -8,7 +8,7 @@ import http from 'node:http';
 import path from 'node:path';
 import type { Redirect, Route } from './serverconfig.ts';
 import { HTML_LIKE_EXT } from './serverconfig.ts';
-import { cleanSearch, decodePath, hasNonUtf8Escapes, mergeSlashes, rawPathKey, serverPath } from './url.ts';
+import { decodePath, hasNonUtf8Escapes, mergeSlashes, rawPathKey, ruleQuery, serverPath } from './url.ts';
 
 const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -97,11 +97,12 @@ export async function createPreviewServer(siteDir: string): Promise<http.Server>
     }
     const rawPath = url.pathname;
     const merged = mergeSlashes(rawPath);
-    const query = cleanSearch(url.search).slice(1);
+    // undefined: too many runs of tracking parameters and empty segments for the server rules.
+    const query = ruleQuery(url.search);
     // Exact rules first, then those that look at the query, then path-only ones (nginx.conf order).
     const find = <T>(map: Map<string, T>) => {
       for (const p of ['raw:' + rawPathKey(rawPath), 'path:' + serverPath(rawPath)]) {
-        const hit = map.get(`${p}?${query}`) ?? map.get(p);
+        const hit = (query !== undefined ? map.get(`${p}?${query}`) : undefined) ?? map.get(p);
         if (hit) return hit;
       }
       return undefined;

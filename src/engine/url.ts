@@ -6,9 +6,7 @@
 // new host: scheme, "www.", port, fragment and analytics tracking parameters.
 
 const TRACKING = ['fbclid', 'gclid', 'dclid', 'gbraid', 'wbraid', 'msclkid', 'mc_cid', 'mc_eid', '_ga', '_gl', 'yclid'];
-/** Names of the parameters cleanSearch() drops, as a case-insensitive regular expression. */
-export const TRACKING_NAME = `utm_[a-z0-9_]+|${TRACKING.join('|')}`;
-const TRACKING_PARAM = new RegExp(`^(${TRACKING_NAME})$`, 'i');
+const TRACKING_PARAM = new RegExp(`^(utm_[a-z0-9_]+|${TRACKING.join('|')})$`, 'i');
 
 export function bareHost(host: string): string {
   return host.toLowerCase().replace(/\.$/, '').replace(/^www\d{0,3}\./, '');
@@ -37,13 +35,43 @@ function decodeSafe(s: string): string {
 /** Query string without tracking parameters, order and encoding kept. Returns '' or '?a=b'. */
 export function cleanSearch(search: string): string {
   if (!search || search === '?') return '';
-  // Names are compared as written (no tool escapes "utm_source"), so that queryPattern() can say
-  // in a server rule exactly what this function does.
-  const parts = search
-    .slice(1)
-    .split('&')
-    .filter((p) => p !== '' && !TRACKING_PARAM.test(p.split('=')[0]));
+  // Names are compared as written (no tool escapes "utm_source"), so that droppedRunPattern() can
+  // say in a server rule exactly what this function does.
+  const parts = search.slice(1).split('&').filter((p) => !dropped(p));
   return parts.length ? '?' + parts.join('&') : '';
+}
+
+/** A query segment cleanSearch() leaves out: empty, or a tracking parameter. */
+function dropped(segment: string): boolean {
+  return segment === '' || TRACKING_PARAM.test(segment.split('=')[0]);
+}
+
+/**
+ * Server rules drop the segments cleanSearch() leaves out one run at a time (a run: segments next
+ * to each other, as in "a=1&&&fbclid=x&b=2"), this many times and no more, so that a crafted query
+ * of thousands of runs costs a few scans of it instead of one per run or per rule.
+ */
+export const QUERY_PASSES = 16;
+
+/**
+ * The query (without "?") that server rules compare with a rule's own: cleanSearch(), or undefined
+ * when the query has more than QUERY_PASSES runs to drop, which no rule matches.
+ */
+export function ruleQuery(search: string): string | undefined {
+  const segments = search.replace(/^\?/, '').split('&');
+  const runs = segments.filter((s, i) => dropped(s) && (i === 0 || !dropped(segments[i - 1]))).length;
+  return runs > QUERY_PASSES ? undefined : cleanSearch(search).slice(1);
+}
+
+/**
+ * One pass of the server rules (PCRE, case-insensitive, possessive so that it scans the subject
+ * once): on "&" + query + "&" with every segment followed by "&", $1 + $2 leaves out the first run
+ * of segments cleanSearch() drops. After the last run is gone, "&" + cleaned query + "&" is left,
+ * or "&" for none.
+ */
+export function droppedRunPattern(): string {
+  const segment = `(?:(?:utm_[a-z0-9_]++|${TRACKING.join('|')})(?:=[^&]*+)?)?&`;
+  return `^(&(?:(?!${segment})[^&]++&)*+)(?:${segment})++(.*)$`;
 }
 
 function regexEscape(s: string): string {
@@ -53,8 +81,8 @@ function regexEscape(s: string): string {
 /**
  * Regular expression (the same in PCRE and JavaScript) for exactly the raw query strings that
  * cleanSearch() turns into `query` ('' for none): empty segments and tracking parameters may sit
- * anywhere. Server rules need it because the archived URL (and a visitor's click with ?fbclid=)
- * carries the raw query, while routes and redirects are keyed by the cleaned one.
+ * anywhere. The archived URL (and a visitor's click with ?fbclid=) carries the raw query, while
+ * routes and redirects are keyed by the cleaned one.
  */
 export function queryPattern(query: string): string {
   // No (?i) group: Node 22 lacks it, and parameter values must keep their case.

@@ -18,9 +18,11 @@ import { after, before, describe, it } from 'node:test';
 import { buildSite, type BuildResult } from '../src/engine/build.ts';
 import type { Manifest, Resource } from '../src/engine/crawl.ts';
 import { createPreviewServer } from '../src/engine/serve.ts';
-import { pathAndQuery, urlKey } from '../src/engine/url.ts';
+import { pathAndQuery, QUERY_PASSES, urlKey } from '../src/engine/url.ts';
 
 const H = 'http://example.com';
+/** A raw query with this many runs of segments the rules drop ("a=1&&b=2" has one). */
+const runs = (n: number) => Array.from({ length: n }, (_, i) => `k${i}=v`).join('&&') + '&&last=1';
 const page = (mark: string) => `<!doctype html><html><head><title>${mark} | Example</title></head><body><p>MARK[${mark}]</p></body></html>`;
 
 interface Capture {
@@ -46,6 +48,7 @@ const captures: Capture[] = [
   { url: `${H}/index.php?page=Contact`, body: page('Contact') },
   { url: `${H}/index.php?page=contact`, body: page('contact') },
   { url: `${H}/index.php`, status: 301, location: `${H}/` },
+  { url: `${H}/runs.php?${runs(QUERY_PASSES - 1)}`, body: page('runs') },
   // Latin-1 escapes (finding 26).
   { url: `${H}/caf%E9.html`, body: page('latin1') },
   { url: `${H}/caf%E9.html?x=1`, body: page('latin1-q') },
@@ -127,6 +130,16 @@ const expected: Array<[string, string]> = [
   ['/index.php?page=CONTACT', '404 -'],
   ['/index.php', '301 /'],
   ['/index.php?fbclid=1', '301 /'],
+  // The rules drop a fixed number of runs, whatever the query costs to clean: one more and no rule
+  // compares it.
+  [`/runs.php?${runs(QUERY_PASSES - 1)}`, '200 runs'],
+  [`/runs.php?${runs(QUERY_PASSES - 1).replaceAll('&&', '&')}`, '200 runs'],
+  [`/runs.php?${runs(QUERY_PASSES - 1)}&&fbclid=1`, '200 runs'],
+  [`/runs.php?&${runs(QUERY_PASSES - 1)}`, '200 runs'],
+  [`/runs.php?&${runs(QUERY_PASSES - 1)}&&fbclid=1`, '404 -'],
+  [`/?${'a&&'.repeat(1000)}`, '200 home'],
+  [`/?p=1${'&'.repeat(3000)}`, '200 post1'],
+  [`/?${'_ga&'.repeat(700)}p=1`, '200 post1'],
   ['/caf%E9.html', '200 latin1'],
   ['/caf%e9.html', '200 latin1'],
   ['/caf%E9.html?fbclid=1', '200 latin1'],
@@ -366,6 +379,7 @@ describe('rules of the restored site', () => {
 
   it('write redirect targets the browser reads as a path', async () => {
     for (const d of result.redirects) assert.ok(!d.to.startsWith('//'), d.to);
-    assert.doesNotMatch(await readFile(path.join(siteDir, '_redirects'), 'utf8'), /^\/\//m);
+    const lines = (await readFile(path.join(siteDir, '_redirects'), 'utf8')).split('\n').filter((l) => l && !l.startsWith('#'));
+    for (const l of lines) assert.ok(!l.split(/\s+/)[1].startsWith('//'), l);
   });
 });

@@ -38,7 +38,9 @@ import {
   makeRootRelative,
   mergeSlashes,
   pathAndQuery,
+  QUERY_PASSES,
   rawPathKey,
+  ruleQuery,
   serverPath,
   toUrl,
   tsToIso,
@@ -414,7 +416,13 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
   const routes = plans.filter((p) => p.route).map((p) => p.route!);
   const takenFiles = new Set(plans.map((p) => p.file.toLowerCase()));
   const takenPaths = new Set(content.map((r) => new URL(r.url).pathname));
-  const available = new Set(content.flatMap((r) => [r.path, new URL(r.url).pathname]));
+  // Also at the address a server answers the URL from: //img/a.png is served at /img/a.png too.
+  const available = new Set(
+    content.flatMap((r) => {
+      const u = new URL(r.url);
+      return [r.path, u.pathname, mergeSlashes(u.pathname) + cleanSearch(u.search), mergeSlashes(u.pathname)];
+    }),
+  );
   const hasPath = (p: string) => available.has(p);
 
   // 2. Site-wide facts: name, description, logo, feed address.
@@ -447,6 +455,9 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
   // 3. Write every file. Pages go first: they tell which charset their scripts and stylesheets were
   // read with, and those are converted to UTF-8 like the pages.
   const pages: PageRecord[] = [];
+  // Pages of a spelling that only differs from another page's address by doubled slashes (//a.html
+  // next to /a.html): their address belongs to that page in sitemaps and the feed.
+  const twins = new Set<string>();
   const types: TypeOverride[] = [];
   const cleaned = { wayback: 0, trackers: 0 };
   let phpLeftovers = 0;
@@ -488,7 +499,14 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
         // The file is written as UTF-8 below.
         if (own && own !== 'utf-8') $el.attr('charset', 'utf-8');
       });
-      const meta = extractMeta($, pageUrl, opts.domain, { hasPath });
+      // Canonical, og:url and sitemap: a spelling of another page's address (//a.html next to
+      // /a.html) names that address, any other page its own URL, except that "//a.html" alone would
+      // name a host "a.html" (links to it lose the extra slash too). Links above resolve against
+      // the URL as the browser has it.
+      const pageAddress = new URL(pageUrl);
+      pageAddress.pathname = p.route?.exact ? mergeSlashes(pageUrl.pathname) : pageUrl.pathname.replace(/^\/{2,}/, '/');
+      const meta = extractMeta($, pageAddress, opts.domain, { hasPath });
+      for (const key of ['canonicalPath', 'image'] as const) meta[key] = meta[key]?.replace(/^\/{2,}/, '/');
       applySeo($, meta, site);
       let html = $.html();
       if (doctype) html = html.replace(/<!doctype[^>]*>/i, () => doctype);
@@ -502,6 +520,7 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
       await write(p.file, html);
       const lastmod = meta.modifiedAt ?? meta.publishedAt ?? tsToIso(p.res.timestamp);
       pages.push({ ...meta, file: p.file, timestamp: p.res.timestamp, lastmod });
+      if (p.route?.exact) twins.add(p.file);
     } else if (p.kind === 'css') {
       const cs = legacyCharset(body, p.res.contentType ?? '', 'css', pageCharset(p));
       // latin1 keeps the bytes exactly as they were when the charset stays.
@@ -566,7 +585,7 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
   }
 
   // 5. Sitemaps, feed, robots.txt, 404 page.
-  const indexable = pages.filter((pg) => !pg.noindex && pg.type !== 'archive' && (!pg.canonicalPath || pg.canonicalPath === pg.path));
+  const indexable = pages.filter((pg) => !twins.has(pg.file) && !pg.noindex && pg.type !== 'archive' && (!pg.canonicalPath || pg.canonicalPath === pg.path));
   const entry = (pg: PageRecord): SitemapEntry => ({ path: pg.path, lastmod: pg.lastmod, image: pg.image });
   const maps = sitemaps(opts.siteUrl, {
     pages: indexable.filter((pg) => pg.type === 'home' || pg.type === 'page').map(entry),
@@ -581,7 +600,7 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
   await write('sitemap.xsl', sitemapXsl(siteName));
   await write('robots.txt', robotsTxt(opts.siteUrl));
 
-  const posts = pages.filter((pg) => pg.type === 'post' && pg.publishedAt && !pg.noindex);
+  const posts = pages.filter((pg) => pg.type === 'post' && pg.publishedAt && !pg.noindex && !twins.has(pg.file));
   if (site.rssPath) {
     const feed = rssFeed(
       { siteUrl: opts.siteUrl, siteName, description: siteDescription ?? siteName, rssPath: site.rssPath },
@@ -592,6 +611,12 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
   if (!takenFiles.has('404.html')) await write('404.html', notFoundPage(siteName, home ? pages.find((pg) => pg.path === '/')?.lang : undefined));
 
   // 6. Server rules. Cloudflare Pages needs the plain files to tell x.html next to a file x apart.
+  const unmatched = [...content, ...moved].filter((r) => ruleQuery(new URL(r.url).search) === undefined);
+  if (unmatched.length) {
+    warnings.push(
+      `${unmatched.length} original URL(s) such as ${unmatched[0].url} have more than ${QUERY_PASSES} runs of empty or tracking parameters in the query string, more than the server rules strip; they answer only without them.`,
+    );
+  }
   const plain = [...new Set(plans.filter((p) => !p.route).map((p) => p.file))];
   const rules: ServerRules = { domain: opts.domain, host: new URL(opts.siteUrl).host, routes, redirects, types, files: plain };
   const pagesRedirects = netlifyRedirects(rules);

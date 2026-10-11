@@ -170,8 +170,8 @@ describe('nginx rules', () => {
   it('matches every key case-sensitively, with no limit on its length', () => {
     assert.equal(entries.length, siteRoutes.length + siteRedirects.length);
     const keys = [
-      ...siteRoutes.map((x) => (x.query !== undefined ? `${x.rawPath}?${x.query}` : x.path)),
-      ...siteRedirects.map((d) => (d.noQuery ? d.rawPath + '?' : d.path)),
+      ...siteRoutes.map((x) => (x.query !== undefined ? `${x.rawPath}?&${x.query}&` : x.path)),
+      ...siteRedirects.map((d) => (d.noQuery ? d.rawPath + '?&' : d.path)),
     ];
     for (const [key] of entries) {
       // "~" is a case-sensitive regex; plain strings go into a case-insensitive, size-limited hash.
