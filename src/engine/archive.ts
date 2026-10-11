@@ -69,6 +69,10 @@ export class ArchiveClient {
   readonly signal?: AbortSignal;
   readonly log: (msg: string) => void;
   requests = 0;
+  /** Playback requests the archive answered (whatever the answer), and those it refused or failed. */
+  played = 0;
+  refused = 0;
+  lastRefusal?: string;
 
   #active = 0;
   #waiters: Array<() => void> = [];
@@ -85,7 +89,7 @@ export class ArchiveClient {
     this.timeoutMs = num(opts.timeoutMs, 90_000, 1);
     this.maxBytes = num(opts.maxBytes, 50 * 1024 * 1024, 0);
     this.backoffMs = num(opts.backoffMs, 2_000, 0);
-    this.userAgent = opts.userAgent ?? 'WaybackDownloader/0.1 (+site restore tool)';
+    this.userAgent = opts.userAgent ?? 'zplus/0.1 (+https://zplus.ai)';
     this.signal = opts.signal;
     this.log = opts.log ?? (() => {});
   }
@@ -210,6 +214,22 @@ export class ArchiveClient {
    * itself made (an archived 301/302 to a different URL) is returned as kind "redirect".
    */
   async fetchCapture(timestamp: string, original: string): Promise<CaptureResult> {
+    const res = await this.#fetchCapture(timestamp, original);
+    if (res.kind === 'missing' && res.transient) {
+      this.refused++;
+      this.lastRefusal = res.reason;
+    } else {
+      this.played++;
+    }
+    return res;
+  }
+
+  /** True when playback was tried and archive.org refused or failed every request (429, 5xx). */
+  get playbackRefused(): boolean {
+    return this.refused > 0 && this.played === 0;
+  }
+
+  async #fetchCapture(timestamp: string, original: string): Promise<CaptureResult> {
     const wanted = toUrl(original);
     if (!wanted) return { kind: 'missing', status: 0, reason: 'invalid URL' };
     const wantedKey = urlKey(wanted);
@@ -244,6 +264,9 @@ export class ArchiveClient {
           }
           return { kind: 'redirect', timestamp: archived.timestamp, status: res.status, location: archived.original };
         }
+        // Not a replay URL. Without Memento-Datetime it is the archive sending us elsewhere, never
+        // a redirect the site made.
+        if (!memento) return { kind: 'missing', status: res.status, reason: `the archive redirected to ${abs.origin}` };
         const target = abs.toString();
         const t = toUrl(target);
         if (t && urlKey(t) === wantedKey) return { kind: 'missing', status: res.status, reason: 'redirect loop' };
