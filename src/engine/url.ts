@@ -205,14 +205,26 @@ export function pathBytesPattern(pathname: string): string {
   );
 }
 
+/** A segment that decodes to "/" or NUL, which no file name holds: decodePath keeps it as written. */
+function keepsEscapes(seg: string): boolean {
+  const d = decodeSafe(seg);
+  return d.includes('/') || d.includes('\0');
+}
+
+/**
+ * True when a segment holds an escaped slash (or NUL): "/tag/AC%2FDC". nginx and Cloudflare Pages
+ * decode it and look up /tag/AC/DC, Apache refuses it unless the server allows encoded slashes, so
+ * a file named "AC%2FDC" would never be found.
+ */
+export function hasEncodedSlash(pathname: string): boolean {
+  return pathname.split('/').some(keepsEscapes);
+}
+
 /** Percent-decoded path for the file system ("/a%20b/" -> "/a b/"). */
 export function decodePath(pathname: string): string {
   return pathname
     .split('/')
-    .map((seg) => {
-      const d = decodeSafe(seg);
-      return d.includes('/') || d.includes('\0') ? seg : d;
-    })
+    .map((seg) => (keepsEscapes(seg) ? seg : decodeSafe(seg)))
     .join('/');
 }
 

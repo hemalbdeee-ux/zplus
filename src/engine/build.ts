@@ -11,7 +11,9 @@
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { decodeText, isValidUtf8 } from './charset.ts';
+import * as cheerio from 'cheerio';
+import type { AnyNode, ProcessingInstruction } from 'domhandler';
+import { decodeText, detectCharset, isValidUtf8 } from './charset.ts';
 import { cleanDocument, stripWaybackMarkup } from './clean.ts';
 import { isHtmlType, type Manifest, type Resource } from './crawl.ts';
 import { loadHtml, rewriteCss, visitUrls } from './html.ts';
@@ -24,6 +26,7 @@ import {
   netlifyRedirects,
   nginxConf,
   pagesOverflow,
+  ruleUrl,
   type FileAlias,
   type Redirect,
   type Route,
@@ -34,6 +37,7 @@ import { robotsTxt, rssFeed, sitemaps, sitemapXsl, type SitemapEntry } from './s
 import {
   cleanSearch,
   decodePath,
+  hasEncodedSlash,
   hasNonUtf8Escapes,
   isInternal,
   makeRootRelative,
@@ -247,15 +251,40 @@ function charsetLabel(label: string | undefined): string | undefined {
  * the Content-Type or a CSS @charset, browsers use the encoding of the page that loads the file.
  */
 function legacyCharset(body: Buffer, contentType: string, kind: Kind, pageCharset: string | undefined): string | undefined {
-  if (!body.some((b) => b > 0x7f)) return undefined;
-  if ((body[0] === 0xef && body[1] === 0xbb && body[2] === 0xbf) || (body[0] === 0xff && body[1] === 0xfe) || (body[0] === 0xfe && body[1] === 0xff)) return undefined;
+  if (!body.some((b) => b > 0x7f) || hasBom(body)) return undefined;
   const declared =
     charsetLabel(/charset\s*=\s*["']?([^"';\s]+)/i.exec(contentType)?.[1]) ??
-    (kind === 'css' ? charsetLabel(/^@charset "([^"]+)";/.exec(body.subarray(0, 64).toString('latin1'))?.[1]) : undefined);
+    (kind === 'css' ? charsetLabel(/^@charset "([^"]+)";/.exec(body.subarray(0, 64).toString('latin1'))?.[1]) : undefined) ??
+    (kind === 'xml' ? charsetLabel(XML_ENCODING.exec(body.subarray(0, 1024).toString('latin1'))?.[3]) : undefined);
   // Valid UTF-8 that a page only implies is another charset is far more likely really UTF-8.
   const implied = pageCharset?.startsWith('utf-16') || isValidUtf8(body) ? undefined : pageCharset;
   const cs = declared ?? implied;
   return cs && cs !== 'utf-8' ? cs : undefined;
+}
+
+function hasBom(body: Buffer): boolean {
+  return (body[0] === 0xef && body[1] === 0xbb && body[2] === 0xbf) || (body[0] === 0xff && body[1] === 0xfe) || (body[0] === 0xfe && body[1] === 0xff);
+}
+
+/** The encoding an <?xml?> declaration names: $3, between the quotes $2. */
+const XML_ENCODING = /^(\s*<\?xml\b[^>]*?\sencoding\s*=\s*)(["'])([^"']*)\2/;
+
+/**
+ * The legacy charset a feed or other XML file, or a text file, was read with. Servers send text as
+ * UTF-8 and leave XML to its declaration, so these are converted to UTF-8 like the pages. As for
+ * pages, bytes that are mostly not UTF-8 under a UTF-8 label, or none, were windows-1252.
+ */
+function fileCharset(body: Buffer, contentType: string, kind: Kind, pageCharset: string | undefined): string | undefined {
+  if (!body.some((b) => b > 0x7f) || hasBom(body)) return undefined;
+  // Not text after all: a .docx is "officedocument...xml", a text/plain URL can hold anything.
+  if (body.includes(0) || (kind === 'xml' && !/^\s*</.test(body.subarray(0, 256).toString('latin1')))) return undefined;
+  const cs = legacyCharset(body, contentType, kind, pageCharset) ?? detectCharset(body, 'charset=utf-8');
+  return cs === 'utf-8' ? undefined : cs;
+}
+
+/** A plain text file, which servers send as text/plain by its .txt name. */
+function isText(p: Plan): boolean {
+  return p.kind === 'other' && path.posix.extname(p.file).toLowerCase() === '.txt' && /^(text\/plain\b|\s*$)/i.test(p.res.contentType ?? '');
 }
 
 function shortHash(s: string): string {
@@ -274,6 +303,72 @@ export function phpSafe(html: string): { html: string; leftovers: number } {
       return '&lt;?';
     });
   return { html: out, leftovers };
+}
+
+/** What comes before a doctype, which the HTML parser skips: whitespace, comments, bogus comments. */
+const BEFORE_DOCTYPE = /[\t\n\f\r ]+|<!--(?:-?>|[\s\S]*?--!?>)|<(?:\?|!(?!--|doctype)|\/(?![a-z]))[^>]*>/iy;
+const DOCTYPE = /<!doctype[^>]*>/iy;
+
+/**
+ * The doctype as the page wrote it ("<!DOCTYPE HTML PUBLIC ...>"), found the way the parser finds
+ * it: after any number of comments, however long, and never inside one.
+ */
+function sourceDoctype(html: string): string | undefined {
+  let at = html.charCodeAt(0) === 0xfeff ? 1 : 0;
+  for (BEFORE_DOCTYPE.lastIndex = at; BEFORE_DOCTYPE.test(html); BEFORE_DOCTYPE.lastIndex = at) at = BEFORE_DOCTYPE.lastIndex;
+  DOCTYPE.lastIndex = at;
+  return DOCTYPE.exec(html)?.[0];
+}
+
+const VOID_ELEMENTS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
+const XML_ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+
+/** XML text with its character and entity references resolved. */
+function decodeXmlText(s: string): string {
+  return s.replace(/&(?:#(\d+)|#x([0-9a-fA-F]+)|(amp|lt|gt|quot|apos));/g, (m, dec?: string, hex?: string, name?: string) => {
+    if (name) return XML_ENTITIES[name];
+    const cp = dec ? Number(dec) : parseInt(hex!, 16);
+    return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : m;
+  });
+}
+
+/**
+ * A page served as application/xhtml+xml, read as browsers read it, with the XML parser: there
+ * <script src="a.js"/> is an empty element and <![CDATA[ ]]> plain text, where the HTML parser takes
+ * the first for a script holding the rest of the page. Written back as HTML that means the same,
+ * which the build reads and servers send as text/html. XML always renders in standards mode, so
+ * the page gets <!DOCTYPE html>, whatever doctype it had.
+ */
+function xhtmlAsHtml(xml: string): string {
+  const $ = cheerio.load(xml, { xml: { decodeEntities: false } });
+  // Text stays as written, as the HTML parser reads its references the same way, except inside
+  // <script> and <style>, where HTML reads none.
+  const write = (nodes: AnyNode[], raw: boolean): string =>
+    nodes
+      .map((n) => {
+        if (n.type === 'text') return raw ? decodeXmlText(n.data) : n.data;
+        if (n.type === 'cdata') {
+          const data = n.children.map((c) => ('data' in c ? c.data : '')).join('');
+          return raw ? data : data.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+        // A comment in a script is no part of its code in XML.
+        if (n.type === 'comment') return raw ? '' : `<!--${n.data}-->`;
+        if (n.type === 'tag' || n.type === 'script' || n.type === 'style') {
+          const attrs = Object.entries(n.attribs).map(([k, v]) => ` ${k}="${v.replace(/"/g, '&quot;')}"`);
+          const inner = write(n.children, raw || n.name === 'script' || n.name === 'style');
+          // Markup that was no XML (<br> left open) keeps what the parser put inside.
+          return `<${n.name}${attrs.join('')}>${inner}${VOID_ELEMENTS.has(n.name) ? '' : `</${n.name}>`}`;
+        }
+        return ''; // the doctype and processing instructions
+      })
+      .join('');
+  return '<!DOCTYPE html>' + write($.root()[0].children, false);
+}
+
+/** A page's markup for the HTML parser: without an <?xml?> declaration, and XHTML read as XML. */
+function htmlSource(text: string, contentType: string): string {
+  const html = text.replace(/^\uFEFF?\s*<\?xml[^>]*\?>\s*/i, '');
+  return /application\/xhtml\+xml/i.test(contentType) ? xhtmlAsHtml(html) : html;
 }
 
 export function planFiles(resources: Resource[], kinds: Map<string, Kind>): Plan[] {
@@ -337,7 +432,9 @@ export function planFiles(resources: Resource[], kinds: Map<string, Kind>): Plan
       continue;
     }
     const decoded = decodePath(pathname);
-    const file = !hasNonUtf8Escapes(pathname) && plainFile(decoded, kind, path.posix.extname(decoded).toLowerCase(), r.contentType ?? '');
+    // Servers look up neither bytes that are not UTF-8 nor an escaped slash by a file name: /tag/AC%2FDC
+    // is /tag/AC/DC to nginx and Pages, which a route keyed by that address serves.
+    const file = !hasNonUtf8Escapes(pathname) && !hasEncodedSlash(pathname) && plainFile(decoded, kind, path.posix.extname(decoded).toLowerCase(), r.contentType ?? '');
     // A query URL never gets a path-only route: that would also answer the bare path.
     if (!file) {
       toRoute(plan, query);
@@ -452,12 +549,13 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
   let logo: string | undefined;
   if (home) {
     const { text } = decodeText(await readRaw(home.res), home.res.contentType ?? '');
-    const $ = loadHtml(text);
+    const source = htmlSource(text, home.res.contentType ?? '');
+    const $ = loadHtml(source);
     const meta = extractMeta($, new URL(home.res.url), opts.domain, { hasPath });
     homeTitle = meta.title;
     siteNameHint = meta.siteNameHint;
     siteDescription = meta.description;
-    logo = pickLogo(text, new URL(home.res.url), opts.domain);
+    logo = pickLogo(source, new URL(home.res.url), opts.domain);
   }
   const siteName = guessSiteName(titles, homeTitle, siteNameHint, opts.domain);
   const rssPath = !takenPaths.has('/rss/') && !takenPaths.has('/rss') && !takenFiles.has('rss/index.xml') ? '/rss/' : !takenPaths.has('/rss.xml') ? '/rss.xml' : undefined;
@@ -489,10 +587,12 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
     if (p.kind === 'html') {
       const pageUrl = new URL(p.res.url);
       const { text, charset } = decodeText(body, p.res.contentType ?? '');
-      // The parser rewrites any doctype to <!DOCTYPE html>; old pages keep their own so browsers
+      const source = stripWaybackMarkup(htmlSource(text, p.res.contentType ?? ''));
+      const $ = loadHtml(source);
+      // The parser writes any doctype as <!DOCTYPE html>; old pages keep their own so browsers
       // render them in the same (often quirks) mode as before.
-      const doctype = /<!doctype[^>]*>/i.exec(text.slice(0, 4096))?.[0];
-      const $ = loadHtml(stripWaybackMarkup(text.replace(/^\uFEFF?\s*<\?xml[^>]*\?>\s*/i, '')));
+      const doctypeNode = $.root()[0].children.find((n): n is ProcessingInstruction => n.type === 'directive');
+      const doctype = doctypeNode && (sourceDoctype(source) ?? `<${doctypeNode.data}>`);
       const stats = cleanDocument($, { stripTracking: opts.stripTracking });
       cleaned.wayback += stats.waybackRemoved;
       cleaned.trackers += stats.trackersRemoved;
@@ -520,14 +620,14 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
       const meta = extractMeta($, pageAddress, opts.domain, { hasPath });
       for (const key of ['canonicalPath', 'image'] as const) meta[key] = meta[key]?.replace(/^\/{2,}/, '/');
       applySeo($, meta, site);
-      let html = $.html();
-      if (doctype) html = html.replace(/<!doctype[^>]*>/i, () => doctype);
+      // Only the parser's own doctype is replaced, not one in a comment before it.
+      let html = $.root()[0].children.map((n) => (n === doctypeNode ? doctype : $.html(n))).join('');
       const ext = path.posix.extname(p.file).toLowerCase();
       if (SERVER_EXT.has(ext)) {
         const safe = phpSafe(html);
         html = safe.html;
         phpLeftovers += safe.leftovers;
-        types.push({ file: p.file, contentType: 'text/html; charset=utf-8' });
+        types.push({ file: p.file, contentType: 'text/html; charset=utf-8', rawPath: pageUrl.pathname });
       }
       await write(p.file, html);
       const lastmod = meta.modifiedAt ?? meta.publishedAt ?? tsToIso(p.res.timestamp);
@@ -539,10 +639,20 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
       const text = cs ? new TextDecoder(cs).decode(body).replace(/^@charset "[^"]*";/, '@charset "utf-8";') : body.toString('latin1');
       await write(p.file, Buffer.from(rewriteCss(text, relink), cs ? 'utf8' : 'latin1'));
     } else if (p.kind === 'js' || p.kind === 'xml') {
-      const cs = p.kind === 'js' ? legacyCharset(body, p.res.contentType ?? '', 'js', pageCharset(p)) : undefined;
+      const ct = p.res.contentType ?? '';
+      const cs = p.kind === 'js' ? legacyCharset(body, ct, 'js', pageCharset(p)) : fileCharset(body, ct, 'xml', undefined);
       const text = cs ? new TextDecoder(cs).decode(body) : body.toString('latin1');
-      const out = text.includes('archive.org/web/') ? unwrapWaybackInText(text, opts.domain) : text;
+      let out = text.includes('archive.org/web/') ? unwrapWaybackInText(text, opts.domain) : text;
+      // The bytes are UTF-8 now (or were all along, whatever the declaration said), and no server
+      // sends a charset with XML: the declaration is what readers go by.
+      if (p.kind === 'xml' && body.some((b) => b > 0x7f) && !hasBom(body)) {
+        out = out.replace(XML_ENCODING, (m, start: string, q: string, label: string) => (charsetLabel(label) === 'utf-8' ? m : `${start}${q}UTF-8${q}`));
+      }
       await write(p.file, cs ? Buffer.from(out, 'utf8') : out !== text ? Buffer.from(out, 'latin1') : body);
+    } else if (isText(p)) {
+      // Servers send .txt files as UTF-8 (AddDefaultCharset, nginx's charset, the preview).
+      const cs = fileCharset(body, p.res.contentType ?? '', p.kind, pageCharset(p));
+      await write(p.file, cs ? Buffer.from(new TextDecoder(cs).decode(body), 'utf8') : body);
     } else {
       await write(p.file, body);
     }
@@ -619,7 +729,9 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
 
   // Cloudflare Pages compares _redirects lines with the path as sent, where Apache, nginx and the
   // preview merge slashes and decode escapes: there, each archived spelling of an address names
-  // what serves it. A plain file serves its own URL there unless that has doubled slashes.
+  // what serves it. A plain file serves its own URL there unless that has doubled slashes, or is
+  // a folder served from index.xml, which gets a line in any spelling (/caf%c3%a9/feed/ as well
+  // as /caf%C3%A9/feed/).
   const fileAliases: FileAlias[] = [];
   for (const p of plans) {
     if (p.route) {
@@ -627,7 +739,8 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
       continue;
     }
     const own = new URL(p.res.url).pathname;
-    for (const raw of [...(own !== mergeSlashes(own) ? [own] : []), ...(p.aliases ?? [])]) fileAliases.push({ rawPath: raw, file: p.file });
+    const ownLine = own !== mergeSlashes(own) || (own.endsWith('/') && p.file.endsWith('index.xml'));
+    for (const raw of [...(ownLine ? [own] : []), ...(p.aliases ?? [])]) fileAliases.push({ rawPath: raw, file: p.file });
   }
 
   // 5. Sitemaps, feed, robots.txt, 404 page.
@@ -663,21 +776,39 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
       `${unmatched.length} original URL(s) such as ${unmatched[0].url} have more than ${QUERY_PASSES} runs of empty or tracking parameters in the query string, more than the server rules strip; they answer only without them.`,
     );
   }
+  const slashed = [...content, ...moved].filter((r) => hasEncodedSlash(new URL(r.url).pathname));
+  if (slashed.length) {
+    warnings.push(
+      `${slashed.length} original URL(s) such as ${slashed[0].url} have an escaped slash (%2F) in the path. Apache and LiteSpeed answer them 404 unless the server configuration (not .htaccess) says "AllowEncodedSlashes On"; nginx, Cloudflare Pages and the preview serve them.`,
+    );
+  }
   const plain = [...new Set(plans.filter((p) => !p.route).map((p) => p.file))];
+  // The generated feed too: Pages and Netlify serve /rss/ only through a line of _redirects.
+  if (site.rssPath === '/rss/') plain.push('rss/index.xml');
   const rules: ServerRules = { domain: opts.domain, host: new URL(opts.siteUrl).host, routes, redirects, types, files: plain, fileAliases };
   const pagesRedirects = netlifyRedirects(rules);
   const pagesHeaders = netlifyHeaders(rules);
-  await write('.htaccess', htaccess(rules));
+  const tooLong = { apache: [] as Array<Route | Redirect>, nginx: [] as Array<Route | Redirect> };
+  await write('.htaccess', htaccess(rules, tooLong.apache));
   await write('_redirects', pagesRedirects);
   await write('_headers', pagesHeaders);
   const ignored = pagesOverflow(pagesRedirects, pagesHeaders);
   if (ignored) {
     warnings.push(
-      `Cloudflare Pages reads at most 2,000 plain and 100 pattern rules from _redirects and 100 rules from _headers; ${ignored} rule(s) of this site are past that, so some original URLs would redirect or fail there. Netlify, Apache, LiteSpeed and nginx are not affected.`,
+      `Cloudflare Pages reads at most 2,000 plain and 100 pattern rules from _redirects and 100 rules from _headers, and no line of more than 2,000 characters; ${ignored} rule(s) of this site are past that, so some original URLs would redirect or fail there. Netlify, Apache, LiteSpeed and nginx are not affected.`,
     );
   }
   await write('__wbd/routes.json', JSON.stringify({ domain: opts.domain, siteUrl: opts.siteUrl, routes, redirects, types }, null, 1));
-  await writeFile(path.join(opts.serverDir, 'nginx.conf'), nginxConf(rules));
+  await writeFile(path.join(opts.serverDir, 'nginx.conf'), nginxConf(rules, tooLong.nginx));
+  for (const [list, file, server, limit] of [
+    [tooLong.apache, '.htaccess', 'Apache and LiteSpeed', '8,191 bytes per line'],
+    [tooLong.nginx, 'nginx.conf', 'nginx', '4,095 bytes per parameter'],
+  ] as const) {
+    if (!list.length) continue;
+    warnings.push(
+      `${list.length} original URL(s) such as ${ruleUrl(list[0])} are too long for a rule of ${file} (${limit}): one such rule would stop ${server} serving any page, so ${file} leaves them out and they do not answer as archived there.`,
+    );
+  }
 
   log(`wrote ${files} files (${(bytes / 1024 / 1024).toFixed(1)} MB): ${pages.length} pages, ${routes.length} rewrites, ${redirects.length} original redirects`);
   return { siteName, pages, routes, redirects, types, files, bytes, rssPath: site.rssPath, warnings, cleaned };

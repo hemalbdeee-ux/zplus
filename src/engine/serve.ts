@@ -8,7 +8,7 @@ import http from 'node:http';
 import path from 'node:path';
 import type { Redirect, Route } from './serverconfig.ts';
 import { HTML_LIKE_EXT, redirectTarget } from './serverconfig.ts';
-import { decodePath, hasNonUtf8Escapes, mergeSlashes, rawPathKey, ruleQuery, serverPath } from './url.ts';
+import { decodePath, hasEncodedSlash, hasNonUtf8Escapes, mergeSlashes, rawPathKey, ruleQuery, serverPath } from './url.ts';
 
 const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -120,8 +120,9 @@ export async function createPreviewServer(siteDir: string): Promise<http.Server>
       return abs ? send(abs) : notFound();
     }
 
-    // No file is named with bytes that are not UTF-8 ("/caf%E9.html"): those URLs are routes.
-    if (hasNonUtf8Escapes(merged)) return notFound();
+    // No file is named with bytes that are not UTF-8 ("/caf%E9.html") or with an escaped slash
+    // ("/tag/AC%2FDC", which no server looks up as a file name): those URLs are routes.
+    if (hasNonUtf8Escapes(merged) || hasEncodedSlash(merged)) return notFound();
     const direct = !decoded.endsWith('/') && isFile(decoded);
     if (direct) return send(direct);
     const withHtml = !decoded.endsWith('/') && isFile(decoded + '.html');
