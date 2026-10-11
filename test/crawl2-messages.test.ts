@@ -40,13 +40,14 @@ describe('archive.org refusing playback during the scan', () => {
     try {
       archive.failNext(429, 100_000);
       await assert.rejects(restore({ domain: 'oldbakery.example', outDir: out, zip: false, archive: { base: archive.base, ...FAST } }), (err: Error) => {
-        assert.match(err.message, /archive\.org refused or failed every request to play back oldbakery\.example's captures \(HTTP 429\)/);
-        assert.doesNotMatch(err.message, /real website/);
+        // The health scan notices first and names how many homepage captures were refused.
+        assert.match(err.message, /archive\.org refused or failed .*\(HTTP 429\)/);
+        assert.doesNotMatch(err.message, /No capture of .* looks like a real website/);
         return true;
       });
       const r = await cli('scan', 'oldbakery.example', '--archive', archive.base, '--delay', '0');
       assert.equal(r.code, 1, r.stdout + r.stderr);
-      assert.match(r.stderr, /archive\.org refused or failed every request to play back/);
+      assert.match(r.stderr, /archive\.org refused or failed .*homepage captures/);
     } finally {
       archive.failNext(429, 0);
       await archive.close();
