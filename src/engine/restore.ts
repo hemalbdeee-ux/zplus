@@ -54,6 +54,8 @@ const INDEX_CAP = 500_000;
 
 /** Reasons the health scan gives for another owner's homepage (NEW_OWNER in health.ts). */
 const NEW_OWNER = /parked|redirects to|sends visitors|spam/;
+/** The reason the health scan gives a month it neither probed nor could estimate from its neighbours. */
+const UNCHECKED = 'not checked; near a change';
 
 type Window = { from?: string; to?: string };
 
@@ -65,21 +67,35 @@ function addMonths(month: string, n: number): string {
   return `${Math.floor(i / 12)}${String((i % 12) + 1).padStart(2, '0')}`;
 }
 
+/** A timestamp as YYYY-MM-DD. */
+const day = (ts: string) => `${ts.slice(0, 4)}-${ts.slice(4, 6)}-${ts.slice(6, 8)}`;
+
 /**
  * The period around a date the user picked in which the site was itself, when the health scan found
  * no good month: the walk scanHealth makes from its last good one. It ends before the first bad
  * month after the date and starts after the last stretch of bad months before it that was not an
- * outage of the site. null when the date falls in a month the scan found run by another owner.
+ * outage of the site. Without a good month the scan never narrows down where the site turned bad, so
+ * the months it left unchecked just before that bad month are left out too. null when the date falls
+ * in a stretch of bad months the scan found parked or run by another owner.
  */
 export function windowAround(months: MonthHealth[], target: string): Window | null {
   let i = -1;
   while (i + 1 < months.length && months[i + 1].month <= target.slice(0, 6)) i++;
   const newOwner = (m: MonthHealth) => m.reasons.some((r) => NEW_OWNER.test(r));
-  if (i >= 0 && months[i].verdict === 'bad' && newOwner(months[i])) return null;
+  if (i >= 0 && months[i].verdict === 'bad') {
+    // A month estimated from the probes around it does not carry their reasons, so the whole stretch
+    // of bad months decides, as in the walk back.
+    let k = i;
+    while (k > 0 && months[k - 1].verdict === 'bad') k--;
+    let j = i;
+    while (j + 1 < months.length && months[j + 1].verdict === 'bad') j++;
+    if (months.slice(k, j + 1).some(newOwner)) return null;
+  }
   const window: Window = {};
-  const firstBadAfter = months.slice(i + 1).find((m) => m.verdict === 'bad');
-  if (firstBadAfter) {
-    const last = addMonths(firstBadAfter.month, -1);
+  let end = months.findIndex((m, n) => n > i && m.verdict === 'bad');
+  if (end >= 0) {
+    while (end > 0 && months[end - 1].reasons.includes(UNCHECKED)) end--;
+    const last = addMonths(months[end].month, -1);
     const lastDay = new Date(Date.UTC(Number(last.slice(0, 4)), Number(last.slice(4, 6)), 0)).getUTCDate();
     window.to = `${last}${lastDay}235959`;
   }
@@ -179,18 +195,23 @@ export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
     );
   }
   let bounds: Window = health?.window ?? {};
+  let around: Window | null = null;
   if (health?.months.length && !health.lastGood && !(givenFrom && givenTo)) {
     // The user picked the date after the scan found no good month. The window still ends at the
     // months it found parked or taken over, or the later owner's pages would come back as the site.
-    const around = windowAround(health.months, target);
+    around = windowAround(health.months, target);
     if (!around) {
-      const date = `${target.slice(0, 4)}-${target.slice(4, 6)}-${target.slice(6, 8)}`;
-      throw new Error(`The health scan found ${domain} parked or run by another owner around ${date}. Pick a date when it was still the old site, or pass --from and --to to restore that period anyway.`);
+      throw new Error(`The health scan found ${domain} parked or run by another owner around ${day(target)}. Pick a date when it was still the old site, or pass --from and --to to restore that period anyway.`);
     }
     bounds = around;
-    emit('health', `no capture looks like a real website: pages are taken from ${bounds.from?.slice(0, 8) ?? 'the start'} to ${bounds.to?.slice(0, 8) ?? 'today'}, between the bad months around the chosen date`);
   }
   const window: Window = { from: givenFrom ?? bounds.from, to: givenTo ?? bounds.to };
+  if (around) {
+    if (window.from && window.to && window.from > window.to) {
+      throw new Error(`The health scan cannot vouch for ${domain} around ${day(target)}: the months around it were bad or not checked, so the period to restore would run from ${day(window.from)} to ${day(window.to)}. Pick a date when it was still the old site, or pass --from and --to to restore that period anyway.`);
+    }
+    emit('health', `no capture looks like a real website: pages are taken from ${window.from?.slice(0, 8) ?? 'the start'} to ${window.to?.slice(0, 8) ?? 'today'}, between the bad months around the chosen date`);
+  }
   if (givenTarget && !inWindow(target, window)) {
     warnings.push(`The chosen date ${target.slice(0, 8)} is outside the period the site looked healthy; pages were taken from that period instead.`);
   }

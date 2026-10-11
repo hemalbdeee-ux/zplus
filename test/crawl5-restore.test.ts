@@ -91,6 +91,63 @@ describe('a date picked after the scan found no good month', () => {
     assert.equal(windowAround(months, '20150301000000'), null);
     assert.deepEqual(windowAround([], '20150301000000'), {});
   });
+
+  it('refuses a date anywhere in a parked stretch, and leaves out the months the scan did not check before it', () => {
+    const month = (m: string, verdict: MonthHealth['verdict'], reasons: string[], probed = false): MonthHealth => ({ month: m, captures: 1, timestamp: `${m}15000000`, score: null, verdict, reasons, probed });
+    const PARKED = ['parked domain page ("this domain may be for sale")'];
+    const months = [
+      month('201801', 'weak', ['very little text (44 words)'], true),
+      month('201802', 'weak', ['estimated from the months around it']),
+      month('201803', 'weak', ['very little text (44 words)'], true),
+      month('201804', 'weak', ['not checked; near a change']),
+      month('201805', 'weak', ['not checked; near a change']),
+      month('201806', 'bad', PARKED, true),
+      month('201807', 'bad', ['estimated from the months around it']),
+      month('201808', 'bad', PARKED, true),
+      month('201809', 'bad', ['after the site went down']),
+    ];
+    // The months between the probes, and after the last one, are the later owner's too.
+    for (const t of ['20180601000000', '20180701000000', '20180901000000', '20190101000000']) assert.equal(windowAround(months, t), null, t);
+    // The scan never narrowed down where the site turned bad: April and May may be parked already.
+    assert.deepEqual(windowAround(months, '20180201000000'), { to: '20180331235959' });
+    assert.deepEqual(windowAround(months, '20180501000000'), { to: '20180331235959' });
+    // Between two parked stretches, with every month in between unchecked, nothing is left.
+    const between = [month('201001', 'bad', PARKED, true), month('201002', 'weak', ['not checked; near a change']), month('201003', 'bad', PARKED, true)];
+    assert.deepEqual(windowAround(between, '20100215000000'), { from: '20100201000000', to: '20100131235959' });
+  });
+
+  it('keeps the parked years out when most months were estimated, not probed', async () => {
+    // A homepage captured every month, each capture a little different (a build date), so the scan
+    // probes a few months and estimates the rest.
+    const months = (from: number, to: number) => Array.from({ length: (to - from + 1) * 12 }, (_, n) => `${from + Math.floor(n / 12)}${String((n % 12) + 1).padStart(2, '0')}`);
+    const stamped = (c: FakeCapture, m: string) => ({ url: c.url, ts: `${m}10120000`, body: String(c.body).replace('</body>', `<!-- ${m} --></body>`) });
+    const [splash, parked, casino] = [SPLASH[0], SPLASH.find((c) => c.ts === '20210610120000')!, SPLASH[SPLASH.length - 1]];
+    const archive = await startFakeArchive([
+      ...months(2015, 2020).map((m) => stamped(splash, m)),
+      ...SPLASH.filter((c) => /\/(gallery|about|shop|contact|news|links)\.html$/.test(c.url)),
+      ...months(2021, 2023).map((m) => stamped(parked, m)),
+      ...['20210211120000', '20220611120000', '20231111120000'].map((ts) => ({ ...casino, ts })),
+    ]);
+    const out = await mkdtemp(path.join(work, 'r-'));
+    try {
+      const opts = { domain: 'splash.example', outDir: out, zip: false, archive: { base: archive.base, ...FAST } };
+      const events: string[] = [];
+      const r = await restore({ ...opts, target: '2019', onEvent: (e) => events.push(e.message) });
+      assert.ok(r.report.window.to && r.report.window.to < '20210101', r.report.window.to);
+      await assert.rejects(readFile(path.join(r.siteDir, 'casino-bonus.html')), { code: 'ENOENT' });
+      assert.doesNotMatch(await readFile(path.join(r.siteDir, 'sitemap-pages.xml'), 'utf8'), /casino/);
+      assert.match(await readFile(path.join(r.siteDir, 'index.html'), 'utf8'), /Splash Ceramics/);
+      // The log gives the period that was used.
+      assert.ok(events.some((m) => m.includes(`pages are taken from the start to ${r.report.window.to!.slice(0, 8)}`)), events.join(' | '));
+      for (const target of ['2022', '2022-06', '2023-11']) {
+        await assert.rejects(restore({ ...opts, target }), /found splash\.example parked or run by another owner around/, target);
+      }
+      // A --from after the months the scan can vouch for leaves nothing to restore.
+      await assert.rejects(restore({ ...opts, target: '2021-03', from: '2021-01' }), /cannot vouch for splash\.example around 2021-03-01: .* from 2021-01-01 to 20\d\d-\d\d-\d\d\. .*--from and --to/);
+    } finally {
+      await archive.close();
+    }
+  });
 });
 
 describe('a restore without the health scan', () => {
