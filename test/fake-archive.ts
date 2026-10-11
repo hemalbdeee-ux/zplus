@@ -1,6 +1,6 @@
 // A small stand-in for web.archive.org: the CDX index API and raw "id_" playback, served from
 // fixture captures. It behaves like the real archive in the ways the engine depends on:
-// SURT-style keys that ignore www, scheme and case, the nearest-timestamp redirect (no
+// SURT-style keys that ignore www, scheme, case and query order, the nearest-timestamp redirect (no
 // Memento-Datetime), archived redirects with a Location on the archive (with Memento-Datetime),
 // skipped self-redirects, revisit rows, resume keys, and filters.
 
@@ -35,7 +35,9 @@ export interface FakeArchive {
 function surtKey(u: URL, stripTrailingSlash = false): string {
   const host = u.hostname.toLowerCase().replace(/^www\d{0,3}\./, '');
   const p = stripTrailingSlash && u.pathname.length > 1 ? u.pathname.replace(/\/+$/, '') : u.pathname;
-  return host.split('.').reverse().join(',') + ')' + (p + u.search).toLowerCase();
+  // IA's canonicalizer sorts the query parameters: ?b=2&a=1 and ?a=1&b=2 share a key.
+  const q = u.search.length > 1 ? '?' + u.search.slice(1).split('&').sort().join('&') : '';
+  return host.split('.').reverse().join(',') + ')' + (p + q).toLowerCase();
 }
 
 function httpDate(ts: string): string {

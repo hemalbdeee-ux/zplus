@@ -79,7 +79,8 @@ export interface IndexedCapture extends Capture {
   /**
    * When the chosen capture is a 3xx: the best in-window capture, not a 3xx, of another URL that
    * the archive files under the same key (/about.html for /About.html, /page for /page/). Replay
-   * skips a 3xx that points inside its own key, so this is where such a redirect went.
+   * skips a 3xx that points inside its own key, so when the URL has no alt this is where such a
+   * redirect went.
    */
   twin?: Capture;
 }
@@ -95,6 +96,10 @@ const LOOKUP_URLS = 100;
 /** This many archive failures in a row (429, 5xx, network) mean archive.org is refusing us. */
 const MAX_FAILURE_STREAK = 20;
 const REVISIT = 'warc/revisit';
+// Where a URL of unknown type was found tells what it is: these lead to other pages, everything
+// else a page names (img, script, a stylesheet, srcset, url() in CSS) is part of that page.
+const PAGE_LINKS: Array<[string, string]> = [['a', 'href'], ['area', 'href'], ['frame', 'src'], ['iframe', 'src'], ['form', 'action'], ['base', 'href'], ['blockquote', 'cite'], ['q', 'cite']];
+const ASSET_REL = /\b(stylesheet|icon|preload|prefetch|modulepreload|manifest|image_src)\b/i;
 // What an extension gives away when the CDX type does not say (a revisit row, an unlisted URL).
 const PAGE_EXT = /\.(html?|shtml|xhtml)$/i;
 const FILE_EXT = /\.(css|m?js|json|xml|rss|atom|txt|csv|pdf|zip|gz|png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?|woff2?|ttf|otf|eot|mp3|mp4|m4a|webm|ogg|ogv|wav|flv|swf|docx?|xlsx?|pptx?)$/i;
@@ -126,6 +131,20 @@ function guessHtml(cap: Capture | undefined, u: URL): boolean | undefined {
 }
 
 const isRedirect = (c: Capture) => /^3/.test(c.statuscode);
+
+/** How many times each raw URL appears in a page as a link to another page (see PAGE_LINKS). */
+function pageLinks($: ReturnType<typeof loadHtml>): Map<string, number> {
+  const out = new Map<string, number>();
+  const add = (v: string | undefined) => {
+    if (v !== undefined) out.set(v, (out.get(v) ?? 0) + 1);
+  };
+  for (const [tag, attr] of PAGE_LINKS) $(`${tag}[${attr}]`).each((_, el) => add($(el).attr(attr)));
+  // rel="canonical", "alternate", "next": pages and feeds, not part of this page.
+  $('link[href]').each((_, el) => {
+    if (!ASSET_REL.test($(el).attr('rel') ?? '')) add($(el).attr('href'));
+  });
+  return out;
+}
 
 function rank(c: Capture, targetSec: number): number {
   const d = tsSeconds(c.timestamp) - targetSec;
@@ -274,13 +293,21 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
     missing: [],
   };
 
-  type Item = { key: string; url: string; referrer?: string; via: Resource['via']; html?: boolean };
+  /**
+   * asset: found as part of a page (an image, a stylesheet), not as a link to another page.
+   * skipped: left out by a demo past its page limit.
+   */
+  type Item = { key: string; url: string; referrer?: string; via: Resource['via']; html?: boolean; asset?: boolean; skipped?: boolean };
   // A read position instead of shift(): shift() is O(n) on big arrays, and a demo drops thousands.
   type Queue = { items: Item[]; head: number };
   const queues: Queue[] = [0, 1, 2].map(() => ({ items: [], head: 0 }));
   const queued = () => queues.reduce((n, q) => n + q.items.length - q.head, 0);
   const seen = new Set<string>();
+  // Items not downloaded yet by key, so a URL first seen as a link and then as an image becomes an asset.
+  const pending = new Map<string, Item>();
   const variants = new Map<string, number>();
+  // Keys whose redirect was worked out from where replay went, not read from an archived 3xx.
+  const inferred = new Set<string>();
   let processed = 0;
   let completed = 0;
   let pages = 0;
@@ -302,10 +329,21 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
     wake?.();
   };
 
-  const enqueue = (u: URL, prio: number, via: Item['via'], referrer?: string): boolean => {
+  const enqueue = (u: URL, prio: number, via: Item['via'], referrer?: string, asset = false): boolean => {
     if (!isInternal(u, opts.domain)) return false;
     const key = urlKey(u);
-    if (seen.has(key)) return false;
+    if (seen.has(key)) {
+      const waiting = asset ? pending.get(key) : undefined;
+      if (waiting && !waiting.asset) {
+        waiting.asset = true;
+        if (waiting.skipped) {
+          waiting.skipped = false;
+          queues[0].items.push(waiting);
+          wake?.();
+        }
+      }
+      return false;
+    }
     const pq = pathAndQuery(u);
     if (SKIP_PATH.test(pq) || GENERATED.has(u.pathname)) return false;
     seen.add(key);
@@ -322,14 +360,17 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
         return false;
       }
     }
-    queues[prio].items.push({ key, url: cap?.original ?? u.toString(), referrer, via, html: guessHtml(cap, u) });
+    const item: Item = { key, url: cap?.original ?? u.toString(), referrer, via, html: guessHtml(cap, u), asset };
+    queues[prio].items.push(item);
+    pending.set(key, item);
     wake?.();
     return true;
   };
 
-  // Past the demo limit only files a kept page linked to still come along. A listed URL of unknown
-  // type (a revisit row) may be a file too, so it is fetched: handle() drops it if it is a page.
-  const mayBeFile = (item: Item) => item.html === false || (item.html === undefined && index.has(item.key));
+  // Past the demo limit only files a kept page linked to still come along. A URL of unknown type (a
+  // revisit row, no extension) that a kept page uses as an image or stylesheet is fetched too, and
+  // handle() drops it if it is a page; one it links to as a page is not.
+  const mayBeFile = (item: Item) => item.html === false || (item.html === undefined && item.asset === true && (index.has(item.key) || index.truncated === true));
 
   const next = (): Item | undefined => {
     for (const q of queues) {
@@ -339,7 +380,11 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
           q.items.splice(0, q.head);
           q.head = 0;
         }
-        if (pageLimitReached() && !(item.via === 'link' && mayBeFile(item))) continue;
+        if (pageLimitReached() && !(item.via === 'link' && mayBeFile(item))) {
+          item.skipped = true;
+          continue;
+        }
+        pending.delete(item.key);
         return item;
       }
     }
@@ -363,18 +408,27 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
   const discover = (body: Buffer, contentType: string, pageUrl: string, key: string) => {
     let urls: string[] = [];
     let base = pageUrl;
+    let links = new Map<string, number>();
     if (isHtmlType(contentType)) {
       const { text } = decodeText(body, contentType);
       const $ = loadHtml(text);
       const baseHref = $('base[href]').attr('href');
       if (baseHref) base = toUrl(unwrapWayback(baseHref), pageUrl)?.toString() ?? pageUrl;
       urls = collectUrls($);
+      links = pageLinks($);
     } else if (isCssType(contentType, pageUrl)) {
       urls = cssUrls(body.toString('latin1'));
     }
+    // A URL is an asset if it appears more often than as a page link (<a href="/x"><img src="/x">).
+    const assets = new Set<string>();
+    for (const raw of urls) {
+      const n = links.get(raw) ?? 0;
+      if (n > 0) links.set(raw, n - 1);
+      else assets.add(raw);
+    }
     for (const raw of urls) {
       const u = toUrl(unwrapWayback(raw.trim()), base);
-      if (u) enqueue(u, 0, 'link', key);
+      if (u) enqueue(u, 0, 'link', key, assets.has(raw));
     }
   };
 
@@ -393,7 +447,7 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
         discover(await readFile(path.join(rawDir, reuse.file)), reuse.contentType ?? '', reuse.url, reuse.key);
       } else if (reuse.location) {
         const t = toUrl(reuse.location);
-        if (t) enqueue(t, 0, 'link', reuse.key);
+        if (t) enqueue(t, 0, 'link', reuse.key, item.asset);
       }
       return;
     }
@@ -418,21 +472,29 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
     let res = await client.fetchCapture(cap?.timestamp ?? opts.target, url);
     if (cap && isRedirect(cap) && !isTransient(res)) {
       // Replay does not always serve the 3xx asked for: the archive skips one whose Location it
-      // files under the same key and serves the nearest other capture of that key, which can be the
-      // parked domain. The key ignores scheme and www (http -> https: the same URL here) but also
-      // case, a trailing slash and query order (/About.html -> /about.html: a redirect to restore).
-      const landed = res.kind === 'ok' && inWindow(res.timestamp, opts.window) ? toUrl(res.original) : null;
-      const usable = res.kind !== 'missing' && inWindow(res.timestamp, opts.window);
-      if (landed && urlKey(landed) !== item.key) {
-        // Replay moved to another URL under the key: that is where the site's 3xx pointed.
-        res = { kind: 'redirect', timestamp: cap.timestamp, status: Number(cap.statuscode), location: landed.toString() };
-      } else if (!usable && cap.alt) {
-        // The best in-window capture of this URL that is not a redirect, fetched at its exact time.
+      // files under the same key and serves the nearest other capture of that key instead, which
+      // can be the parked domain or another spelling. The key ignores scheme and www (http ->
+      // https: the same URL here) but also case, a trailing slash and query order (/About.html ->
+      // /about.html: a redirect to restore), and nothing in the reply tells which it was.
+      const kept = res.kind !== 'missing' && inWindow(res.timestamp, opts.window);
+      const landed = kept && res.kind === 'ok' ? toUrl(res.original) : null;
+      const elsewhere = landed !== null && urlKey(landed) !== item.key;
+      if (kept && !elsewhere) {
+        // The archived redirect itself, or this URL's own content from the good period.
+      } else if (cap.alt) {
+        // The URL also served content of its own in the good period: serving it never invents a
+        // redirect. Where replay landed says nothing about the 3xx, which may only have switched to
+        // https or www (both spellings could otherwise end up redirecting to each other).
         used = cap.alt;
         res = await client.fetchCapture(cap.alt.timestamp, cap.alt.original);
-      } else if (!usable && cap.twin) {
+      } else if (landed && elsewhere) {
+        // Nothing but 3xx captures of this URL, and replay moved to the other spelling under its key.
+        res = { kind: 'redirect', timestamp: cap.timestamp, status: Number(cap.statuscode), location: landed.toString() };
+        inferred.add(item.key);
+      } else if (cap.twin) {
         // Nothing usable of this URL itself: the 3xx went to the other URL under its key.
         res = { kind: 'redirect', timestamp: cap.timestamp, status: Number(cap.statuscode), location: cap.twin.original };
+        inferred.add(item.key);
       }
     }
     failStreak = isTransient(res) ? failStreak + 1 : 0;
@@ -456,7 +518,7 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
       const status = used && isRedirect(used) && used.timestamp === res.timestamp ? Number(used.statuscode) : res.status;
       const target = toUrl(res.location, url);
       manifest.resources.push({ ...base, timestamp: res.timestamp, status: normalizeRedirectStatus(status), location: target?.toString() ?? res.location });
-      if (target) enqueue(target, 0, 'link', item.key);
+      if (target) enqueue(target, 0, 'link', item.key, item.asset);
     } else {
       manifest.missing.push({ key: item.key, url, reason: res.reason, referrer: item.referrer, transient: res.transient || undefined });
     }
@@ -547,6 +609,7 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
     await checkpoint();
     throw failure;
   }
+  breakLoops(manifest, inferred);
   const left = queued() + unqueued;
   if (left > 0 || processed >= opts.maxUrls) {
     manifest.truncated = left > 0;
@@ -554,4 +617,30 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
   }
   await save();
   return manifest;
+}
+
+/**
+ * Backstop: a redirect worked out from replay never ends in a loop (with one kept from an earlier
+ * run, say). The site never sent visitors round in circles, so such a URL is left out instead.
+ */
+function breakLoops(manifest: Manifest, inferred: Set<string>): void {
+  const byKey = new Map(manifest.resources.map((r) => [r.key, r]));
+  const keyOf = (location: string) => {
+    const u = toUrl(location);
+    return u ? urlKey(u) : undefined;
+  };
+  for (const key of inferred) {
+    const chain = new Set<string>();
+    let r = byKey.get(key);
+    while (r?.location !== undefined && !chain.has(r.key)) {
+      chain.add(r.key);
+      const next = keyOf(r.location);
+      r = next === undefined ? undefined : byKey.get(next);
+    }
+    if (r?.key !== key) continue;
+    const loop = byKey.get(key)!;
+    byKey.delete(key);
+    manifest.resources.splice(manifest.resources.indexOf(loop), 1);
+    manifest.missing.push({ key, url: loop.url, reason: 'the archive only has redirects for this URL that go round in a loop' });
+  }
 }

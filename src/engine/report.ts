@@ -31,6 +31,40 @@ export interface RestoreReport {
   warnings: string[];
 }
 
+/** What Cloudflare Pages reads of _redirects (plain rules, then pattern rules) and of _headers. */
+const PAGES_LIMITS = { plain: 2000, patterns: 100, headers: 100 };
+
+/**
+ * Notes for hosts that cannot serve every original URL of this site, from the generated
+ * _redirects and _headers. Apache, LiteSpeed and nginx have no such limits.
+ */
+export function hostingNotes(redirects: string, headers: string): string[] {
+  let plain = 0;
+  let patterns = 0;
+  let lookAlikes = 0;
+  for (const line of redirects.split('\n')) {
+    const [from, to] = line.trim().split(/\s+/);
+    if (!from || from.startsWith('#')) continue;
+    // Pages takes a path with * or :name as a pattern, and every line after the first one too.
+    const pattern = /\*|:[A-Za-z]/.test(from);
+    if (patterns || pattern) patterns++;
+    else plain++;
+    // An original URL like /wiki/Talk:Main.html: its rule also matches its neighbours.
+    if (pattern && !to?.includes(':splat')) lookAlikes++;
+  }
+  const headerRules = headers.split('\n').filter((l) => l.startsWith('/')).length;
+  const notes: string[] = [];
+  if (plain > PAGES_LIMITS.plain || patterns > PAGES_LIMITS.patterns || headerRules > PAGES_LIMITS.headers) {
+    notes.push(
+      `Cloudflare Pages reads only the first ${PAGES_LIMITS.plain} plain and ${PAGES_LIMITS.patterns} pattern rules of _redirects and ${PAGES_LIMITS.headers} rules of _headers; this site needs ${plain}, ${patterns} and ${headerRules}, so some original URLs would not work there. Use Apache, LiteSpeed or nginx.`,
+    );
+  }
+  if (lookAlikes) {
+    notes.push(`${lookAlikes} original URLs have ":" or "*" in their path, which Cloudflare Pages reads as a pattern: there they can serve another page. Apache, LiteSpeed, nginx and Netlify serve them exactly.`);
+  }
+  return notes;
+}
+
 export function makeReport(input: {
   manifest: Manifest;
   build: BuildResult;
@@ -41,6 +75,8 @@ export function makeReport(input: {
   warnings: string[];
 }): RestoreReport {
   const { manifest, build } = input;
+  const queryUrls = [...build.routes, ...build.redirects].filter((x) => x.query !== undefined).length;
+  const hosting = queryUrls ? [`${queryUrls} original URLs have a query string: Apache, LiteSpeed and nginx serve them, Netlify and Cloudflare Pages cannot.`] : [];
   return {
     domain: manifest.domain,
     siteUrl: input.siteUrl,
@@ -62,9 +98,10 @@ export function makeReport(input: {
       trackersRemoved: build.cleaned.trackers,
     },
     truncated: manifest.truncated,
-    missing: manifest.missing.map((m) => ({ url: m.url, reason: m.reason, referrer: m.referrer })),
+    // A refusal is not a gap in the archive: another run can still fetch it.
+    missing: manifest.missing.map((m) => ({ url: m.url, reason: m.transient ? `archive.org did not answer (${m.reason}); run the restore again to fetch it` : m.reason, referrer: m.referrer })),
     redirects: build.redirects.map((r) => ({ from: r.rawPath + (r.query ? `?${r.query}` : ''), to: r.to, status: r.status })),
-    warnings: [...input.warnings, ...build.warnings],
+    warnings: [...input.warnings, ...build.warnings, ...hosting],
   };
 }
 
@@ -156,7 +193,7 @@ export function reportHtml(r: RestoreReport): string {
   }
   <section class="muted">
     <h2>How to put it online</h2>
-    <p>Upload the contents of the <code>site</code> folder to the web root (for example <code>public_html</code>). On Apache or LiteSpeed hosting the included <code>.htaccess</code> does the rest. On nginx use <code>server/nginx.conf</code>. Netlify and Cloudflare Pages read <code>_redirects</code> and <code>_headers</code>, but cannot serve URLs with a query string.</p>
+    <p>Upload the contents of the <code>site</code> folder to the web root (for example <code>public_html</code>). On Apache or LiteSpeed hosting the included <code>.htaccess</code> does the rest. On nginx use <code>server/nginx.conf</code>. Netlify and Cloudflare Pages read <code>_redirects</code> and <code>_headers</code>, but cannot serve URLs with a query string, and Cloudflare Pages reads at most ${PAGES_LIMITS.plain} plain and ${PAGES_LIMITS.patterns} pattern rules of <code>_redirects</code> and ${PAGES_LIMITS.headers} rules of <code>_headers</code>.</p>
   </section>
 </main>
 </body>

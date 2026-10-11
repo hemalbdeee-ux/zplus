@@ -103,6 +103,9 @@ async function main(): Promise<void> {
     const domain = normalizeDomain(arg);
     const client = new ArchiveClient({ base: values.archive, concurrency: num('concurrency', 1), minIntervalMs: num('delay', 0), log: (m) => console.error(paint('2', m)) });
     const h = await scanHealth(client, domain, { maxProbes: num('probes', 1), log: (m) => console.error(paint('2', m)) });
+    if (!h.lastGood && client.playbackRefused) {
+      throw new Error(`archive.org refused or failed every request to play back ${domain}'s captures (${client.lastRefusal}), so its history could not be checked. Try again later.`);
+    }
     if (!h.months.length) {
       console.log(`The Wayback Machine has no captures of ${domain}.`);
       return;
@@ -114,6 +117,7 @@ async function main(): Promise<void> {
       console.log(`Host:               ${h.host}`);
     } else {
       console.log('\nNo capture looks like a real website.');
+      if (client.refused) console.log(`archive.org refused ${client.refused} of the ${client.refused + client.played} captures checked (${client.lastRefusal}); trying again later may find one.`);
     }
     for (const m of h.months.filter((x) => x.probed)) {
       console.log(paint('2', `  ${m.month.slice(0, 4)}-${m.month.slice(4)}  ${String(m.score).padStart(3)}  ${m.verdict.padEnd(4)}  ${m.reasons.join('; ')}`));

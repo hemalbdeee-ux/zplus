@@ -1,12 +1,12 @@
 // One restore job, start to finish: health scan -> archive index -> download -> build -> package.
 
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { ArchiveClient, type ArchiveOptions } from './archive.ts';
 import { buildSite } from './build.ts';
 import { buildIndex, crawl } from './crawl.ts';
 import { scanHealth, type HealthReport } from './health.ts';
-import { makeReport, reportHtml, type RestoreReport } from './report.ts';
+import { hostingNotes, makeReport, reportHtml, type RestoreReport } from './report.ts';
 import { normalizeDomain, parseTimestamp } from './url.ts';
 import { zipPaths } from './zip.ts';
 
@@ -98,9 +98,14 @@ export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
 
   const target = opts.target ? parseTimestamp(opts.target) : health?.lastGood?.timestamp;
   if (!target) {
+    // A scan whose captures archive.org would not play back says nothing about the site.
+    if (client.playbackRefused) {
+      throw new Error(`archive.org refused or failed every request to play back ${domain}'s captures (${client.lastRefusal}), so its history could not be checked. Try again later.`);
+    }
+    const refusedSome = client.refused ? ` archive.org refused ${client.refused} of the ${client.refused + client.played} captures checked, so trying again later may find one.` : '';
     throw new Error(
       health?.months.length
-        ? `No capture of ${domain} looks like a real website. Pass a date with --target to restore anyway.`
+        ? `No capture of ${domain} looks like a real website. Pass a date with --target to restore anyway.${refusedSome}`
         : `The Wayback Machine has no captures of ${domain}.`,
     );
   }
@@ -163,6 +168,8 @@ export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
     log: (m) => emit('build', m),
   });
 
+  const generated = (name: string) => readFile(path.join(siteDir, name), 'utf8').catch(() => '');
+  warnings.push(...hostingNotes(await generated('_redirects'), await generated('_headers')));
   const report = makeReport({ manifest, build, health, siteUrl, startedAt, archiveRequests: client.requests, warnings });
   await writeFile(path.join(jobDir, 'report.json'), JSON.stringify(report, null, 1));
   await writeFile(path.join(jobDir, 'report.html'), reportHtml(report));
