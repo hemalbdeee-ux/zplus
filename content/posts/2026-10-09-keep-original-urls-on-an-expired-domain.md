@@ -17,7 +17,7 @@ So every URL that existed should answer with its page at the same address.
 
 ## The hard cases
 
-A static host serves `/about/` and `/about.html` without any help. Old sites have other shapes too:
+Apache and nginx serve `/about/` and `/about.html` without any help (Cloudflare Pages does not: it redirects `/about.html` to `/about`). Old sites have other shapes too:
 
 | Original URL | Problem on static hosting |
 | --- | --- |

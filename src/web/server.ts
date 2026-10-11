@@ -5,9 +5,10 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { existsSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
+import { isIPv6 } from 'node:net';
 import path from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
-import type { HealthReport } from '../engine/health.ts';
+import type { HealthReport, MonthHealth } from '../engine/health.ts';
 import type { PageMeta } from '../engine/meta.ts';
 import { robotsTxt, rssFeed, sitemaps, sitemapXsl, type SitemapEntry } from '../engine/sitemap.ts';
 import { normalizeDomain } from '../engine/url.ts';
@@ -62,6 +63,24 @@ function codeMatches(given: string, expected: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/**
+ * The address that limits count against. An IPv6 client usually has a whole /64 to pick addresses
+ * from, so the /64 is one client; an IPv4 address written as IPv6 is that IPv4 address.
+ */
+export function clientKey(ip: string | undefined): string {
+  const addr = (ip ?? '').replace(/%.*$/, '');
+  const v4 = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(addr);
+  if (v4) return v4[1];
+  if (!isIPv6(addr)) return addr;
+  const [head, tail] = addr.toLowerCase().split('::');
+  // An IPv4 address at the end takes the room of two groups.
+  const groups = (part: string | undefined) => (part ? part.split(':').flatMap((g) => (g.includes('.') ? ['0', '0'] : [g])) : []);
+  const left = groups(head);
+  const right = groups(tail);
+  const all = tail === undefined ? left : [...left, ...Array<string>(8 - left.length - right.length).fill('0'), ...right];
+  return `${all.slice(0, 4).map((g) => parseInt(g, 16).toString(16)).join(':')}::/64`;
+}
+
 function timelineRows(h: HealthReport) {
   const years = [...new Set(h.months.map((m) => m.month.slice(0, 4)))];
   return years.map((year) => ({
@@ -78,10 +97,31 @@ function timelineRows(h: HealthReport) {
   }));
 }
 
-/** Good snapshots inside the healthy window: restore() takes pages from that window only, so a date outside it cannot be honoured. */
+// Why a probe found no page (the scan puts it first), and the notes of a verdict estimated from
+// other months. A probed month carries such a note only when its probe found no page.
+const UNPLAYED = /^(capture not playable|redirect could not be followed|the page it leads to is a capture from)/;
+const ESTIMATED = /^(same content as |estimated from the months around it|after the site went down|not checked; near a change)/;
+
+/**
+ * A month whose homepage capture the archive could not play back during the scan. Its verdict is an
+ * estimate, and a restore from it would ask for the same capture again for the homepage.
+ */
+function unplayable(m: MonthHealth): boolean {
+  return m.probed && (UNPLAYED.test(m.reasons[0] ?? '') || m.reasons.some((r) => ESTIMATED.test(r)));
+}
+
+/**
+ * Good snapshots inside the healthy window that the archive could play back: restore() takes pages
+ * from that window only, so a date outside it cannot be honoured.
+ */
 function restorable(h: HealthReport) {
   return h.months.filter(
-    (m) => m.verdict === 'good' && m.timestamp && (!h.window.from || m.timestamp >= h.window.from) && (!h.window.to || m.timestamp <= h.window.to),
+    (m) =>
+      m.verdict === 'good' &&
+      m.timestamp &&
+      !unplayable(m) &&
+      (!h.window.from || m.timestamp >= h.window.from) &&
+      (!h.window.to || m.timestamp <= h.window.to),
   );
 }
 
@@ -127,6 +167,7 @@ export async function createApp(config: WebConfig) {
     siteUrl: config.siteUrl,
     siteName: s.title,
     siteDescription: s.description,
+    tagline: s.tagline,
     rssPath: '/rss/',
     description: s.description,
     lang: s.lang,
@@ -206,10 +247,11 @@ export async function createApp(config: WebConfig) {
 
   // ---- Public site ----
 
+  const homeTitle = s.tagline ? `${s.title} · ${s.tagline}` : s.title;
   app.get('/', (req, res) => {
     render(res, 'home', {
-      title: s.title,
-      seo: meta({ path: '/', type: 'home', title: s.title, headline: s.title }),
+      title: homeTitle,
+      seo: meta({ path: '/', type: 'home', title: homeTitle, headline: s.title }),
       bodyClass: 'home-template',
       posts: content.posts.slice(0, 3),
       sample: sampleRows,
@@ -325,10 +367,11 @@ export async function createApp(config: WebConfig) {
     }
     const recent = store.recentScan(domain, 12 * 3600_000);
     if (recent) return res.redirect(303, `/job/${recent.id}/`);
-    if (store.countByIp(req.ip ?? '', 3600_000, 'scan') >= config.scanLimit) {
+    const ip = clientKey(req.ip);
+    if (store.countByIp(ip, 3600_000, 'scan') >= config.scanLimit) {
       return render(res, 'restore', { title: `Restore a website · ${s.title}`, seo: meta({ path: '/restore/', noindex: true }), error: 'Too many checks from your address in the last hour. Please try again later.', domain: raw }, 429);
     }
-    const job = store.create({ kind: 'scan', domain, ip: req.ip });
+    const job = store.create({ kind: 'scan', domain, ip });
     runner.tick();
     res.redirect(303, `/job/${job.id}/`);
   };
@@ -363,6 +406,7 @@ export async function createApp(config: WebConfig) {
       demo: job.max_pages !== null,
       parentId: job.parent_id,
       codeRequired: !!config.accessCode,
+      codeTries: CODE_TRIES,
     };
     if (job.kind === 'scan' && result) {
       const h = (result as ScanResult).health;
@@ -402,7 +446,7 @@ export async function createApp(config: WebConfig) {
     const target = String(req.body?.target ?? '');
     const valid = restorable(health).some((m) => m.timestamp === target);
     const full = req.body?.mode === 'full';
-    const ip = req.ip ?? '';
+    const ip = clientKey(req.ip);
     const fail = (msg: string, status: number) => {
       res.locals.formError = msg;
       res.status(status);
@@ -419,7 +463,7 @@ export async function createApp(config: WebConfig) {
         return fail('That access code is not valid.', 403);
       }
     }
-    const job = store.create({ kind: 'restore', domain: scan.domain, target, maxPages: full ? undefined : 4, parentId: scan.id, ip: req.ip });
+    const job = store.create({ kind: 'restore', domain: scan.domain, target, maxPages: full ? undefined : 4, parentId: scan.id, ip });
     runner.tick();
     res.redirect(303, `/job/${job.id}/`);
   });
@@ -474,7 +518,7 @@ export async function createApp(config: WebConfig) {
 
 if (process.argv[1] === import.meta.filename) {
   const config = configFromEnv();
-  const { app, runner } = await createApp(config);
+  const { app, runner, content } = await createApp(config);
   runner.start();
-  app.listen(config.port, () => console.log(`Wayback Downloader on ${config.siteUrl} (port ${config.port})`));
+  app.listen(config.port, () => console.log(`${content.settings.title} on ${config.siteUrl} (port ${config.port})`));
 }

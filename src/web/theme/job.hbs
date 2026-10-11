@@ -55,7 +55,8 @@
                             <label class="radio"><input type="radio" name="mode" value="full"> <span><b>Full site</b>: every archived URL of the healthy period, up to 20,000</span></label>
                             {{#if job.codeRequired}}
                             <label for="code">Access code for a full restore</label>
-                            <input id="code" name="code" type="password" autocomplete="off">
+                            <input id="code" name="code" type="password" autocomplete="off" aria-describedby="code-note">
+                            <p class="form-note" id="code-note">Not needed for a demo. After {{job.codeTries}} wrong codes, full restores from your address are blocked for an hour.</p>
                             {{/if}}
                         </fieldset>
                         {{#if formError}}<p class="form-error" role="alert">{{formError}}</p>{{/if}}
@@ -81,7 +82,7 @@
         {{else}}
             <div class="result">
                 <h2>The site is ready</h2>
-                <p>Restored from the snapshot of <b>{{ts job.report.target}}</b> for <span class="mono">{{job.report.siteUrl}}</span>. Every original URL works at the same address.</p>
+                <p>Restored from the snapshot of <b>{{ts job.report.target}}</b> for <span class="mono">{{job.report.siteUrl}}</span>. On Apache, LiteSpeed and nginx hosting every original URL works at the same address.</p>
                 <dl class="stats">
                     <div><dt>Pages</dt><dd>{{number job.report.counts.pages}}</dd></div>
                     <div><dt>Blog posts</dt><dd>{{number job.report.counts.posts}}</dd></div>

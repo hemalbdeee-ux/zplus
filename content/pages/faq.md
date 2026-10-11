@@ -1,7 +1,7 @@
 ---
 title: Frequently asked questions
 slug: faq
-meta_description: How Wayback Downloader picks a snapshot, why it never changes URLs, which hosting works, and what a demo restore includes.
+meta_description: How zplus.ai picks a snapshot, why it never changes URLs, which hosting works, and what a demo restore includes.
 ---
 
 ## Which snapshot do you restore?
@@ -14,11 +14,17 @@ No. The Wayback Machine captures each URL on its own schedule. For every URL we 
 
 ## Will my URLs change?
 
-No. Every original URL works at exactly the same address, including `.php` pages, URLs with a query string such as `/index.php?page=contact`, and URLs without a trailing slash. Backlinks point at those exact addresses, so we do not rename anything. The only redirects in the restored site are the ones the original site made, as the archive recorded them.
+No. On Apache, LiteSpeed and nginx hosting every original URL works at exactly the same address, including `.php` pages, URLs with a query string such as `/index.php?page=contact`, and URLs without a trailing slash. Backlinks point at those exact addresses, so we do not rename anything. The only redirects in the restored site are the ones the original site made, as the archive recorded them. Netlify and Cloudflare Pages cannot keep every URL; see the next question.
 
 ## Which hosting can I use?
 
-Any Apache or LiteSpeed hosting (most shared hosting, including cPanel and hPanel) works with the included `.htaccess`. For nginx we include a server configuration. Netlify and Cloudflare Pages work too, except for URLs with a query string, which they cannot match.
+Any Apache or LiteSpeed hosting (most shared hosting, including cPanel and hPanel) works with the included `.htaccess`. For nginx we include a server configuration. Both keep every original URL, including URLs with a query string.
+
+Netlify and Cloudflare Pages read the included `_redirects` and `_headers` files, with limits:
+
+- URLs with a query string, such as `/index.php?page=contact`, do not work there: the included `_redirects` has no rules for them. On Netlify a URL with a doubled slash, such as `//about.php`, can also show another page.
+- Cloudflare Pages on its own redirects `/about.html` to `/about` and `/blog/index.html` to `/blog/`. Rules in `_redirects` keep those URLs at their own address, but Pages reads at most 2,000 plain and 100 pattern rules from `_redirects` and 100 rules from `_headers`, and ignores the rest. A large site with many rewritten URLs or `.php` pages needs Apache, LiteSpeed or nginx.
+- Cloudflare Pages reads a path with `:` followed by a letter, or with `*`, as a pattern. The rule for an original URL such as `/wiki/Talk:Main.html` then also catches neighbouring URLs such as `/wiki/Talkative.html`, which show the wrong page. Sites with such URLs need Apache, LiteSpeed, nginx or Netlify.
 
 ## What do you change in the pages?
 

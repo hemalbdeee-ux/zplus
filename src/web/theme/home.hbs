@@ -1,7 +1,7 @@
 <section class="hero">
     <div class="wrap hero-inner">
         <div class="hero-copy">
-            <p class="eyebrow">Wayback Machine restore</p>
+            {{#if site.tagline}}<p class="eyebrow">{{site.tagline}}</p>{{/if}}
             <h1>Bring an expired website back with every URL exactly where it was.</h1>
             <p class="lead">We find the last snapshot in which the site was really itself, skip the parking pages that came after, and rebuild it as fast static HTML. On top goes the SEO layer Ghost uses: canonical tags, structured data, sitemaps and RSS.</p>
             {{> restore-form}}
@@ -21,7 +21,7 @@
             <li><h3>Check the snapshots</h3><p>We score the homepage month by month. Parking pages, suspended hosting, default server pages and spam from a later owner are marked, so you can see when the site was healthy.</p></li>
             <li><h3>Pick a date</h3><p>The last good snapshot is chosen for you. You can pick any other healthy month. Pages are only taken from the period in which the site was itself.</p></li>
             <li><h3>Restore</h3><p>Every archived page, image, stylesheet and script is downloaded, cleaned of Wayback leftovers and the old owner's tracking code, and converted to UTF-8.</p></li>
-            <li><h3>Upload</h3><p>You get a ZIP with the site, an <code>.htaccess</code> for Apache and LiteSpeed, an nginx config and a report. Upload it to any hosting.</p></li>
+            <li><h3>Upload</h3><p>You get a ZIP with the site, an <code>.htaccess</code> for Apache and LiteSpeed, an nginx config and a report. Upload it to any Apache, LiteSpeed or nginx hosting.</p></li>
         </ol>
     </div>
 </section>
@@ -56,7 +56,7 @@
             <li><h3>The site as it was</h3><p>The healthy version of every page, with its own HTML, images, CSS and JavaScript. The original doctype is kept, so old layouts render the way they did.</p></li>
             <li><h3>The SEO layer Ghost uses</h3><p>Each page gets canonical, description, Open Graph, Twitter card and JSON-LD in one block before <code>&lt;/head&gt;</code>, like Ghost's <code>ghost_head</code>.</p></li>
             <li><h3>Sitemaps, RSS, robots.txt</h3><p>A sitemap index with pages, posts, tags and authors, an RSS feed of the blog posts, a clean robots.txt and a 404 page.</p></li>
-            <li><h3>Server rules included</h3><p><code>.htaccess</code> for Apache and LiteSpeed, a config for nginx, and <code>_redirects</code> for Netlify and Cloudflare Pages.</p></li>
+            <li><h3>Server rules included</h3><p><code>.htaccess</code> for Apache and LiteSpeed and a config for nginx, which keep every URL. <code>_redirects</code> and <code>_headers</code> for Netlify and Cloudflare Pages, where URLs with a query string do not work and <a href="/faq/">other limits</a> apply.</p></li>
             <li><h3>No old tracking</h3><p>The previous owner's Analytics, AdSense and pixel scripts are removed, so your traffic is not reported to them.</p></li>
             <li><h3>A clear report</h3><p>Which snapshot was used and why, how many pages came back, and which files the archive never had.</p></li>
         </ul>
