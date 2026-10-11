@@ -124,10 +124,26 @@ describe('web app: brand, snapshot list and code limits', () => {
   it('does not promise more than static hosts can do', async () => {
     const home = await (await get('/')).text();
     assert.doesNotMatch(home, /Upload it to any hosting/);
+    assert.match(home, /Netlify and Cloudflare Pages, where URLs with a query string do not work/);
     const faq = await (await get('/faq/')).text();
+    assert.match(faq, /On Apache, LiteSpeed and nginx hosting every original URL works at exactly the same address/);
     assert.match(faq, /Cloudflare Pages on its own redirects/);
     assert.match(faq, /2,000 plain and 100 pattern rules/);
-    assert.doesNotMatch(faq, /Netlify and Cloudflare Pages work too/);
+    // Pages reads /wiki/Talk:Main.html as a pattern that also matches /wiki/Talkative.html.
+    assert.match(faq, /catches neighbouring URLs such as <code>\/wiki\/Talkative\.html<\/code>, which show the wrong page/);
+    assert.doesNotMatch(faq, /Netlify and Cloudflare Pages work too|Neither can match a query string|keep those URLs as they are/);
+    const post = await (await get('/keep-original-urls-on-an-expired-domain/')).text();
+    assert.match(post, /Apache and nginx serve <code>\/about\/<\/code> and <code>\/about\.html<\/code> without any help \(Cloudflare Pages does not/);
+    assert.doesNotMatch(post, /A static host serves/);
+
+    // A finished restore names the hosts that keep every URL.
+    const job = store.create({ kind: 'restore', domain: 'shop.example', target: '20190610120000', parentId: scanId });
+    assert.equal(store.claim()?.id, job.id);
+    const counts = { pages: 3, posts: 0, files: 5, bytes: 2048, redirects: 1, rewrites: 1, missing: 0 };
+    store.finish(job.id, { report: { target: '20190610120000', siteUrl: 'https://shop.example', counts, warnings: [] }, reportHtml: 'report.html' });
+    const result = await (await get(`/job/${job.id}/`)).text();
+    assert.match(result, /The site is ready/);
+    assert.match(result, /On Apache, LiteSpeed and nginx hosting every original URL works at the same address/);
   });
 
   it('offers only months whose homepage capture could be played back', async () => {
