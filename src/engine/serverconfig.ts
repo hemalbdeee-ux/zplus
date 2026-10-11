@@ -39,6 +39,11 @@ export interface ServerRules {
   routes: Route[];
   redirects: Redirect[];
   types: TypeOverride[];
+  /**
+   * Site-relative files served at their own URL (not route targets), e.g. "menu.html". Without it,
+   * Cloudflare Pages serves x.jpg instead of x.jpg.html when both exist.
+   */
+  files?: string[];
 }
 
 export const HTML_LIKE_EXT = ['php', 'php3', 'php4', 'php5', 'phtml', 'asp', 'aspx', 'jsp', 'jspx', 'cfm', 'cgi', 'pl', 'shtml', 'shtm', 'do', 'action'];
@@ -47,19 +52,38 @@ function apacheRegex(path: string): string {
   return regexEscape(path.replace(/^\//, ''));
 }
 
-// Apache's config parser only treats a backslash specially before the quote character.
+// mod_rewrite splits its own arguments: a quote always ends a quoted argument (a backslash does not
+// escape it) and a raw newline ends the line, so one such byte in an archived path would make the
+// whole .htaccess invalid. Arguments never contain either: patterns spell them as \xHH escapes
+// (regexEscape) and targets percent-encode them (apacheUrl).
 function apacheQuoted(s: string): string {
-  return `"${s.replace(/"/g, '\\"')}"`;
+  return `"${s}"`;
 }
 
+/** A PCRE pattern matching s literally, with quotes and control characters as \xHH escapes. */
 function regexEscape(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/["\x00-\x1f\x7f]/g, (c) => '\\x' + c.charCodeAt(0).toString(16).padStart(2, '0'));
+}
+
+// Percent-encodes the bytes that cannot appear literally in a quoted mod_rewrite argument.
+function apacheUrl(s: string): string {
+  return s.replace(/["\x00-\x1f\x7f]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'));
 }
 
 function apacheTarget(to: string, dropQuery: boolean): string {
-  let t = to.replace(/\$/g, '\\$').replace(/%/g, '\\%');
+  let t = apacheUrl(to).replace(/\$/g, '\\$').replace(/%/g, '\\%');
   if (dropQuery && !to.includes('?')) t += '?';
   return t;
+}
+
+/** A site-relative file name as it appears in a URL path. */
+function encodeFile(file: string): string {
+  return encodeURI(file).replace(/[#?]/g, encodeURIComponent);
+}
+
+/** Internal rewrite target: Apache decodes it again, so % and # must be encoded. */
+function apacheFile(file: string): string {
+  return apacheTarget(encodeFile(file), false);
 }
 
 function isPermanent(status: number): boolean {
@@ -110,17 +134,25 @@ export function htaccess(r: ServerRules): string {
     out.push('# Original URLs with a query string. Internal rewrite: the URL stays exactly the same.');
     for (const x of queryRoutes) {
       out.push(`RewriteCond %{QUERY_STRING} ${apacheQuoted('^' + regexEscape(x.query!) + '$')}`);
-      out.push(`RewriteRule ${apacheQuoted('^' + apacheRegex(x.path) + '$')} ${apacheQuoted(x.file)} [L]`);
+      out.push(`RewriteRule ${apacheQuoted('^' + apacheRegex(x.path) + '$')} ${apacheQuoted(apacheFile(x.file))} [NS,L]`);
     }
   }
   if (pathRoutes.length) {
     out.push('');
     out.push('# Original URLs stored under another file name. Internal rewrite, the URL stays the same.');
-    for (const x of pathRoutes) out.push(`RewriteRule ${apacheQuoted('^' + apacheRegex(x.path) + '$')} ${apacheQuoted(x.file)} [L]`);
+    // NS: mod_dir looks up /folder/index.html with a subrequest, which must not pick up the route of
+    // the /folder/index.html URL when /folder/ is a different page.
+    for (const x of pathRoutes) out.push(`RewriteRule ${apacheQuoted('^' + apacheRegex(x.path) + '$')} ${apacheQuoted(apacheFile(x.file))} [NS,L]`);
   }
 
   out.push('');
   out.push('# Extensionless URLs: /about is served from about.html without a redirect.');
+  // $1 is decoded and Apache decodes the target again, so a path with % or # (/100%25-cotton,
+  // /tag/c%23) is rewritten from the still-encoded path of the request line instead.
+  out.push('RewriteCond %{REQUEST_FILENAME} !-f');
+  out.push('RewriteCond %{REQUEST_FILENAME}.html -f');
+  out.push('RewriteCond %{THE_REQUEST} ^\\S+\\s+(/[^?\\s]*)');
+  out.push('RewriteRule [%#] %1.html [L]');
   out.push('RewriteCond %{REQUEST_FILENAME} !-f');
   out.push('RewriteCond %{REQUEST_FILENAME}.html -f');
   out.push('RewriteRule ^(.+)$ $1.html [L]');
@@ -144,9 +176,17 @@ function nginxString(s: string): string {
 
 export function nginxConf(r: ServerRules): string {
   const id = r.domain.replace(/[^a-z0-9]/gi, '_');
+  // Plain map keys go into a hash that ignores case and only has room for keys of about 46 bytes, so
+  // /About.html would match the /about.html route and one long URL would stop nginx from loading.
+  // Regex keys are case-sensitive and have no length limit (nginx tries them in turn, about 0.05 µs
+  // each, which is fine for the few thousand rules of a restored site).
+  // Values may contain variables and nginx has no escape for "$", so a literal one is written as a
+  // variable that holds it (a geo value is not compiled).
+  const dollar = `wbd_${id}_dollar`;
+  const needsDollar = r.redirects.some((d) => d.to.includes('$')) || r.routes.some((x) => x.file.includes('$'));
   const map = (name: string, source: string, entries: Array<[string, string]>) => {
     const lines = [`map ${source} $wbd_${id}_${name} {`, '    default "";'];
-    for (const [k, v] of entries) lines.push(`    ${nginxString(k)} ${nginxString(v)};`);
+    for (const [k, v] of entries) lines.push(`    ${nginxString('~^' + regexEscape(k) + '$')} ${nginxString(v.replace(/\$/g, () => `\${${dollar}}`))};`);
     lines.push('}');
     return lines.join('\n');
   };
@@ -166,7 +206,7 @@ export function nginxConf(r: ServerRules): string {
 # (it must be included inside the http { } block), set "root" to the folder holding the site,
 # add your TLS settings, then run: nginx -t && systemctl reload nginx
 
-# Redirects the original site made ($uri: path only; $request_uri: path with query string).
+${needsDollar ? `geo $${dollar} { default "$"; }\n\n` : ''}# Redirects the original site made ($uri: path only; $request_uri: path with query string).
 ${map('r301', '$uri', pathRedirect(true))}
 ${map('r302', '$uri', pathRedirect(false))}
 ${map('q301', '$request_uri', queryRedirect(true))}
@@ -205,19 +245,53 @@ server {
 `;
 }
 
+// Cloudflare Pages answers every x.html and x/index.html with a 308 to /x and /x/, also after a 200
+// rewrite, unless a file x sits next to x.html. It serves /x from x.html and /x/ from x/index.html
+// without a redirect, and so does Netlify, so rewrites point there.
+function pagesTarget(file: string): string {
+  if (file === 'index.html' || file.endsWith('/index.html')) return '/' + encodeFile(file.slice(0, -'index.html'.length));
+  return '/' + encodeFile(file.replace(/\.html$/, ''));
+}
+
+/** Pages reads a path with * or :name as a pattern, and keeps only 100 of those. */
+const PAGES_PATTERN = /\*|:[A-Za-z]/;
+
+type RedirectLine = [from: string, to: string, status: number];
+
 /** Netlify and Cloudflare Pages. Neither can match an exact query string value. */
 export function netlifyRedirects(r: ServerRules): string {
   const out = [`# Generated by Wayback Downloader for ${r.domain} (Netlify / Cloudflare Pages).`];
+  // Pages reads every line after the first pattern as a pattern too, so paths that look like one
+  // wait until all plain paths are written.
+  const patterns: RedirectLine[] = [];
+  const section = (title: string, lines: RedirectLine[]) => {
+    const plain = lines.filter(([from]) => !PAGES_PATTERN.test(from));
+    patterns.push(...lines.filter(([from]) => PAGES_PATTERN.test(from)));
+    if (plain.length) out.push('', title, ...plain.map((x) => x.join('  ')));
+  };
   const pathRedirects = r.redirects.filter((d) => d.query === undefined);
-  if (pathRedirects.length) {
-    out.push('', '# Redirects the original site made');
-    for (const d of pathRedirects) out.push(`${d.rawPath}  ${d.to}  ${isPermanent(d.status) ? 301 : 302}`);
-  }
   const pathRoutes = r.routes.filter((x) => x.query === undefined);
-  if (pathRoutes.length) {
-    out.push('', '# Original URLs served from another file (rewrite, the URL stays the same)');
-    for (const x of pathRoutes) out.push(`${x.rawPath}  /${x.file}  200`);
-  }
+  section('# Redirects the original site made', pathRedirects.map((d) => [d.rawPath, d.to, isPermanent(d.status) ? 301 : 302]));
+  section('# Original URLs served from another file (rewrite, the URL stays the same)', pathRoutes.map((x) => [x.rawPath, pagesTarget(x.file), 200]));
+
+  // Every other .html URL, for Pages: x/index.html is rewritten to /x/ and x.html to /x, except
+  // next to a file x, where Pages serves x.html as it is and /x would serve x. Netlify serves an
+  // existing file before it reads a rule that is not forced, so these change nothing there.
+  const taken = new Set([...pathRedirects, ...pathRoutes].map((x) => x.rawPath));
+  const files = new Set(r.files);
+  const asIs = [...files]
+    .filter((f) => f.endsWith('.html') && !/(^|\/)index\.html$/.test(f) && files.has(f.slice(0, -'.html'.length)))
+    .map((f): RedirectLine => ['/' + encodeFile(f), '/' + encodeFile(f), 200]);
+  const home: RedirectLine = ['/index.html', '/', 200];
+  section('# For Cloudflare Pages, which redirects x.html to /x and x/index.html to /x/ by itself', [...asIs, home].filter(([from]) => !taken.has(from)));
+  // Pages tries patterns in file order and reads only 100: the two below go after the .html ones
+  // they would hide and before the rest.
+  const html = patterns.filter(([from]) => from.endsWith('.html'));
+  if (html.length) out.push('', '# Paths that Cloudflare Pages reads as patterns (* or :name)', ...html.map((x) => x.join('  ')));
+  out.push('', '# Every other .html and /index.html URL, for Cloudflare Pages', '/*/index.html  /:splat/  200', '/*.html  /:splat  200');
+  const rest = patterns.filter(([from]) => !from.endsWith('.html'));
+  if (rest.length) out.push('', '# Paths that Cloudflare Pages reads as patterns (* or :name)', ...rest.map((x) => x.join('  ')));
+
   const queryOnes = [...r.redirects.filter((d) => d.query !== undefined), ...r.routes.filter((x) => x.query !== undefined)];
   if (queryOnes.length) {
     out.push('', `# ${queryOnes.length} URLs with a query string need Apache, LiteSpeed or nginx (see .htaccess):`);
