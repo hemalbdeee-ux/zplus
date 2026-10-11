@@ -74,6 +74,16 @@ export function isShort(job: Pick<Job, 'kind' | 'max_pages'>): boolean {
 }
 const SHORT = `(kind = 'scan' OR max_pages IS NOT NULL)`;
 
+/**
+ * A restore takes its healthy period from the scan it was made from. Without that scan the period
+ * is not known, so a restore whose scan is gone does not run again (worker.ts fails it).
+ */
+const SCAN_KEPT = `(parent_id IS NULL OR EXISTS (SELECT 1 FROM jobs AS p WHERE p.id = jobs.parent_id AND p.status = 'done'))`;
+/** A failed restore a user may run again: it has retries left and its scan is still there. */
+const RETRYABLE = `kind = 'restore' AND status = 'failed' AND retries < ${MAX_RETRIES} AND ${SCAN_KEPT}`;
+/** A job past the retention period, unless a job made from it (a restore of a scan) is still kept. */
+const EXPIRED = `finished_at IS NOT NULL AND finished_at < ? AND NOT EXISTS (SELECT 1 FROM jobs AS c WHERE c.parent_id = jobs.id)`;
+
 export class JobStore {
   readonly db: DatabaseSync;
 
@@ -160,19 +170,25 @@ export class JobStore {
       .run(Date.now(), id);
   }
 
+  /** Whether retry() would run this job again. */
+  canRetry(id: string): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM jobs WHERE id = ? AND ${RETRYABLE}`).get(id);
+  }
+
   /**
-   * Runs a failed restore again under the same id, so it continues from its work folder. It keeps
-   * its place in the line and is not another restore for the daily limit. False when the job is
-   * not a failed restore or has used up its retries.
+   * Runs a failed restore again under the same id, so it continues from its work folder. It joins
+   * the back of the line, as a new restore would, but is not another restore for the daily limit.
+   * False when the job is not a failed restore, has used up its retries or its scan is gone.
    */
   retry(id: string): boolean {
+    const now = Date.now();
     return (
       this.db
         .prepare(
           `UPDATE jobs SET status = 'queued', attempts = 0, retries = retries + 1, phase = NULL, message = NULL, done = 0, queued = 0,
-           error = NULL, updated_at = ?, finished_at = NULL WHERE id = ? AND kind = 'restore' AND status = 'failed' AND retries < ?`,
+           error = NULL, created_at = ?, updated_at = ?, finished_at = NULL WHERE id = ? AND ${RETRYABLE}`,
         )
-        .run(Date.now(), id, MAX_RETRIES).changes > 0
+        .run(now, now, id).changes > 0
     );
   }
 
@@ -222,12 +238,24 @@ export class JobStore {
     return Number(row.n) + 1;
   }
 
+  /** Jobs that finished before `ms`, restores before the scans they were made from. */
   finishedBefore(ms: number): Job[] {
-    return this.db.prepare(`SELECT * FROM jobs WHERE finished_at IS NOT NULL AND finished_at < ?`).all(ms) as unknown as Job[];
+    return this.db
+      .prepare(`SELECT * FROM jobs WHERE finished_at IS NOT NULL AND finished_at < ? ORDER BY parent_id IS NULL, finished_at`)
+      .all(ms) as unknown as Job[];
   }
 
-  delete(id: string): void {
-    this.db.prepare('DELETE FROM jobs WHERE id = ?').run(id);
+  /**
+   * Whether the job finished before `ms` and no job made from it is left: a scan is kept while a
+   * restore of it is, as that restore may still run (again) and needs the scan's healthy period.
+   */
+  expired(id: string, ms: number): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM jobs WHERE id = ? AND ${EXPIRED}`).get(id, ms);
+  }
+
+  /** Deletes the job if it is still expired(): it may have been run again, or a restore made from it, in the meantime. */
+  deleteExpired(id: string, ms: number): boolean {
+    return this.db.prepare(`DELETE FROM jobs WHERE id = ? AND ${EXPIRED}`).run(id, ms).changes > 0;
   }
 
   close(): void {

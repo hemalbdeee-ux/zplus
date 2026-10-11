@@ -28,7 +28,8 @@
             {{#if job.canRetry}}
             <form method="post" action="/job/{{job.id}}/retry"><button class="btn" type="submit">Try again</button></form>
             <p class="form-note">The restore continues where it stopped: what it has downloaded is kept.</p>
-            {{else}}{{#if job.isScan}}{{> recheck domain=job.domain}}{{/if}}{{/if}}
+            {{else}}{{#if job.recheck}}{{> recheck domain=job.domain}}{{/if}}{{/if}}
+            {{#if job.retriesUsed}}<p>This restore has already been run again {{job.retriesUsed}} times, as often as one restore can be, so it cannot continue here. A new restore from the snapshots starts over.</p>{{/if}}
             <p>{{#if job.parentId}}<a href="/job/{{job.parentId}}/">Back to the snapshots</a>{{else}}<a href="/restore/">Try another domain</a>{{/if}}</p>
         </div>
     {{/if}}
@@ -98,7 +99,7 @@
                     <div><dt>Not in the archive</dt><dd>{{number job.report.counts.missing}}</dd></div>
                 </dl>
                 <p class="actions">{{#if job.hasZip}}<a class="btn" href="/job/{{job.id}}/download">Download ZIP</a>{{/if}} <a class="btn btn-ghost" href="/job/{{job.id}}/report">Open the report</a></p>
-                {{#if job.demo}}<p class="notice">This demo contains the homepage and the first pages it links to. A <a href="/job/{{job.parentId}}/">full restore</a> downloads every archived URL of the healthy period.</p>{{/if}}
+                {{#if job.demo}}<p class="notice">This demo contains the homepage and the first pages it links to. A {{#if job.parentId}}<a href="/job/{{job.parentId}}/">full restore</a>{{else}}full restore{{/if}} downloads every archived URL of the healthy period.</p>{{/if}}
                 {{#each job.report.warnings}}<p class="notice">{{this}}</p>{{/each}}
                 <h3>Put it online</h3>
                 <ol class="howto">

@@ -18,6 +18,9 @@ import type { Job, JobStore } from './db.ts';
 
 /** What a user is told when a job fails for a reason that is not theirs to fix. */
 export const JOB_FAILED = 'Something went wrong on our side while running this job. Please try again later.';
+/** What a user is told when a restore's snapshot check is gone, so its healthy period is not known. */
+export const scanGone = (domain: string) =>
+  `The snapshot check this restore was made from has expired, so the period ${domain} looked healthy is no longer known. Check the domain again and choose a snapshot.`;
 /** A demo is the homepage and the pages it links to, so it needs few URLs and no unlinked files. */
 const DEMO_MAX_URLS = 200;
 /** How long a cancelled or failed job's process has to stop on its own before it is killed. */
@@ -216,6 +219,13 @@ export class JobRunner {
   /** Runs one job in a child process and records how it ended. */
   run(job: Job): Promise<void> {
     const parent = job.kind === 'restore' && job.parent_id ? this.store.get(job.parent_id) : undefined;
+    // A restore made from a scan takes its healthy period from that scan. Without it restore() would
+    // scan again, and a scan that archive.org partly refuses can find no healthy period at all: the
+    // chosen snapshot would then be restored with pages from every year, a later owner's too.
+    if (job.kind === 'restore' && job.parent_id && !(parent?.status === 'done' && parent.result)) {
+      this.store.fail(job.id, scanGone(job.domain));
+      return Promise.resolve();
+    }
     const stallMs = this.opts.stallMs ?? 10 * 60_000;
     const input: JobInput = {
       type: 'start',
@@ -298,14 +308,17 @@ export class JobRunner {
     });
   }
 
+  /**
+   * Deletes jobs past the retention period. A scan goes with its last restore, not before: a failed
+   * restore can still run again, and it needs the scan's healthy period.
+   */
   async sweep(): Promise<void> {
     const cutoff = Date.now() - this.opts.retentionDays * 86_400_000;
     for (const job of this.store.finishedBefore(cutoff)) {
       // A failed restore that was run again in the meantime keeps its folder.
-      const now = this.store.get(job.id);
-      if (!now?.finished_at || now.finished_at >= cutoff) continue;
+      if (!this.store.expired(job.id, cutoff)) continue;
       await rm(this.jobDir(job.id), { recursive: true, force: true });
-      this.store.delete(job.id);
+      this.store.deleteExpired(job.id, cutoff);
     }
   }
 }

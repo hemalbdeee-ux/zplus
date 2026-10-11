@@ -1,11 +1,13 @@
 // Jobs that wait, stop and run again. A snapshot check or demo never waits for a full restore; a
 // shutdown (a deploy) puts running jobs back in the queue without using up an attempt; a failed
-// restore runs again under the same id and continues where it stopped; a scan that archive.org
-// partly refused says so and is not reused. Also the deploy files that make these work.
+// restore runs again under the same id and continues where it stopped, for as long as the scan it
+// was made from is kept; a scan that archive.org partly refused says so and is not reused. Also the
+// deploy files that make these work.
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import http, { type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import os from 'node:os';
@@ -13,12 +15,13 @@ import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { JobStore, MAX_RETRIES, type Job } from '../src/web/db.ts';
 import { configFromEnv, createApp } from '../src/web/server.ts';
-import { JobRunner } from '../src/web/worker.ts';
+import { JobRunner, scanGone } from '../src/web/worker.ts';
 import { startFakeArchive, type FakeArchive, type FakeCapture } from './fake-archive.ts';
 import { OLD_BAKERY } from './fixtures/oldbakery.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const TS = '20200101000000';
+const DAY = 86_400_000;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function until<T>(what: string, fn: () => T | undefined | false, ms = 20_000): Promise<T> {
@@ -239,6 +242,7 @@ describe('web app: a failed restore runs again where it stopped', () => {
   let server: Server;
   let base: string;
   let store: JobStore;
+  let runner: JobRunner;
   let stop: () => void;
   let scanId: string;
 
@@ -251,6 +255,7 @@ describe('web app: a failed restore runs again where it stopped', () => {
     // A refusal is final at once (archive.org gets five tries with backoff).
     Object.assign(app.runner.opts.archive, { retries: 0 });
     store = app.store;
+    runner = app.runner;
     app.runner.start();
     server = app.app.listen(0, '127.0.0.1');
     await new Promise((r) => server.once('listening', r));
@@ -338,6 +343,149 @@ describe('web app: a failed restore runs again where it stopped', () => {
     store.fail(job.id, 'archive.org refused');
     assert.equal(store.retry(job.id), false);
     assert.equal(store.get(job.id)?.status, 'failed');
+  });
+
+  it('says when a restore has been run again as often as it can be', async () => {
+    const job = store.create({ kind: 'restore', domain: 'long.example', target: TS, parentId: scanId });
+    store.db.prepare(`UPDATE jobs SET status = 'failed', retries = ?, error = 'archive.org refused' WHERE id = ?`).run(MAX_RETRIES, job.id);
+    const page = await (await fetch(`${base}/job/${job.id}/`)).text();
+    assert.doesNotMatch(page, /\/retry"/);
+    assert.match(page, new RegExp(`already been run again ${MAX_RETRIES} times`));
+    assert.match(page, new RegExp(`href="/job/${scanId}/">Back to the snapshots`));
+    store.db.prepare('DELETE FROM jobs WHERE id = ?').run(job.id);
+  });
+
+  it('goes to the back of the line when it runs again', async () => {
+    const local = new JobStore(':memory:');
+    const failed = local.create({ kind: 'restore', domain: 'a.example', target: TS, ip: 'x' });
+    local.fail(failed.id, 'archive.org refused');
+    await sleep(3);
+    const waiting = local.create({ kind: 'restore', domain: 'b.example', target: TS });
+    await sleep(3);
+    assert.equal(local.retry(failed.id), true);
+    assert.equal(local.queuePosition(failed.id), 2);
+    assert.equal(local.claim()?.id, waiting.id);
+    assert.equal(local.claim()?.id, failed.id);
+    // Still one restore for the daily limit.
+    assert.equal(local.countByIp('x', DAY, 'restore'), 1);
+    local.close();
+  });
+
+  // Last: it ends with the scan swept.
+  it('keeps the snapshots while a restore made from them is kept, so trying again a week later uses them', async () => {
+    refusing = true;
+    const res = await post(`/job/${scanId}/restore`, { target: TS, mode: 'full' });
+    const id = res.headers.get('location')!.split('/')[2];
+    assert.equal((await ended(id))!.status, 'failed');
+    // A week on, the scan is past the retention period; the failed restore, which ended later, not yet.
+    store.db.prepare('UPDATE jobs SET finished_at = ? WHERE id = ?').run(Date.now() - 8 * DAY, scanId);
+    await runner.sweep();
+    assert.equal(store.get(scanId)?.status, 'done');
+    const page = await (await fetch(`${base}/job/${id}/`)).text();
+    assert.match(page, new RegExp(`action="/job/${id}/retry"`));
+    assert.match(page, new RegExp(`href="/job/${scanId}/">Back to the snapshots`));
+
+    refusing = false;
+    assert.equal((await post(`/job/${id}/retry`, {})).status, 303);
+    const done = await ended(id);
+    assert.equal(done!.status, 'done', done!.error ?? '');
+    // The healthy period came from the scan: the restore did not check the homepages again.
+    assert.equal(existsSync(path.join(dataDir, 'jobs', id, 'long.example', '.work', 'health.json')), false);
+
+    // Once its restores are past the retention period too, the scan goes in the same sweep.
+    store.db.prepare('UPDATE jobs SET finished_at = ? WHERE parent_id = ?').run(Date.now() - 8 * DAY, scanId);
+    await runner.sweep();
+    assert.equal(store.get(id), undefined);
+    assert.equal(store.get(scanId), undefined);
+    assert.equal(existsSync(path.join(dataDir, 'jobs', id)), false);
+  });
+});
+
+describe('a restore whose snapshot check is gone', () => {
+  let dir: string;
+  let archive: Awaited<ReturnType<typeof hangingArchive>>;
+  before(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'wbd-web5-orphan-'));
+    archive = await hangingArchive();
+  });
+  after(async () => {
+    archive?.close();
+    if (dir) await rm(dir, { recursive: true, force: true });
+  });
+
+  /** A scan that found a healthy period, and a restore made from it. */
+  const scanAndRestore = (store: JobStore) => {
+    const scan = store.create({ kind: 'scan', domain: 'gone.example' });
+    store.finish(scan.id, { health: { domain: 'gone.example', months: [], lastGood: { month: '202001', timestamp: TS, score: 90, original: 'http://gone.example/' }, window: { to: '20200301000000' }, host: 'gone.example', probes: 1 } });
+    const restore = store.create({ kind: 'restore', domain: 'gone.example', target: TS, parentId: scan.id });
+    return { scan, restore };
+  };
+
+  it('is kept by the sweep together with its scan, and an old scan without restores is not', async () => {
+    const store = new JobStore(':memory:');
+    const runner = new JobRunner(store, dir, { workers: 1, retentionDays: 7, archive: { base: archive.base, minIntervalMs: 0 }, log: () => {} });
+    const { scan, restore } = scanAndRestore(store);
+    store.fail(restore.id, 'archive.org refused');
+    const lone = store.create({ kind: 'scan', domain: 'lone.example' });
+    store.finish(lone.id, { health: { domain: 'lone.example', months: [], window: {}, host: 'lone.example', probes: 0 } });
+    await mkdir(runner.jobDir(restore.id), { recursive: true });
+    await writeFile(path.join(runner.jobDir(restore.id), 'kept'), 'x');
+    store.db.prepare('UPDATE jobs SET finished_at = ? WHERE id IN (?, ?)').run(Date.now() - 8 * DAY, scan.id, lone.id);
+    store.db.prepare('UPDATE jobs SET finished_at = ? WHERE id = ?').run(Date.now() - 6 * DAY, restore.id);
+    await runner.sweep();
+    assert.equal(store.get(lone.id), undefined);
+    assert.equal(store.get(scan.id)?.status, 'done');
+    assert.equal(store.get(restore.id)?.status, 'failed');
+    assert.equal(existsSync(path.join(runner.jobDir(restore.id), 'kept')), true);
+    assert.equal(store.canRetry(restore.id), true);
+    store.close();
+  });
+
+  it('is not run again: it fails at once instead of checking the homepages again', async () => {
+    // A database swept before scans were kept: the server was down, the scan is gone, the restore
+    // was running and is put back in the line when the server starts.
+    const store = new JobStore(path.join(dir, 'orphan.sqlite'));
+    const { scan, restore } = scanAndRestore(store);
+    store.fail(restore.id, 'archive.org refused');
+    store.db.prepare('DELETE FROM jobs WHERE id = ?').run(scan.id);
+    assert.equal(store.canRetry(restore.id), false);
+    assert.equal(store.retry(restore.id), false);
+    store.db.prepare(`UPDATE jobs SET status = 'running', error = NULL, finished_at = NULL WHERE id = ?`).run(restore.id);
+    const runner = new JobRunner(store, path.join(dir, 'orphan'), { workers: 1, retentionDays: 7, archive: { base: archive.base, minIntervalMs: 0 }, log: () => {} });
+    runner.start();
+    try {
+      const failed = await until('the restore to end', () => (store.get(restore.id)?.status === 'failed' ? store.get(restore.id) : undefined));
+      assert.equal(failed.error, scanGone('gone.example'));
+      assert.equal(archive.seen(), 0);
+      assert.equal(runner.processes.size, 0);
+    } finally {
+      runner.stop();
+      store.close();
+    }
+  });
+
+  it('offers to check the domain again instead of trying again', async () => {
+    const dataDir = path.join(dir, 'web');
+    const app = await createApp({ ...configFromEnv({}), dataDir, archiveBase: archive.base, accessCode: '' });
+    const { scan, restore } = scanAndRestore(app.store);
+    app.store.fail(restore.id, scanGone('gone.example'));
+    app.store.db.prepare('DELETE FROM jobs WHERE id = ?').run(scan.id);
+    const server = app.app.listen(0, '127.0.0.1');
+    await new Promise((r) => server.once('listening', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const page = await (await fetch(`${base}/job/${restore.id}/`)).text();
+      assert.doesNotMatch(page, /\/retry"/);
+      assert.doesNotMatch(page, /Back to the snapshots/);
+      assert.match(page, /<form method="post" action="\/restore\/"><input type="hidden" name="domain" value="gone.example">/);
+      const res = await fetch(`${base}/job/${restore.id}/retry`, { method: 'POST', redirect: 'manual', headers: { origin: base } });
+      assert.equal(res.status, 303);
+      assert.equal(app.store.get(restore.id)?.status, 'failed');
+      assert.equal(app.store.get(restore.id)?.retries, 0);
+    } finally {
+      server.close();
+      app.store.close();
+    }
   });
 });
 

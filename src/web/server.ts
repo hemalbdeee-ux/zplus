@@ -406,6 +406,9 @@ export async function createApp(config: WebConfig) {
 
   const jobView = (job: Job) => {
     const result = job.result ? JSON.parse(job.result) : undefined;
+    // The scan a restore was made from is kept as long as the restore (JobRunner.sweep), except in
+    // a database swept before that rule: then the restore cannot run again (worker.ts scanGone).
+    const scanGone = job.kind === 'restore' && !!job.parent_id && store.get(job.parent_id)?.status !== 'done';
     const view: Record<string, unknown> = {
       id: job.id,
       kind: job.kind,
@@ -420,11 +423,14 @@ export async function createApp(config: WebConfig) {
       position: store.queuePosition(job.id),
       isScan: job.kind === 'scan',
       demo: job.max_pages !== null,
-      parentId: job.parent_id,
+      parentId: scanGone ? null : job.parent_id,
       codeRequired: !!config.accessCode,
       codeTries: CODE_TRIES,
-      // A failed restore runs again where it stopped; a scan is simply asked for again.
-      canRetry: job.kind === 'restore' && job.status === 'failed' && job.retries < MAX_RETRIES,
+      // A failed restore runs again where it stopped; a scan, or a restore whose scan is gone, is
+      // asked for again from the start.
+      canRetry: job.status === 'failed' && store.canRetry(job.id),
+      recheck: job.status === 'failed' && (job.kind === 'scan' || scanGone),
+      retriesUsed: job.status === 'failed' && job.kind === 'restore' && !scanGone && job.retries >= MAX_RETRIES ? job.retries : 0,
     };
     if (job.kind === 'scan' && result) {
       const h = (result as ScanResult).health;
