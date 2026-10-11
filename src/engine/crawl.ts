@@ -88,7 +88,9 @@ export interface IndexedCapture extends Capture {
 /** One capture per URL key; `truncated` is set when reading stopped at the size limit. */
 export type CaptureIndex = Map<string, IndexedCapture> & { truncated?: boolean };
 
-const SKIP_PATH = /\/(wp-admin|wp-json|cgi-bin|trackback)(\/|$)|\/(wp-login|xmlrpc|wp-cron)\.php|[?&](replytocom|share|action=edit)=/i;
+// Admin, API and comment endpoints, which hold none of the site's content. Not /cgi-bin/: old sites
+// served pages from there (page.cgi?id=news), restored like any other URL.
+const SKIP_PATH = /\/(wp-admin|wp-json|trackback)(\/|$)|\/(wp-login|xmlrpc|wp-cron)\.php|[?&](replytocom|share|action=edit)=/i;
 const GENERATED = new Set(['/robots.txt', '/sitemap.xml']);
 const MAX_QUERY_VARIANTS = 200;
 /** One archive key holds a handful of spellings of a URL; more means the lookup went wrong. */
@@ -163,7 +165,9 @@ type IndexOptions = Pick<CrawlOptions, 'domain' | 'target' | 'window'>;
 function indexer(opts: IndexOptions, limit = Infinity) {
   const targetSec = tsSeconds(opts.target);
   const index: CaptureIndex = new Map();
-  // Mimetype of the latest non-revisit row per key, to tell what a revisit pick really is.
+  // Mimetype of the latest row per key that served content, to tell what a revisit pick really is.
+  // Not a 3xx row's: that is the type of the redirect's own little body (text/html after an http ->
+  // https move), whatever the URL holds.
   const realType = new Map<string, string>();
 
   const add = (c: Capture): void => {
@@ -180,7 +184,7 @@ function indexer(opts: IndexOptions, limit = Infinity) {
       index.truncated = true;
       return;
     }
-    if (cdxHtml(c.mimetype) !== undefined) realType.set(key, c.mimetype);
+    if (/^2/.test(c.statuscode) && cdxHtml(c.mimetype) !== undefined) realType.set(key, c.mimetype);
     if (!cur) {
       index.set(key, c);
       return;
@@ -274,14 +278,17 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
   await mkdir(rawDir, { recursive: true });
   const manifestPath = path.join(opts.workDir, 'manifest.json');
 
-  // Resume: reuse bodies fetched by an earlier run with the same target and window.
+  // Resume: reuse bodies fetched by an earlier run for the same snapshot. Its window may differ (a
+  // new health scan): handle() fetches again whatever was taken from outside this one.
   const previous = new Map<string, Resource>();
   if (existsSync(manifestPath)) {
     try {
       const old = JSON.parse(await readFile(manifestPath, 'utf8')) as Manifest;
-      if (old.domain === opts.domain && old.target === opts.target && JSON.stringify(old.window) === JSON.stringify(opts.window)) {
+      if (old.domain === opts.domain && old.target === opts.target) {
         for (const r of old.resources) if (!r.file || existsSync(path.join(rawDir, r.file))) previous.set(r.key, r);
         log(`resuming: ${previous.size} URLs already downloaded`);
+      } else if (old.domain === opts.domain) {
+        log(`not resuming: the earlier run restored the snapshot of ${old.target}, this one ${opts.target}`);
       }
     } catch {
       // A damaged manifest only costs a refetch.
@@ -481,12 +488,13 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
       // files under the same key and serves the nearest other capture of that key instead, which
       // can be the parked domain or another spelling. The key ignores scheme and www (http ->
       // https: the same URL here) but also case, a trailing slash and query order (/About.html ->
-      // /about.html: a redirect to restore), and nothing in the reply tells which it was.
+      // /about.html: a redirect to restore), and nothing in the reply tells which it was. What it
+      // lands on can be another spelling's own archived redirect too: that is not this URL's.
       const kept = res.kind !== 'missing' && inWindow(res.timestamp, opts.window);
-      const landed = kept && res.kind === 'ok' ? toUrl(res.original) : null;
+      const landed = kept && res.kind !== 'missing' && res.original ? toUrl(res.original) : null;
       const elsewhere = landed !== null && urlKey(landed) !== item.key;
       if (kept && !elsewhere) {
-        // The archived redirect itself, or this URL's own content from the good period.
+        // An archived redirect of this URL, or its own content from the good period.
       } else if (cap.alt) {
         // The URL also served content of its own in the good period: serving it never invents a
         // redirect. Where replay landed says nothing about the 3xx, which may only have switched to
@@ -495,11 +503,11 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
         res = await client.fetchCapture(cap.alt.timestamp, cap.alt.original);
       } else if (landed && elsewhere) {
         // Nothing but 3xx captures of this URL, and replay moved to the other spelling under its key.
-        res = { kind: 'redirect', timestamp: cap.timestamp, status: Number(cap.statuscode), location: landed.toString() };
+        res = { kind: 'redirect', timestamp: cap.timestamp, original: url, status: Number(cap.statuscode), location: landed.toString() };
         inferred.add(item.key);
       } else if (cap.twin) {
         // Nothing usable of this URL itself: the 3xx went to the other URL under its key.
-        res = { kind: 'redirect', timestamp: cap.timestamp, status: Number(cap.statuscode), location: cap.twin.original };
+        res = { kind: 'redirect', timestamp: cap.timestamp, original: url, status: Number(cap.statuscode), location: cap.twin.original };
         inferred.add(item.key);
       }
     }
@@ -547,7 +555,7 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
       if (added[prio] >= room) unqueued++;
       else if (enqueue(u, prio, 'index')) added[prio]++;
     }
-    const n = added[1] + added[2] + unqueued;
+    const n = added[1] + added[2];
     if (n) log(`following ${n} more URLs from the archive index that no page links to`);
   };
 
@@ -616,6 +624,9 @@ export async function crawl(client: ArchiveClient, index: CaptureIndex, opts: Cr
     throw failure;
   }
   breakLoops(manifest, inferred);
+  // The budget can run out exactly as the linked URLs do, before the orphan pass: its URLs were
+  // left out all the same.
+  if (!orphansAdded) addOrphans();
   const left = queued() + unqueued;
   if (left > 0 || processed >= opts.maxUrls) {
     manifest.truncated = left > 0;

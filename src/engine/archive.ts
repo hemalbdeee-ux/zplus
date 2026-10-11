@@ -31,7 +31,8 @@ export interface CdxQuery {
 export type CaptureResult =
   /** original: the URL the served capture is filed under; the archive can move to another spelling. */
   | { kind: 'ok'; timestamp: string; original: string; status: number; contentType: string; body: Buffer }
-  | { kind: 'redirect'; timestamp: string; status: number; location: string }
+  /** original: as for "ok", the URL whose archived redirect this is (fetchCapture always says). */
+  | { kind: 'redirect'; timestamp: string; original?: string; status: number; location: string }
   /** transient: the archive itself failed or refused (429, 5xx), so a later try may work. */
   | { kind: 'missing'; status: number; reason: string; transient?: boolean };
 
@@ -262,7 +263,7 @@ export class ArchiveClient {
             url = nextUrl;
             continue;
           }
-          return { kind: 'redirect', timestamp: archived.timestamp, status: res.status, location: archived.original };
+          return { kind: 'redirect', timestamp: archived.timestamp, original: orig, status: res.status, location: archived.original };
         }
         // Not a replay URL. Without Memento-Datetime it is the archive sending us elsewhere, never
         // a redirect the site made.
@@ -270,7 +271,7 @@ export class ArchiveClient {
         const target = abs.toString();
         const t = toUrl(target);
         if (t && urlKey(t) === wantedKey) return { kind: 'missing', status: res.status, reason: 'redirect loop' };
-        return { kind: 'redirect', timestamp: ts, status: res.status, location: target };
+        return { kind: 'redirect', timestamp: ts, original: orig, status: res.status, location: target };
       }
       if (res.status === 200) {
         const fromHeader = mementoTimestamp(res.headers.get('memento-datetime'));
