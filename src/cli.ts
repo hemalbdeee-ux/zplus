@@ -30,7 +30,8 @@ Restore options:
   --demo                Restore only the first 4 pages (and their images and styles)
   --no-orphans          Only URLs that pages link to, not every URL in the archive index
   --keep-tracking       Keep the old site's analytics and ad scripts
-  --no-health           Skip the health scan (then --target is required)
+  --no-health           Skip the health scan. Then --target and --to are required (and --from
+                        is advised): nothing else keeps a later owner's pages out
   --no-zip              Do not create the ZIP file
   --concurrency <n>     Parallel requests to archive.org (default: 3)
   --delay <ms>          Minimum gap between requests (default: 350)
@@ -126,7 +127,10 @@ async function main(): Promise<void> {
   }
   if (command === 'restore') {
     if (!arg) throw new Error('Give a domain: wbd restore example.com');
-    if (values['no-health'] && !values.target) throw new Error('--no-health needs --target');
+    // The scan is what finds when a later owner took over; without it --to has to say so.
+    if (values['no-health'] && (!values.target || !values.to)) {
+      throw new Error("--no-health needs --target and --to (the last date the old site was itself): without the health scan nothing else keeps a later owner's parked or spam pages out");
+    }
     const archive = { base: values.archive, concurrency: num('concurrency', 1), minIntervalMs: num('delay', 0) };
     const maxUrls = num('max-urls', 1);
     let last = 0;
@@ -156,7 +160,8 @@ async function main(): Promise<void> {
     });
     const c = result.report.counts;
     console.log(`\nRestored ${result.report.domain} from ${result.report.target}`);
-    console.log(`  ${c.pages} pages (${c.posts} posts), ${c.files} files, ${c.redirects} original redirects, ${c.missing} not in the archive`);
+    const refused = c.refused ? `, ${c.refused} refused by archive.org (run again to fetch)` : '';
+    console.log(`  ${c.pages} pages (${c.posts} posts), ${c.files} files, ${c.redirects} original redirects, ${c.missing} not in the archive${refused}`);
     console.log(`  Site:   ${result.siteDir}`);
     if (result.zipFile) console.log(`  ZIP:    ${result.zipFile}`);
     console.log(`  Report: ${result.jobDir}/report.html`);

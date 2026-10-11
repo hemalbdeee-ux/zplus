@@ -4,8 +4,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { ArchiveClient, type ArchiveOptions } from './archive.ts';
 import { buildSite } from './build.ts';
-import { buildIndex, crawl } from './crawl.ts';
-import { scanHealth, type HealthReport } from './health.ts';
+import { buildIndex, crawl, type Manifest } from './crawl.ts';
+import { scanHealth, type HealthReport, type MonthHealth } from './health.ts';
 import { hostingNotes, makeReport, reportHtml, type RestoreReport } from './report.ts';
 import { normalizeDomain, parseTimestamp } from './url.ts';
 import { zipPaths } from './zip.ts';
@@ -52,6 +52,56 @@ const DEMO_INDEX_URLS = 5_000;
  */
 const INDEX_CAP = 500_000;
 
+/** Reasons the health scan gives for another owner's homepage (NEW_OWNER in health.ts). */
+const NEW_OWNER = /parked|redirects to|sends visitors|spam/;
+
+type Window = { from?: string; to?: string };
+
+const inWindow = (ts: string, w: Window) => (!w.from || ts >= w.from) && (!w.to || ts <= w.to);
+
+/** YYYYMM moved by a number of months. */
+function addMonths(month: string, n: number): string {
+  const i = Number(month.slice(0, 4)) * 12 + Number(month.slice(4, 6)) - 1 + n;
+  return `${Math.floor(i / 12)}${String((i % 12) + 1).padStart(2, '0')}`;
+}
+
+/**
+ * The period around a date the user picked in which the site was itself, when the health scan found
+ * no good month: the walk scanHealth makes from its last good one. It ends before the first bad
+ * month after the date and starts after the last stretch of bad months before it that was not an
+ * outage of the site. null when the date falls in a month the scan found run by another owner.
+ */
+export function windowAround(months: MonthHealth[], target: string): Window | null {
+  let i = -1;
+  while (i + 1 < months.length && months[i + 1].month <= target.slice(0, 6)) i++;
+  const newOwner = (m: MonthHealth) => m.reasons.some((r) => NEW_OWNER.test(r));
+  if (i >= 0 && months[i].verdict === 'bad' && newOwner(months[i])) return null;
+  const window: Window = {};
+  const firstBadAfter = months.slice(i + 1).find((m) => m.verdict === 'bad');
+  if (firstBadAfter) {
+    const last = addMonths(firstBadAfter.month, -1);
+    const lastDay = new Date(Date.UTC(Number(last.slice(0, 4)), Number(last.slice(4, 6)), 0)).getUTCDate();
+    window.to = `${last}${lastDay}235959`;
+  }
+  for (let j = i - 1; j >= 0; j--) {
+    if (months[j].verdict !== 'bad') continue;
+    let k = j;
+    while (k > 0 && months[k - 1].verdict === 'bad') k--;
+    const run = months.slice(k, j + 1);
+    const outage = !run.some(newOwner) && (run.length === 1 || (monthsBetween(months[k].month, months[j].month) < 6 && months.slice(0, k).some((m) => m.verdict === 'good')));
+    if (!outage) {
+      window.from = `${addMonths(months[j].month, 1)}01000000`;
+      break;
+    }
+    j = k;
+  }
+  return window;
+}
+
+function monthsBetween(a: string, b: string): number {
+  return Number(b.slice(0, 4)) * 12 + Number(b.slice(4, 6)) - (Number(a.slice(0, 4)) * 12 + Number(a.slice(4, 6)));
+}
+
 export interface RestoreResult {
   jobDir: string;
   siteDir: string;
@@ -77,8 +127,13 @@ export function normalizeSiteUrl(raw: string): string {
 export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
   const startedAt = Date.now();
   const domain = normalizeDomain(opts.domain);
-  // Checked before any download: the site address is only used in the last build step.
+  // Checked before any download: the site address is only used in the last build step, the dates
+  // after the health scan.
   const givenSiteUrl = opts.siteUrl !== undefined ? normalizeSiteUrl(opts.siteUrl) : undefined;
+  const givenTarget = opts.target ? parseTimestamp(opts.target) : undefined;
+  const givenFrom = opts.from ? parseTimestamp(opts.from) : undefined;
+  const givenTo = opts.to ? parseTimestamp(opts.to, true) : undefined;
+  if (givenFrom && givenTo && givenFrom > givenTo) throw new Error(`The --from date ${opts.from} is after the --to date ${opts.to}.`);
   const demo = opts.maxPages !== undefined;
   const maxUrls = opts.maxUrls !== undefined && Number.isFinite(opts.maxUrls) && opts.maxUrls >= 1 ? Math.floor(opts.maxUrls) : demo ? DEMO_MAX_URLS : 20_000;
   const emit = (phase: Phase, message: string, extra: Partial<RestoreEvent> = {}) => opts.onEvent?.({ phase, message, ...extra });
@@ -87,6 +142,9 @@ export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
   const workDir = path.join(jobDir, '.work');
   await mkdir(workDir, { recursive: true });
   const warnings: string[] = [];
+  const earlier = await readFile(path.join(workDir, 'manifest.json'), 'utf8')
+    .then((text) => JSON.parse(text) as Manifest | null)
+    .catch(() => null);
 
   let health: HealthReport | undefined = opts.health;
   if (!health && !opts.skipHealth) {
@@ -96,7 +154,18 @@ export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
     if (health.lastGood) emit('health', `last good snapshot: ${health.lastGood.timestamp} (score ${health.lastGood.score})`);
   }
 
-  const target = opts.target ? parseTimestamp(opts.target) : health?.lastGood?.timestamp;
+  let target = givenTarget ?? health?.lastGood?.timestamp;
+  // A re-run continues the earlier one, whose downloads crawl() reuses for the same snapshot only.
+  // A new scan can pick another last good month (one more capture indexed, a probe refused this
+  // time), so the snapshot an earlier scan picked (a homepage capture, not a date the user gave) is
+  // kept while it is still in the period this scan finds the site was itself.
+  if (!givenTarget && health?.lastGood && earlier?.domain === domain && earlier.target !== target) {
+    const scanned = health.months.some((m) => m.timestamp === earlier.target && m.verdict !== 'bad');
+    if (scanned && inWindow(earlier.target, { from: givenFrom ?? health.window.from, to: givenTo ?? health.window.to })) {
+      emit('health', `continuing the earlier run, which restores the snapshot of ${earlier.target} (this scan picks ${target})`);
+      target = earlier.target;
+    }
+  }
   if (!target) {
     // A scan whose captures archive.org would not play back says nothing about the site.
     if (client.playbackRefused) {
@@ -109,12 +178,27 @@ export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
         : `The Wayback Machine has no captures of ${domain}.`,
     );
   }
-  const window = {
-    from: opts.from ? parseTimestamp(opts.from) : health?.window.from,
-    to: opts.to ? parseTimestamp(opts.to, true) : health?.window.to,
-  };
-  if (opts.target && ((window.from && target < window.from) || (window.to && target > window.to))) {
+  let bounds: Window = health?.window ?? {};
+  if (health?.months.length && !health.lastGood && !(givenFrom && givenTo)) {
+    // The user picked the date after the scan found no good month. The window still ends at the
+    // months it found parked or taken over, or the later owner's pages would come back as the site.
+    const around = windowAround(health.months, target);
+    if (!around) {
+      const date = `${target.slice(0, 4)}-${target.slice(4, 6)}-${target.slice(6, 8)}`;
+      throw new Error(`The health scan found ${domain} parked or run by another owner around ${date}. Pick a date when it was still the old site, or pass --from and --to to restore that period anyway.`);
+    }
+    bounds = around;
+    emit('health', `no capture looks like a real website: pages are taken from ${bounds.from?.slice(0, 8) ?? 'the start'} to ${bounds.to?.slice(0, 8) ?? 'today'}, between the bad months around the chosen date`);
+  }
+  const window: Window = { from: givenFrom ?? bounds.from, to: givenTo ?? bounds.to };
+  if (givenTarget && !inWindow(target, window)) {
     warnings.push(`The chosen date ${target.slice(0, 8)} is outside the period the site looked healthy; pages were taken from that period instead.`);
+  }
+  if (!window.to && !health?.months.length) {
+    // Only the scan of the homepage finds when a later owner took over.
+    const note = `Neither a health scan of the homepage nor a --to date bounded the period, so captures of every date were used and a later owner's parked or spam pages may have been restored as the site.`;
+    warnings.push(note);
+    emit('index', note);
   }
   const host = health?.host ?? domain;
   const siteUrl = givenSiteUrl ?? `https://${host}`;
@@ -169,7 +253,8 @@ export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
   });
 
   const generated = (name: string) => readFile(path.join(siteDir, name), 'utf8').catch(() => '');
-  warnings.push(...hostingNotes(await generated('_redirects'), await generated('_headers')));
+  // buildSite reports Cloudflare Pages' rule limits itself.
+  warnings.push(...hostingNotes(await generated('_redirects'), await generated('_headers'), { limits: false }));
   const report = makeReport({ manifest, build, health, siteUrl, startedAt, archiveRequests: client.requests, warnings });
   await writeFile(path.join(jobDir, 'report.json'), JSON.stringify(report, null, 1));
   await writeFile(path.join(jobDir, 'report.html'), reportHtml(report));

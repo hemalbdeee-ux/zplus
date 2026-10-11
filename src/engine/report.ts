@@ -22,7 +22,10 @@ export interface RestoreReport {
     bytes: number;
     rewrites: number;
     redirects: number;
+    /** Not restored, and a re-run would not get them either: not archived in the window, an error page, too large. */
     missing: number;
+    /** Not restored because archive.org refused or failed the request: a re-run can fetch them. */
+    refused?: number;
     trackersRemoved: number;
   };
   truncated: boolean;
@@ -36,9 +39,10 @@ const PAGES_LIMITS = { plain: 2000, patterns: 100, headers: 100 };
 
 /**
  * Notes for hosts that cannot serve every original URL of this site, from the generated
- * _redirects and _headers. Apache, LiteSpeed and nginx have no such limits.
+ * _redirects and _headers. Apache, LiteSpeed and nginx have no such limits. `limits: false` leaves
+ * out the one on Cloudflare Pages' rule limits, for a site buildSite built: it reports them itself.
  */
-export function hostingNotes(redirects: string, headers: string): string[] {
+export function hostingNotes(redirects: string, headers: string, opts: { limits?: boolean } = {}): string[] {
   let plain = 0;
   let patterns = 0;
   let lookAlikes = 0;
@@ -54,7 +58,7 @@ export function hostingNotes(redirects: string, headers: string): string[] {
   }
   const headerRules = headers.split('\n').filter((l) => l.startsWith('/')).length;
   const notes: string[] = [];
-  if (plain > PAGES_LIMITS.plain || patterns > PAGES_LIMITS.patterns || headerRules > PAGES_LIMITS.headers) {
+  if ((opts.limits ?? true) && (plain > PAGES_LIMITS.plain || patterns > PAGES_LIMITS.patterns || headerRules > PAGES_LIMITS.headers)) {
     notes.push(
       `Cloudflare Pages reads only the first ${PAGES_LIMITS.plain} plain and ${PAGES_LIMITS.patterns} pattern rules of _redirects and ${PAGES_LIMITS.headers} rules of _headers; this site needs ${plain}, ${patterns} and ${headerRules}, so some original URLs would not work there. Use Apache, LiteSpeed or nginx.`,
     );
@@ -94,11 +98,12 @@ export function makeReport(input: {
       bytes: build.bytes,
       rewrites: build.routes.length,
       redirects: build.redirects.length,
-      missing: manifest.missing.length,
+      // A refusal is not a gap in the archive: another run can still fetch it.
+      missing: manifest.missing.filter((m) => !m.transient).length,
+      refused: manifest.missing.filter((m) => m.transient).length,
       trackersRemoved: build.cleaned.trackers,
     },
     truncated: manifest.truncated,
-    // A refusal is not a gap in the archive: another run can still fetch it.
     missing: manifest.missing.map((m) => ({ url: m.url, reason: m.transient ? `archive.org did not answer (${m.reason}); run the restore again to fetch it` : m.reason, referrer: m.referrer })),
     redirects: build.redirects.map((r) => ({ from: r.rawPath + (r.query ? `?${r.query}` : ''), to: r.to, status: r.status })),
     warnings: [...input.warnings, ...build.warnings, ...hosting],
@@ -168,6 +173,7 @@ export function reportHtml(r: RestoreReport): string {
     <div class="stat"><b>${r.counts.redirects}</b>original redirects</div>
     <div class="stat"><b>${r.counts.rewrites}</b>query/odd URLs kept</div>
     <div class="stat"><b>${r.counts.missing}</b>not in the archive</div>
+    ${r.counts.refused ? `<div class="stat"><b>${r.counts.refused}</b>refused by archive.org (run again to fetch)</div>` : ''}
   </section>
   <section>
     <h2>Homepage health by month</h2>
@@ -185,7 +191,7 @@ export function reportHtml(r: RestoreReport): string {
   }
   ${
     r.missing.length
-      ? `<section><h2>Not found in the archive</h2><div class="list"><table><tr><th>URL</th><th>Why</th><th>Linked from</th></tr>${r.missing
+      ? `<section><h2>Not restored</h2><div class="list"><table><tr><th>URL</th><th>Why</th><th>Linked from</th></tr>${r.missing
           .slice(0, 1000)
           .map((m) => `<tr><td><code>${esc(m.url)}</code></td><td>${esc(m.reason)}</td><td><code>${esc(m.referrer ?? '')}</code></td></tr>`)
           .join('')}</table></div></section>`
