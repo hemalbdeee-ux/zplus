@@ -100,8 +100,9 @@ Copy `.env.example` to `.env`, set the domain (and, if you want one, the access 
 `.htaccess`, `server/nginx.conf`, `_redirects` and `_headers` are all built from it. The rules were
 checked against real Apache 2.4, nginx 1.24, `wrangler pages dev` and `netlify dev`.
 
-Apache, LiteSpeed and nginx keep every URL. Netlify and Cloudflare Pages have limits, which the
-report names for each site:
+Apache, LiteSpeed and nginx keep every URL. Netlify and Cloudflare Pages have limits (the report
+lists the site's query-string URLs and says when Pages would drop rules; the rest applies to any
+site):
 
 - URLs with a query string do not work there (they cannot match an exact query string).
 - A URL with a doubled slash (`//menu.html`) can show another page.
