@@ -24,6 +24,7 @@ import {
   netlifyRedirects,
   nginxConf,
   pagesOverflow,
+  type FileAlias,
   type Redirect,
   type Route,
   type ServerRules,
@@ -91,6 +92,8 @@ interface Plan {
   /** Same bytes as this plan under a name differing only in letter case: gets a copy of its output. */
   sameAs?: Plan;
   route?: Route;
+  /** Other archived spellings of this plan's address, served from it (see Route.aliases). */
+  aliases?: string[];
 }
 
 const HTML_EXT = new Set(['.html', '.htm', '.xhtml']);
@@ -224,6 +227,11 @@ function isPermanent(status: number): boolean {
   return status === 301 || status === 308;
 }
 
+/** Records raw, another archived spelling of the address that x answers at its own raw path. */
+function addAlias(x: { aliases?: string[] }, own: string, raw: string): void {
+  if (raw !== own && !x.aliases?.includes(raw)) (x.aliases ??= []).push(raw);
+}
+
 function charsetLabel(label: string | undefined): string | undefined {
   if (!label) return undefined;
   try {
@@ -309,7 +317,11 @@ export function planFiles(resources: Resource[], kinds: Map<string, Kind>): Plan
     // spelling of it (shorter paths come first). Another spelling with other bytes keeps them at
     // its own raw path only, when the server can tell it apart (by its doubled slashes).
     const first = owners.get(address(u));
-    if (first && ((first.res.sha1 ?? first.res.key) === (r.sha1 ?? r.key) || rawPathKey(new URL(first.res.url).pathname) === rawPathKey(u.pathname))) continue;
+    const firstPath = first && new URL(first.res.url).pathname;
+    if (first && ((first.res.sha1 ?? first.res.key) === (r.sha1 ?? r.key) || rawPathKey(firstPath!) === rawPathKey(u.pathname))) {
+      addAlias(first, firstPath!, u.pathname);
+      continue;
+    }
     const plan: Plan = { res: r, kind, file: '' };
     plans.push(plan);
     if (first) {
@@ -546,10 +558,22 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
     const u = new URL(r.url);
     if (cleanSearch(u.search)) queryPaths.add(serverPath(u.pathname));
   }
-  const answered = new Map<string, { raw: string; to?: string; permanent?: boolean }>();
-  for (const p of plans) if (!p.route?.exact) answered.set(address(new URL(p.res.url)), { raw: rawPathKey(new URL(p.res.url).pathname) });
+  // What answers at each address and at which raw path; another spelling that answers the same way
+  // there becomes an alias of it.
+  interface Answer {
+    raw: string;
+    rawPath: string;
+    of: Plan | Redirect;
+    to?: string;
+    permanent?: boolean;
+  }
+  const answered = new Map<string, Answer>();
+  for (const p of plans) {
+    const u = new URL(p.res.url);
+    if (!p.route?.exact) answered.set(address(u), { raw: rawPathKey(u.pathname), rawPath: u.pathname, of: p });
+  }
   const redirects: Redirect[] = [];
-  const exactDone = new Set<string>();
+  const exactDone = new Map<string, Redirect>();
   // The spelling the server reads as is goes first: it is the one the address belongs to.
   const moved = manifest.resources.filter((r) => r.status !== 200 && r.location);
   const merged = (r: Resource) => (sitePath(new URL(r.url)) === new URL(r.url).pathname ? 0 : 1);
@@ -565,15 +589,21 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
     // A redirect to its own address would loop (/a.php to /a.php?fbclid=1, %e9 to %E9); one to
     // another spelling of it (//a.php to /a.php) is kept for that spelling only.
     const self = internal && address(loc) === at;
-    if (self && rawPathKey(loc.pathname.replace(/^\/{2,}/, '/')) === raw) continue;
+    const loops = self && rawPathKey(loc.pathname.replace(/^\/{2,}/, '/')) === raw;
     const owner = answered.get(at);
-    if (owner && (owner.raw === raw || (owner.to === to && owner.permanent === isPermanent(r.status)))) continue;
+    // This spelling answers as the address does (//old.php next to /old.php, both to /).
+    if (loops || (owner && (owner.raw === raw || (owner.to === to && owner.permanent === isPermanent(r.status))))) {
+      if (owner) addAlias(owner.of, owner.rawPath, u.pathname);
+      continue;
+    }
     const query = cleanSearch(u.search).slice(1) || undefined;
     const exact = self || owner !== undefined;
-    if (exact && exactDone.has(raw + '?' + (query ?? ''))) continue;
-    if (exact) exactDone.add(raw + '?' + (query ?? ''));
-    else answered.set(at, { raw, to, permanent: isPermanent(r.status) });
-    redirects.push({
+    const done = exact ? exactDone.get(raw + '?' + (query ?? '')) : undefined;
+    if (done) {
+      addAlias(done, done.rawPath, u.pathname);
+      continue;
+    }
+    const d: Redirect = {
       path: decodePath(sitePath(u)),
       rawPath: u.pathname,
       query,
@@ -581,7 +611,23 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
       to,
       status: r.status,
       ...(exact ? { exact } : {}),
-    });
+    };
+    redirects.push(d);
+    if (exact) exactDone.set(raw + '?' + (query ?? ''), d);
+    else answered.set(at, { raw, rawPath: u.pathname, of: d, to, permanent: isPermanent(r.status) });
+  }
+
+  // Cloudflare Pages compares _redirects lines with the path as sent, where Apache, nginx and the
+  // preview merge slashes and decode escapes: there, each archived spelling of an address names
+  // what serves it. A plain file serves its own URL there unless that has doubled slashes.
+  const fileAliases: FileAlias[] = [];
+  for (const p of plans) {
+    if (p.route) {
+      if (p.aliases) p.route.aliases = p.aliases;
+      continue;
+    }
+    const own = new URL(p.res.url).pathname;
+    for (const raw of [...(own !== mergeSlashes(own) ? [own] : []), ...(p.aliases ?? [])]) fileAliases.push({ rawPath: raw, file: p.file });
   }
 
   // 5. Sitemaps, feed, robots.txt, 404 page.
@@ -618,7 +664,7 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
     );
   }
   const plain = [...new Set(plans.filter((p) => !p.route).map((p) => p.file))];
-  const rules: ServerRules = { domain: opts.domain, host: new URL(opts.siteUrl).host, routes, redirects, types, files: plain };
+  const rules: ServerRules = { domain: opts.domain, host: new URL(opts.siteUrl).host, routes, redirects, types, files: plain, fileAliases };
   const pagesRedirects = netlifyRedirects(rules);
   const pagesHeaders = netlifyHeaders(rules);
   await write('.htaccess', htaccess(rules));

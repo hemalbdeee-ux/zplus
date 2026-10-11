@@ -7,7 +7,7 @@ import { readFile } from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import type { Redirect, Route } from './serverconfig.ts';
-import { HTML_LIKE_EXT } from './serverconfig.ts';
+import { HTML_LIKE_EXT, redirectTarget } from './serverconfig.ts';
 import { decodePath, hasNonUtf8Escapes, mergeSlashes, rawPathKey, ruleQuery, serverPath } from './url.ts';
 
 const TYPES: Record<string, string> = {
@@ -112,7 +112,8 @@ export async function createPreviewServer(siteDir: string): Promise<http.Server>
     if (decoded.startsWith('/__wbd/')) return notFound();
 
     const moved = find(redirects);
-    if (moved) return redirect(moved.status === 301 || moved.status === 308 ? 301 : 302, moved.to);
+    // The query as sent, as Apache and nginx pass it on.
+    if (moved) return redirect(moved.status === 301 || moved.status === 308 ? 301 : 302, redirectTarget(moved, target.includes('?') ? target.slice(target.indexOf('?')) : ''));
     const routed = find(routes);
     if (routed) {
       const abs = isFile('/' + routed.file);
