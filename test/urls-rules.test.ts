@@ -389,7 +389,8 @@ describe('Cloudflare Pages', () => {
     assert.equal(pagesOverflow(netlifyRedirects(rules(many.slice(0, 1990))), netlifyHeaders(rules([]))), 0);
     const patterns: Route[] = Array.from({ length: 99 }, (_, i) => ({ path: `/wiki/Talk:P${i}.html`, rawPath: `/wiki/Talk:P${i}.html`, file: `__wbd/f/t${i}.html` }));
     assert.equal(pagesOverflow(netlifyRedirects(rules(patterns)), netlifyHeaders(rules([]))), 1);
-    const types = Array.from({ length: 100 }, (_, i) => ({ file: `p${i}.php`, contentType: 'text/html; charset=utf-8' }));
+    // _headers holds one rule per .php page (no fixed /__wbd/* rule any more): 101 rules, 1 past the limit.
+    const types = Array.from({ length: 101 }, (_, i) => ({ file: `p${i}.php`, contentType: 'text/html; charset=utf-8' }));
     assert.equal(pagesOverflow(netlifyRedirects(rules([])), netlifyHeaders({ ...rules([]), types })), 1);
   });
 

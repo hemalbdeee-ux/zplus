@@ -22,7 +22,9 @@ Any Apache or LiteSpeed hosting (most shared hosting, including cPanel and hPane
 
 Netlify and Cloudflare Pages read the included `_redirects` and `_headers` files, with limits:
 
-- URLs with a query string, such as `/index.php?page=contact`, do not work there: the included `_redirects` has no rules for them. On Netlify a URL with a doubled slash, such as `//about.php`, can also show another page.
+- URLs with a query string, such as `/index.php?page=contact`, do not work there: the included `_redirects` has no rules for them.
+- A URL with a doubled slash, such as `//menu.html` or `//about.php`, can show another page on both hosts.
+- Netlify serves an existing file before it reads a rule. Where the original site had different pages at `/about` and `/about.html`, or at `/blog/` and `/blog/index.html`, both addresses show the same page there, and a redirect from such an address (for example `/index.html` to `/`) is not made.
 - Cloudflare Pages on its own redirects `/about.html` to `/about` and `/blog/index.html` to `/blog/`. Rules in `_redirects` keep those URLs at their own address, but Pages reads at most 2,000 plain and 100 pattern rules from `_redirects` and 100 rules from `_headers`, and ignores the rest. A large site with many rewritten URLs or `.php` pages needs Apache, LiteSpeed or nginx.
 - Cloudflare Pages reads a path with `:` followed by a letter, or with `*`, as a pattern. The rule for an original URL such as `/wiki/Talk:Main.html` then also catches neighbouring URLs such as `/wiki/Talkative.html`, which show the wrong page. Sites with such URLs need Apache, LiteSpeed, nginx or Netlify.
 
