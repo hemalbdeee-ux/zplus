@@ -1,8 +1,11 @@
 // Runs queued jobs in the background, a few at a time (archive.org punishes anything faster),
-// and deletes finished jobs after the retention period. Each job runs in its own child process
-// (this file, forked), so a job that eats the CPU, hangs or crashes cannot freeze or take down
-// the web server. A job whose process dies or stops responding is retried up to MAX_ATTEMPTS times.
-// A job that fails or is cancelled aborts every archive request it still has open.
+// and deletes finished jobs after the retention period. Scans and demos have one more slot that
+// full restores never take, so a restore that runs for hours does not hold up a snapshot check.
+// Each job runs in its own child process (this file, forked), so a job that eats the CPU, hangs or
+// crashes cannot freeze or take down the web server. A job whose process dies or stops responding
+// is retried up to MAX_ATTEMPTS times; one the server stops for a shutdown goes back to the queue
+// without using up an attempt. A job that fails or is cancelled aborts every archive request it
+// still has open.
 
 import { fork, type ChildProcess } from 'node:child_process';
 import { rm } from 'node:fs/promises';
@@ -22,6 +25,10 @@ const ABORT_GRACE_MS = 5000;
 
 export interface ScanResult {
   health: HealthReport;
+  /** Captures archive.org played back during the scan, and those it refused or failed (429, 5xx). */
+  played?: number;
+  refused?: number;
+  lastRefusal?: string;
 }
 
 export interface RestoreJobResult {
@@ -94,14 +101,19 @@ export function restoreOptions(input: JobInput, signal: AbortSignal, onEvent?: R
   };
 }
 
+/** `workers` slots take any job in order; one more takes only scans and demos (isShort in db.ts). */
+type Lane = 'any' | 'short';
+const SHORT_SLOTS = 1;
+
 export class JobRunner {
   readonly store: JobStore;
   readonly dataDir: string;
   readonly opts: RunnerOptions;
-  #running = 0;
+  #busy: Record<Lane, number> = { any: 0, short: 0 };
   #stopped = false;
   #processes = new Map<string, ChildProcess>();
   #aborts = new Map<string, AbortController>();
+  #runs = new Map<string, Promise<void>>();
   #timers: NodeJS.Timeout[] = [];
 
   constructor(store: JobStore, dataDir: string, opts: RunnerOptions) {
@@ -125,12 +137,38 @@ export class JobRunner {
     this.tick();
   }
 
-  /** Stops claiming jobs and kills running job processes; their jobs are requeued on the next start. */
+  /**
+   * Stops claiming jobs and kills running job processes; their jobs count as interrupted on the next
+   * start, as after a crash.
+   */
   stop(): void {
+    this.#halt();
+    for (const child of this.#processes.values()) child.kill('SIGKILL');
+  }
+
+  /**
+   * Stops for a server shutdown (a deploy): claims no more jobs, asks every running job's process to
+   * stop (it saves its progress) and kills one that has not after `graceMs`, then puts those jobs
+   * back in the queue without counting the attempt. The next start resumes them.
+   */
+  async shutdown(graceMs = ABORT_GRACE_MS): Promise<void> {
+    this.#halt();
+    const runs = [...this.#runs];
+    for (const child of this.#processes.values()) {
+      if (child.exitCode !== null || child.signalCode !== null) continue;
+      if (child.connected) child.send({ type: 'abort' } satisfies ToJob, () => {});
+      const killer = setTimeout(() => child.kill('SIGKILL'), graceMs);
+      child.once('close', () => clearTimeout(killer));
+    }
+    await Promise.all(runs.map(([, run]) => run));
+    // Only jobs still marked running: one that finished or failed before the shutdown keeps its result.
+    for (const [id] of runs) this.store.release(id);
+  }
+
+  #halt(): void {
     this.#stopped = true;
     for (const t of this.#timers) clearInterval(t);
     this.#timers = [];
-    for (const child of this.#processes.values()) child.kill('SIGKILL');
   }
 
   /**
@@ -150,7 +188,7 @@ export class JobRunner {
   }
 
   get running(): number {
-    return this.#running;
+    return this.#busy.any + this.#busy.short;
   }
 
   /** The process of each running job, by job id. */
@@ -158,15 +196,20 @@ export class JobRunner {
     return this.#processes;
   }
 
+  /** Starts queued jobs while a slot is free: the shared slots first, then the one for scans and demos. */
   tick(): void {
-    while (!this.#stopped && this.#running < this.opts.workers) {
-      const job = this.store.claim();
+    while (!this.#stopped) {
+      const lane: Lane | undefined = this.#busy.any < this.opts.workers ? 'any' : this.#busy.short < SHORT_SLOTS ? 'short' : undefined;
+      if (!lane) return;
+      const job = this.store.claim(lane === 'short');
       if (!job) return;
-      this.#running++;
-      void this.run(job).finally(() => {
-        this.#running--;
+      this.#busy[lane]++;
+      const run = this.run(job).finally(() => {
+        this.#busy[lane]--;
+        if (this.#runs.get(job.id) === run) this.#runs.delete(job.id);
         this.tick();
       });
+      this.#runs.set(job.id, run);
     }
   }
 
@@ -258,6 +301,9 @@ export class JobRunner {
   async sweep(): Promise<void> {
     const cutoff = Date.now() - this.opts.retentionDays * 86_400_000;
     for (const job of this.store.finishedBefore(cutoff)) {
+      // A failed restore that was run again in the meantime keeps its folder.
+      const now = this.store.get(job.id);
+      if (!now?.finished_at || now.finished_at >= cutoff) continue;
       await rm(this.jobDir(job.id), { recursive: true, force: true });
       this.store.delete(job.id);
     }
@@ -281,7 +327,11 @@ async function execute(input: JobInput, send: (m: JobMessage) => void, signal: A
     progress('health', `checking how ${job.domain} looked over the years`);
     const client = new ArchiveClient({ ...input.archive, signal, log: (m) => progress('health', m) });
     const health = await scanHealth(client, job.domain, { log: (m) => progress('health', m) });
-    return { health } satisfies ScanResult;
+    // As in the CLI: a scan whose captures archive.org would not play back says nothing about the site.
+    if (!health.lastGood && client.playbackRefused) {
+      throw new Error(`archive.org refused or failed every request to play back ${job.domain}'s captures (${client.lastRefusal}), so its history could not be checked. Try again later.`);
+    }
+    return { health, played: client.played, refused: client.refused, lastRefusal: client.lastRefusal } satisfies ScanResult;
   }
 
   const result = await restore(restoreOptions(input, signal, (e) => progress(e.phase, e.message, e.done, e.queued)));
@@ -298,6 +348,9 @@ if (process.argv[1] === import.meta.filename && process.send) {
   let started = false;
   // Without the server nobody records the result, and the restarted server runs the job again.
   process.on('disconnect', () => process.exit(1));
+  // Ctrl-C (or a stop of the whole process group) also reaches this process: the server stops its
+  // jobs itself, so that it can put them back in the queue.
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, () => {});
   process.on('message', async (m: ToJob) => {
     if (m.type === 'abort') return controller.abort();
     if (started) return;

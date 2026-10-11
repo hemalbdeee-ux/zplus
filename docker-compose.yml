@@ -10,11 +10,15 @@ services:
       dockerfile: Dockerfile
     container_name: zplus
     restart: unless-stopped
+    # docker stop sends SIGTERM to the server, which puts running jobs back in the queue and exits.
+    init: true
     environment:
       WBD_SITE_URL: https://${WBD_DOMAIN:-zplus.ai}
       WBD_ACCESS_CODE: ${WBD_ACCESS_CODE:-}
       WBD_WORKERS: ${WBD_WORKERS:-1}
       WBD_RETENTION_DAYS: ${WBD_RETENTION_DAYS:-7}
+      WBD_SCAN_LIMIT: ${WBD_SCAN_LIMIT:-30}
+      WBD_RESTORE_LIMIT: ${WBD_RESTORE_LIMIT:-10}
     volumes:
       - wbd-data:/data   # SQLite database and job files
     # Caps so a big restore can never slow down other sites on the same VPS (RigConfigurator).

@@ -24,6 +24,8 @@ export interface Job {
   ip: string | null;
   /** How many times a worker has started this job. */
   attempts: number;
+  /** How many times a user has run this job again after it failed. */
+  retries: number;
   created_at: number;
   updated_at: number;
   finished_at: number | null;
@@ -46,6 +48,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   error TEXT,
   ip TEXT,
   attempts INTEGER NOT NULL DEFAULT 0,
+  retries INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   finished_at INTEGER
@@ -59,6 +62,17 @@ CREATE INDEX IF NOT EXISTS code_failures_ip ON code_failures (ip, at);
 
 /** A job is started at most this often; one that keeps crashing or hanging its worker is failed, not retried forever. */
 export const MAX_ATTEMPTS = 2;
+/** How often a user may run a failed restore again. */
+export const MAX_RETRIES = 3;
+
+/**
+ * Scans and demos take a minute or two; a full restore can take hours. Short jobs have a worker
+ * slot of their own, so they never wait for a full restore.
+ */
+export function isShort(job: Pick<Job, 'kind' | 'max_pages'>): boolean {
+  return job.kind === 'scan' || job.max_pages !== null;
+}
+const SHORT = `(kind = 'scan' OR max_pages IS NOT NULL)`;
 
 export class JobStore {
   readonly db: DatabaseSync;
@@ -67,9 +81,11 @@ export class JobStore {
     this.db = new DatabaseSync(file);
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
     this.db.exec(SCHEMA);
-    // CREATE TABLE IF NOT EXISTS leaves databases made before the attempts column as they were.
+    // CREATE TABLE IF NOT EXISTS leaves databases made before the newer columns as they were.
     const columns = this.db.prepare('PRAGMA table_info(jobs)').all() as { name: string }[];
-    if (!columns.some((c) => c.name === 'attempts')) this.db.exec('ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
+    for (const name of ['attempts', 'retries']) {
+      if (!columns.some((c) => c.name === name)) this.db.exec(`ALTER TABLE jobs ADD COLUMN ${name} INTEGER NOT NULL DEFAULT 0`);
+    }
   }
 
   create(input: { kind: JobKind; domain: string; target?: string; maxPages?: number; parentId?: string; ip?: string }): Job {
@@ -87,13 +103,13 @@ export class JobStore {
     return this.db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as Job | undefined;
   }
 
-  /** Takes the oldest queued job, marks it running and counts the attempt. */
-  claim(): Job | undefined {
+  /** Takes the oldest queued job (or the oldest scan or demo), marks it running and counts the attempt. */
+  claim(shortOnly = false): Job | undefined {
     const now = Date.now();
     return this.db
       .prepare(
         `UPDATE jobs SET status = 'running', attempts = attempts + 1, updated_at = ?
-         WHERE id = (SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1)
+         WHERE id = (SELECT id FROM jobs WHERE status = 'queued'${shortOnly ? ` AND ${SHORT}` : ''} ORDER BY created_at LIMIT 1)
          RETURNING *`,
       )
       .get(now) as Job | undefined;
@@ -134,6 +150,32 @@ export class JobStore {
     return 'queued';
   }
 
+  /**
+   * A running job the server stopped on purpose (it is shutting down) goes back to the queue, and
+   * the attempt does not count: a deploy is not a crash.
+   */
+  release(id: string): void {
+    this.db
+      .prepare(`UPDATE jobs SET status = 'queued', attempts = MAX(attempts - 1, 0), updated_at = ? WHERE id = ? AND status = 'running'`)
+      .run(Date.now(), id);
+  }
+
+  /**
+   * Runs a failed restore again under the same id, so it continues from its work folder. It keeps
+   * its place in the line and is not another restore for the daily limit. False when the job is
+   * not a failed restore or has used up its retries.
+   */
+  retry(id: string): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE jobs SET status = 'queued', attempts = 0, retries = retries + 1, phase = NULL, message = NULL, done = 0, queued = 0,
+           error = NULL, updated_at = ?, finished_at = NULL WHERE id = ? AND kind = 'restore' AND status = 'failed' AND retries < ?`,
+        )
+        .run(Date.now(), id, MAX_RETRIES).changes > 0
+    );
+  }
+
   /** After a restart, every job that was running counts as interrupted. */
   requeueRunning(): { requeued: number; failed: number } {
     const counts = { requeued: 0, failed: 0 };
@@ -170,10 +212,13 @@ export class JobStore {
     return Number(row.n);
   }
 
+  /** A scan or demo waits only for the scans and demos ahead of it; a full restore for every job ahead. */
   queuePosition(id: string): number {
     const job = this.get(id);
     if (!job || job.status !== 'queued') return 0;
-    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM jobs WHERE status = 'queued' AND created_at < ?`).get(job.created_at) as { n: number };
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM jobs WHERE status = 'queued' AND created_at < ?${isShort(job) ? ` AND ${SHORT}` : ''}`)
+      .get(job.created_at) as { n: number };
     return Number(row.n) + 1;
   }
 
