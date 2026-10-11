@@ -6,7 +6,9 @@
 // new host: scheme, "www.", port, fragment and analytics tracking parameters.
 
 const TRACKING = ['fbclid', 'gclid', 'dclid', 'gbraid', 'wbraid', 'msclkid', 'mc_cid', 'mc_eid', '_ga', '_gl', 'yclid'];
-const TRACKING_PARAM = new RegExp(`^(utm_[a-z0-9_]+|${TRACKING.join('|')})$`, 'i');
+/** Names of the parameters cleanSearch() drops, as a case-insensitive regular expression. */
+export const TRACKING_NAME = `utm_[a-z0-9_]+|${TRACKING.join('|')}`;
+const TRACKING_PARAM = new RegExp(`^(${TRACKING_NAME})$`, 'i');
 
 export function bareHost(host: string): string {
   return host.toLowerCase().replace(/\.$/, '').replace(/^www\d{0,3}\./, '');
@@ -145,13 +147,31 @@ export function decodePathBytes(pathname: string): Buffer {
   return Buffer.from(pathname.replace(/%([0-9a-f]{2})/gi, (_m, hex: string) => String.fromCharCode(parseInt(hex, 16))), 'latin1');
 }
 
+/** Apache and nginx merge repeated slashes before they look at a path: //a/b.png is /a/b.png. */
+export function mergeSlashes(pathname: string): string {
+  return pathname.replace(/\/{2,}/g, '/');
+}
+
+/**
+ * The address Apache and nginx look a path up by: slashes merged and escapes decoded to bytes (one
+ * character per byte). "/caf%E9.html", "/caf%e9.html" and "//caf%E9.html" are one address to them.
+ */
+export function serverPath(pathname: string): string {
+  return decodePathBytes(mergeSlashes(pathname)).toString('latin1');
+}
+
+/** The path as sent, with every escape in capitals: "%e9" and "%E9" are the same byte. */
+export function rawPathKey(pathname: string): string {
+  return pathname.replace(/%[0-9a-f]{2}/gi, (m) => m.toUpperCase());
+}
+
 /**
  * Regular expression (PCRE, unanchored) for a path as Apache and nginx match it: slashes merged,
  * escapes decoded, bytes outside printable ASCII written as \xHH. A Latin-1 path ("/caf%E9.html")
  * is the byte 0xE9 to the server, which a UTF-8 config file cannot hold as text.
  */
 export function pathBytesPattern(pathname: string): string {
-  return regexEscape(decodePathBytes(pathname.replace(/\/{2,}/g, '/')).toString('latin1')).replace(
+  return regexEscape(serverPath(pathname)).replace(
     /[\x00-\x1f\x7f-\xff]/g,
     (c) => '\\x' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'),
   );

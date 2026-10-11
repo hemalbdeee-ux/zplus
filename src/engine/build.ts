@@ -23,6 +23,7 @@ import {
   netlifyHeaders,
   netlifyRedirects,
   nginxConf,
+  pagesOverflow,
   type Redirect,
   type Route,
   type ServerRules,
@@ -35,7 +36,10 @@ import {
   hasNonUtf8Escapes,
   isInternal,
   makeRootRelative,
+  mergeSlashes,
   pathAndQuery,
+  rawPathKey,
+  serverPath,
   toUrl,
   tsToIso,
   unwrapWayback,
@@ -202,7 +206,20 @@ function plainFile(decoded: string, kind: Kind, ext: string, contentType: string
 
 /** Apache and nginx merge repeated slashes before they look at a path: //a/b.png is /a/b.png. */
 function sitePath(u: URL): string {
-  return u.pathname.replace(/\/{2,}/g, '/');
+  return mergeSlashes(u.pathname);
+}
+
+/**
+ * The address Apache and nginx answer this URL from: //a.php?x=1&fbclid=2 and /a.php?x=1 are one
+ * address, and so are /caf%e9.html and /caf%E9.html.
+ */
+function address(u: URL): string {
+  const query = cleanSearch(u.search);
+  return serverPath(u.pathname) + query;
+}
+
+function isPermanent(status: number): boolean {
+  return status === 301 || status === 308;
 }
 
 function charsetLabel(label: string | undefined): string | undefined {
@@ -263,13 +280,13 @@ export function planFiles(resources: Resource[], kinds: Map<string, Kind>): Plan
   const variants = new Map<string, Set<string>>();
   for (const r of content) {
     const u = new URL(r.url);
-    const set = variants.get(sitePath(u)) ?? new Set<string>();
+    const set = variants.get(serverPath(u.pathname)) ?? new Set<string>();
     set.add(r.sha1 ?? r.key);
-    variants.set(sitePath(u), set);
+    variants.set(serverPath(u.pathname), set);
   }
 
   const taken = new Map<string, Plan>();
-  const plainPaths = new Set<string>();
+  const owners = new Map<string, Plan>();
   const plans: Plan[] = [];
   const toRoute = (p: Plan, query?: string) => {
     const u = new URL(p.res.url);
@@ -286,14 +303,21 @@ export function planFiles(resources: Resource[], kinds: Map<string, Kind>): Plan
     const pathname = sitePath(u);
     const kind = kinds.get(r.key) ?? 'other';
     const query = cleanSearch(u.search).slice(1) || undefined;
-    // The server reads //a/b.png as /a/b.png, so one capture serves both: /a/b.png when it was
-    // archived too (shorter paths come first).
-    if (query === undefined && plainPaths.has(pathname)) continue;
-    if (query === undefined) plainPaths.add(pathname);
+    // The server reads //a/b.png as /a/b.png, so the first capture at an address serves every
+    // spelling of it (shorter paths come first). Another spelling with other bytes keeps them at
+    // its own raw path only, when the server can tell it apart (by its doubled slashes).
+    const first = owners.get(address(u));
+    if (first && ((first.res.sha1 ?? first.res.key) === (r.sha1 ?? r.key) || rawPathKey(new URL(first.res.url).pathname) === rawPathKey(u.pathname))) continue;
     const plan: Plan = { res: r, kind, file: '' };
     plans.push(plan);
+    if (first) {
+      toRoute(plan, query);
+      plan.route!.exact = true;
+      continue;
+    }
+    owners.set(address(u), plan);
 
-    const ignorableQuery = query !== undefined && kind !== 'html' && (variants.get(pathname)?.size ?? 0) <= 1;
+    const ignorableQuery = query !== undefined && kind !== 'html' && (variants.get(serverPath(u.pathname))?.size ?? 0) <= 1;
     if (query !== undefined && !ignorableQuery) {
       toRoute(plan, query);
       continue;
@@ -426,7 +450,9 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
   const types: TypeOverride[] = [];
   const cleaned = { wayback: 0, trackers: 0 };
   let phpLeftovers = 0;
-  const planByPath = new Map(plans.map((p) => [p.res.path, p]));
+  // Plans by the address a link reaches (//js/a.js and /js/a.js?fbclid=1 reach /js/a.js).
+  const planByAddress = new Map<string, Plan>();
+  for (const p of plans) if (!p.route?.exact && !planByAddress.has(address(new URL(p.res.url)))) planByAddress.set(address(new URL(p.res.url)), p);
   const siteCharsets = new Map<string, number>();
   const fileCharsets = new Map<string, Map<string, number>>();
   const count = (counts: Map<string, number>, charset: string) => counts.set(charset, (counts.get(charset) ?? 0) + 1);
@@ -453,7 +479,7 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
         const $el = $(el);
         if (el.tagName === 'link' && !/(^|\s)stylesheet(\s|$)/i.test($el.attr('rel') ?? '')) return;
         const u = toUrl($el.attr(el.tagName === 'link' ? 'href' : 'src') ?? '', pageUrl);
-        const target = u && isInternal(u, opts.domain) ? planByPath.get(pathAndQuery(u)) : undefined;
+        const target = u && isInternal(u, opts.domain) ? planByAddress.get(address(u)) : undefined;
         if (!target || (target.kind !== 'js' && target.kind !== 'css')) return;
         const own = charsetLabel($el.attr('charset'));
         const file = (target.sameAs ?? target).file;
@@ -493,51 +519,51 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
   for (const p of plans) if (p.sameAs) await write(p.file, await readFile(path.join(root, p.sameAs.file)));
   if (phpLeftovers) warnings.push(`${phpLeftovers} script(s) in .php pages contain "<?"; check them if your host runs PHP with short tags on.`);
 
-  // 4. Redirects the original site made.
+  // 4. Redirects the original site made. Like a capture (see planFiles), a redirect answers every
+  // spelling of its address, unless a page or another redirect already answers there: then it
+  // fires for its own raw path only (/r.php?id=2 is a page and //r.php?id=2 redirects).
   const queryPaths = new Set<string>();
   for (const r of manifest.resources) {
     const u = new URL(r.url);
-    if (cleanSearch(u.search)) queryPaths.add(sitePath(u));
+    if (cleanSearch(u.search)) queryPaths.add(serverPath(u.pathname));
   }
+  const answered = new Map<string, { raw: string; to?: string; permanent?: boolean }>();
+  for (const p of plans) if (!p.route?.exact) answered.set(address(new URL(p.res.url)), { raw: rawPathKey(new URL(p.res.url).pathname) });
   const redirects: Redirect[] = [];
-  const redirected = new Set<string>();
-  const singleSlash = new Set(manifest.resources.map((r) => pathAndQuery(new URL(r.url))));
-  for (const r of manifest.resources) {
-    if (r.status === 200 || !r.location) continue;
+  const exactDone = new Set<string>();
+  // The spelling the server reads as is goes first: it is the one the address belongs to.
+  const moved = manifest.resources.filter((r) => r.status !== 200 && r.location);
+  const merged = (r: Resource) => (sitePath(new URL(r.url)) === new URL(r.url).pathname ? 0 : 1);
+  for (const r of [...moved].sort((a, b) => merged(a) - merged(b))) {
     const u = new URL(r.url);
-    const loc = toUrl(r.location);
+    const loc = toUrl(r.location!);
     if (!loc) continue;
-    const to = isInternal(loc, opts.domain) ? pathAndQuery(loc) : loc.toString();
-    if (to === r.path) continue;
+    const internal = isInternal(loc, opts.domain);
+    // "//a.jpg" in a Location header names a host "a.jpg"; the server reads it as /a.jpg anyway.
+    const to = internal ? pathAndQuery(loc).replace(/^\/{2,}/, '/') : loc.toString();
+    const raw = rawPathKey(u.pathname);
+    const at = address(u);
+    // A redirect to its own address would loop (/a.php to /a.php?fbclid=1, %e9 to %E9); one to
+    // another spelling of it (//a.php to /a.php) is kept for that spelling only.
+    const self = internal && address(loc) === at;
+    if (self && rawPathKey(loc.pathname.replace(/^\/{2,}/, '/')) === raw) continue;
+    const owner = answered.get(at);
+    if (owner && (owner.raw === raw || (owner.to === to && owner.permanent === isPermanent(r.status)))) continue;
     const query = cleanSearch(u.search).slice(1) || undefined;
-    // //a.php and /a.php are one URL to the server: a redirect at //a.php would also catch /a.php.
-    const key = sitePath(u) + (query !== undefined ? '?' + query : '');
-    if (redirected.has(key) || (sitePath(u) !== u.pathname && singleSlash.has(key))) continue;
-    redirected.add(key);
+    const exact = self || owner !== undefined;
+    if (exact && exactDone.has(raw + '?' + (query ?? ''))) continue;
+    if (exact) exactDone.add(raw + '?' + (query ?? ''));
+    else answered.set(at, { raw, to, permanent: isPermanent(r.status) });
     redirects.push({
       path: decodePath(sitePath(u)),
       rawPath: u.pathname,
       query,
-      noQuery: query === undefined && queryPaths.has(sitePath(u)),
+      noQuery: query === undefined && queryPaths.has(serverPath(u.pathname)),
       to,
       status: r.status,
+      ...(exact ? { exact } : {}),
     });
   }
-
-  // nginx matches query routes and query redirects on the raw request, where //?p=1 is not /?p=1;
-  // Apache merges the slashes, and links to //?p=1 are written as /?p=1. So the merged address
-  // gets the same rule, unless it was archived itself. nginx map keys ignore letter case: a rule
-  // must not repeat another key in any case.
-  const keys = new Set(manifest.resources.map((r) => pathAndQuery(new URL(r.url)).toLowerCase()));
-  const withMerged = <T extends Route | Redirect>(x: T, byRawPath: boolean): T[] => {
-    const rawPath = x.rawPath.replace(/\/{2,}/g, '/');
-    const key = (rawPath + (x.query !== undefined ? '?' + x.query : '')).toLowerCase();
-    if (!byRawPath || rawPath === x.rawPath || keys.has(key)) return [x];
-    keys.add(key);
-    return [x, { ...x, rawPath }];
-  };
-  const serverRoutes = routes.flatMap((x) => withMerged(x, x.query !== undefined));
-  const serverRedirects = redirects.flatMap((d) => withMerged(d, d.query !== undefined || d.noQuery === true));
 
   // 5. Sitemaps, feed, robots.txt, 404 page.
   const indexable = pages.filter((pg) => !pg.noindex && pg.type !== 'archive' && (!pg.canonicalPath || pg.canonicalPath === pg.path));
@@ -565,15 +591,21 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
   }
   if (!takenFiles.has('404.html')) await write('404.html', notFoundPage(siteName, home ? pages.find((pg) => pg.path === '/')?.lang : undefined));
 
-  // 6. Server rules.
-  const rules: ServerRules = { domain: opts.domain, host: new URL(opts.siteUrl).host, routes: serverRoutes, redirects: serverRedirects, types };
+  // 6. Server rules. Cloudflare Pages needs the plain files to tell x.html next to a file x apart.
+  const plain = [...new Set(plans.filter((p) => !p.route).map((p) => p.file))];
+  const rules: ServerRules = { domain: opts.domain, host: new URL(opts.siteUrl).host, routes, redirects, types, files: plain };
+  const pagesRedirects = netlifyRedirects(rules);
+  const pagesHeaders = netlifyHeaders(rules);
   await write('.htaccess', htaccess(rules));
-  await write('_redirects', netlifyRedirects(rules));
-  await write('_headers', netlifyHeaders(rules));
-  await write(
-    '__wbd/routes.json',
-    JSON.stringify({ domain: opts.domain, siteUrl: opts.siteUrl, routes: serverRoutes, redirects: serverRedirects, types }, null, 1),
-  );
+  await write('_redirects', pagesRedirects);
+  await write('_headers', pagesHeaders);
+  const ignored = pagesOverflow(pagesRedirects, pagesHeaders);
+  if (ignored) {
+    warnings.push(
+      `Cloudflare Pages reads at most 2,000 plain and 100 pattern rules from _redirects and 100 rules from _headers; ${ignored} rule(s) of this site are past that, so some original URLs would redirect or fail there. Netlify, Apache, LiteSpeed and nginx are not affected.`,
+    );
+  }
+  await write('__wbd/routes.json', JSON.stringify({ domain: opts.domain, siteUrl: opts.siteUrl, routes, redirects, types }, null, 1));
   await writeFile(path.join(opts.serverDir, 'nginx.conf'), nginxConf(rules));
 
   log(`wrote ${files} files (${(bytes / 1024 / 1024).toFixed(1)} MB): ${pages.length} pages, ${routes.length} rewrites, ${redirects.length} original redirects`);

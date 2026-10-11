@@ -363,7 +363,8 @@ describe('build: doubled slashes in a path', () => {
     ]);
     assert.equal(files['//double/slash.png'], 'double/slash.png');
     assert.equal(files['/a.png'], 'a.png');
-    assert.equal(files['//a.png'], undefined);
+    // Other bytes than /a.png: kept for the doubled-slash spelling only.
+    assert.match(files['//a.png'], /^__wbd\/f\/[0-9a-f]{12}\.png <- path$/);
     assert.match(files['//index.php?page=x'], /^__wbd\/q\/.+ <- page=x$/);
     const kinds = new Map([[urlKey(new URL('http://example.com//index.php?page=x')), 'html' as const]]);
     const [routed] = planFiles([res('http://example.com//index.php?page=x', 'text/html', 'q')], kinds);
@@ -378,9 +379,10 @@ describe('build: doubled slashes in a path', () => {
     // Apache and nginx turn //double/slash.png into /double/slash.png before they look for it.
     assert.match((await get('/double/slash.png')).text, /MARK\[double\]/);
     assert.match((await read('index.html')).toString('utf8'), /<img id="i" src="\/double\/slash\.png">/);
-    // The redirect at //old.php would also catch the page at /old.php.
-    assert.deepEqual(result.redirects, []);
+    // The redirect at //old.php must not catch the page at /old.php: it fires for //old.php only.
+    assert.deepEqual(result.redirects.map((d) => [d.rawPath, d.exact]), [['//old.php', true]]);
     assert.match((await get('/old.php')).text, /MARK\[old\]/);
+    assert.equal((await get('//old.php')).status, 301);
   });
 
   it('answers query URLs and redirects at the merged address too', async () => {
@@ -401,18 +403,15 @@ describe('build: doubled slashes in a path', () => {
     const html = (await read('index.html')).toString('utf8');
     assert.match(html, /<a id="p" href="\/\?p=123">/);
     assert.match(html, /<a id="l" href="\/list\.php">/);
+    // One rule per address the server reads; ///?p=123 has other bytes than //?p=123, so it keeps
+    // a rule for its own spelling.
     const rules = JSON.parse((await read('__wbd/routes.json')).toString('utf8')) as { routes: Route[]; redirects: Redirect[] };
-    const key = (x: Route | Redirect) => x.rawPath + (x.query !== undefined ? '?' + x.query : '');
-    assert.deepEqual(rules.routes.map(key).sort(), [
-      '///?p=123', '//?p=123', '//Both.php?x=1', '//index.php?page_id=5', '//list.php?p=2',
-      '/?p=123', '/both.php?x=1', '/index.php?page_id=5', '/list.php?p=2',
-    ]);
-    assert.deepEqual(rules.redirects.map(key).sort(), ['//go.php?id=1', '//list.php', '/go.php?id=1', '/list.php']);
-    // No two server keys may differ only in letter case (nginx map keys ignore it).
-    const all = [...rules.routes, ...rules.redirects].map((x) => key(x).toLowerCase());
-    assert.equal(new Set(all).size, all.length);
-    // The report lists what the original site had.
+    const key = (x: Route | Redirect) => x.rawPath + (x.query !== undefined ? '?' + x.query : '') + (x.exact ? ' exact' : '');
+    assert.deepEqual(rules.routes.map(key).sort(), ['///?p=123 exact', '//?p=123', '//Both.php?x=1', '//index.php?page_id=5', '//list.php?p=2', '/both.php?x=1']);
+    assert.deepEqual(rules.redirects.map(key).sort(), ['//go.php?id=1', '//list.php']);
     assert.deepEqual(result.redirects.map(key).sort(), ['//go.php?id=1', '//list.php']);
+    assert.match((await get('///?p=123')).text, /MARK\[post123b\]/);
+    assert.match((await get('/Both.php?x=1')).text, /MARK\[Both\]/);
     assert.match((await get('/?p=123')).text, /MARK\[post123\]/);
     assert.match((await get('/index.php?page_id=5')).text, /MARK\[page5\]/);
     assert.match((await get('/index.php')).text, /MARK\[indexphp\]/);
