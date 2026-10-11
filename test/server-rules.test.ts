@@ -63,11 +63,11 @@ describe('Apache rules for odd archived paths', () => {
       assert.equal(rule.rest.trim(), '');
       assert.ok(!new RegExp(rule.args[0]).test(x.path.slice(1) + 'z'));
     }
-    const cond = lines.find((l) => l.startsWith('RewriteCond %{QUERY_STRING} "^a'));
+    const cond = lines.find((l) => l.startsWith('RewriteCond %{ENV:WBD_QUERY} "^&a'));
     assert.ok(cond);
     const { args } = rewriteArgs(cond.slice(12));
     assert.equal(args.length, 2);
-    assert.ok(new RegExp(args[1]).test('a="b"'));
+    assert.ok(new RegExp(args[1]).test('&a="b"&'));
   });
 
   it('keeps folder URLs off the route of their own index.html', () => {
@@ -170,8 +170,8 @@ describe('nginx rules', () => {
   it('matches every key case-sensitively, with no limit on its length', () => {
     assert.equal(entries.length, siteRoutes.length + siteRedirects.length);
     const keys = [
-      ...siteRoutes.map((x) => (x.query !== undefined ? `${x.rawPath}?${x.query}` : x.path)),
-      ...siteRedirects.map((d) => (d.noQuery ? d.rawPath : d.path)),
+      ...siteRoutes.map((x) => (x.query !== undefined ? `${x.rawPath}?&${x.query}&` : x.path)),
+      ...siteRedirects.map((d) => (d.noQuery ? d.rawPath + '?&' : d.path)),
     ];
     for (const [key] of entries) {
       // "~" is a case-sensitive regex; plain strings go into a case-insensitive, size-limited hash.

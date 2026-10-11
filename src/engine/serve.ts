@@ -8,7 +8,7 @@ import http from 'node:http';
 import path from 'node:path';
 import type { Redirect, Route } from './serverconfig.ts';
 import { HTML_LIKE_EXT } from './serverconfig.ts';
-import { cleanSearch, decodePath } from './url.ts';
+import { decodePath, hasNonUtf8Escapes, mergeSlashes, rawPathKey, ruleQuery, serverPath } from './url.ts';
 
 const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -38,14 +38,28 @@ interface RoutesFile {
   redirects: Redirect[];
 }
 
+/**
+ * Rules keyed the way the generated .htaccess and nginx.conf compare them: by the address the server
+ * reads (slashes merged, escapes decoded to bytes) or, for an exact rule, by the raw path, plus
+ * "?" and the query without tracking parameters for a rule that looks at the query. The first rule
+ * for a key wins, as in Apache.
+ */
+function ruleMap<T extends Route | Redirect>(list: T[]): Map<string, T> {
+  const map = new Map<string, T>();
+  for (const x of list) {
+    const p = x.exact ? 'raw:' + rawPathKey(x.rawPath) : 'path:' + serverPath(x.rawPath);
+    const key = x.query !== undefined ? `${p}?${x.query}` : 'noQuery' in x && x.noQuery ? `${p}?` : p;
+    if (!map.has(key)) map.set(key, x);
+  }
+  return map;
+}
+
 export async function createPreviewServer(siteDir: string): Promise<http.Server> {
   const root = path.resolve(siteDir);
   const rulesFile = path.join(root, '__wbd', 'routes.json');
   const rules: RoutesFile = existsSync(rulesFile) ? JSON.parse(await readFile(rulesFile, 'utf8')) : { routes: [], redirects: [] };
-  const queryRoutes = new Map(rules.routes.filter((r) => r.query !== undefined).map((r) => [`${r.rawPath}?${r.query}`, r.file]));
-  const pathRoutes = new Map(rules.routes.filter((r) => r.query === undefined).map((r) => [r.path, r.file]));
-  const queryRedirects = new Map(rules.redirects.filter((r) => r.query !== undefined).map((r) => [`${r.rawPath}?${r.query}`, r]));
-  const pathRedirects = new Map(rules.redirects.filter((r) => r.query === undefined).map((r) => [r.path, r]));
+  const redirects = ruleMap(rules.redirects);
+  const routes = ruleMap(rules.routes);
 
   const isFile = (rel: string) => {
     const abs = path.resolve(root, '.' + rel);
@@ -57,11 +71,6 @@ export async function createPreviewServer(siteDir: string): Promise<http.Server>
   };
 
   return http.createServer((req, res) => {
-    const url = new URL(req.url ?? '/', 'http://preview.local');
-    const rawPath = url.pathname;
-    const query = cleanSearch(url.search).slice(1);
-    const decoded = decodePath(rawPath);
-
     const send = (abs: string, status = 200) => {
       res.writeHead(status, { 'content-type': TYPES[path.extname(abs).toLowerCase()] ?? 'application/octet-stream' });
       createReadStream(abs).pipe(res);
@@ -79,25 +88,45 @@ export async function createPreviewServer(siteDir: string): Promise<http.Server>
       }
     };
 
+    // Joined, not resolved: "//x" is a path here, as for Apache and nginx, not a host.
+    const target = req.url ?? '/';
+    const url = URL.parse(target.startsWith('/') ? 'http://preview.local' + target : target);
+    if (!url) {
+      res.writeHead(400, { 'content-type': 'text/plain' });
+      return res.end('Bad request');
+    }
+    const rawPath = url.pathname;
+    const merged = mergeSlashes(rawPath);
+    // undefined: too many runs of tracking parameters and empty segments for the server rules.
+    const query = ruleQuery(url.search);
+    // Exact rules first, then those that look at the query, then path-only ones (nginx.conf order).
+    const find = <T>(map: Map<string, T>) => {
+      for (const p of ['raw:' + rawPathKey(rawPath), 'path:' + serverPath(rawPath)]) {
+        const hit = (query !== undefined ? map.get(`${p}?${query}`) : undefined) ?? map.get(p);
+        if (hit) return hit;
+      }
+      return undefined;
+    };
+
+    const decoded = decodePath(merged);
     if (decoded.startsWith('/__wbd/')) return notFound();
 
-    const qr = query ? queryRedirects.get(`${rawPath}?${query}`) : undefined;
-    if (qr) return redirect(qr.status === 301 || qr.status === 308 ? 301 : 302, qr.to);
-    const pr = pathRedirects.get(decoded);
-    if (pr && (!pr.noQuery || !query)) return redirect(pr.status === 301 || pr.status === 308 ? 301 : 302, pr.to);
-
-    const routed = (query && queryRoutes.get(`${rawPath}?${query}`)) || pathRoutes.get(decoded);
+    const moved = find(redirects);
+    if (moved) return redirect(moved.status === 301 || moved.status === 308 ? 301 : 302, moved.to);
+    const routed = find(routes);
     if (routed) {
-      const abs = isFile('/' + routed);
+      const abs = isFile('/' + routed.file);
       return abs ? send(abs) : notFound();
     }
 
+    // No file is named with bytes that are not UTF-8 ("/caf%E9.html"): those URLs are routes.
+    if (hasNonUtf8Escapes(merged)) return notFound();
     const direct = !decoded.endsWith('/') && isFile(decoded);
     if (direct) return send(direct);
     const withHtml = !decoded.endsWith('/') && isFile(decoded + '.html');
     if (withHtml) return send(withHtml);
     if (isDir(decoded)) {
-      if (!decoded.endsWith('/')) return redirect(301, rawPath + '/' + (url.search || ''));
+      if (!decoded.endsWith('/')) return redirect(301, merged + '/' + (url.search || ''));
       const index = isFile(decoded + 'index.html') ?? isFile(decoded + 'index.xml');
       if (index) return send(index);
     }

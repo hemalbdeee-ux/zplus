@@ -35,13 +35,43 @@ function decodeSafe(s: string): string {
 /** Query string without tracking parameters, order and encoding kept. Returns '' or '?a=b'. */
 export function cleanSearch(search: string): string {
   if (!search || search === '?') return '';
-  // Names are compared as written (no tool escapes "utm_source"), so that queryPattern() can say
-  // in a server rule exactly what this function does.
-  const parts = search
-    .slice(1)
-    .split('&')
-    .filter((p) => p !== '' && !TRACKING_PARAM.test(p.split('=')[0]));
+  // Names are compared as written (no tool escapes "utm_source"), so that droppedRunPattern() can
+  // say in a server rule exactly what this function does.
+  const parts = search.slice(1).split('&').filter((p) => !dropped(p));
   return parts.length ? '?' + parts.join('&') : '';
+}
+
+/** A query segment cleanSearch() leaves out: empty, or a tracking parameter. */
+function dropped(segment: string): boolean {
+  return segment === '' || TRACKING_PARAM.test(segment.split('=')[0]);
+}
+
+/**
+ * Server rules drop the segments cleanSearch() leaves out one run at a time (a run: segments next
+ * to each other, as in "a=1&&&fbclid=x&b=2"), this many times and no more, so that a crafted query
+ * of thousands of runs costs a few scans of it instead of one per run or per rule.
+ */
+export const QUERY_PASSES = 16;
+
+/**
+ * The query (without "?") that server rules compare with a rule's own: cleanSearch(), or undefined
+ * when the query has more than QUERY_PASSES runs to drop, which no rule matches.
+ */
+export function ruleQuery(search: string): string | undefined {
+  const segments = search.replace(/^\?/, '').split('&');
+  const runs = segments.filter((s, i) => dropped(s) && (i === 0 || !dropped(segments[i - 1]))).length;
+  return runs > QUERY_PASSES ? undefined : cleanSearch(search).slice(1);
+}
+
+/**
+ * One pass of the server rules (PCRE, case-insensitive, possessive so that it scans the subject
+ * once): on "&" + query + "&" with every segment followed by "&", $1 + $2 leaves out the first run
+ * of segments cleanSearch() drops. After the last run is gone, "&" + cleaned query + "&" is left,
+ * or "&" for none.
+ */
+export function droppedRunPattern(): string {
+  const segment = `(?:(?:utm_[a-z0-9_]++|${TRACKING.join('|')})(?:=[^&]*+)?)?&`;
+  return `^(&(?:(?!${segment})[^&]++&)*+)(?:${segment})++(.*)$`;
 }
 
 function regexEscape(s: string): string {
@@ -51,8 +81,8 @@ function regexEscape(s: string): string {
 /**
  * Regular expression (the same in PCRE and JavaScript) for exactly the raw query strings that
  * cleanSearch() turns into `query` ('' for none): empty segments and tracking parameters may sit
- * anywhere. Server rules need it because the archived URL (and a visitor's click with ?fbclid=)
- * carries the raw query, while routes and redirects are keyed by the cleaned one.
+ * anywhere. The archived URL (and a visitor's click with ?fbclid=) carries the raw query, while
+ * routes and redirects are keyed by the cleaned one.
  */
 export function queryPattern(query: string): string {
   // No (?i) group: Node 22 lacks it, and parameter values must keep their case.
@@ -145,13 +175,31 @@ export function decodePathBytes(pathname: string): Buffer {
   return Buffer.from(pathname.replace(/%([0-9a-f]{2})/gi, (_m, hex: string) => String.fromCharCode(parseInt(hex, 16))), 'latin1');
 }
 
+/** Apache and nginx merge repeated slashes before they look at a path: //a/b.png is /a/b.png. */
+export function mergeSlashes(pathname: string): string {
+  return pathname.replace(/\/{2,}/g, '/');
+}
+
+/**
+ * The address Apache and nginx look a path up by: slashes merged and escapes decoded to bytes (one
+ * character per byte). "/caf%E9.html", "/caf%e9.html" and "//caf%E9.html" are one address to them.
+ */
+export function serverPath(pathname: string): string {
+  return decodePathBytes(mergeSlashes(pathname)).toString('latin1');
+}
+
+/** The path as sent, with every escape in capitals: "%e9" and "%E9" are the same byte. */
+export function rawPathKey(pathname: string): string {
+  return pathname.replace(/%[0-9a-f]{2}/gi, (m) => m.toUpperCase());
+}
+
 /**
  * Regular expression (PCRE, unanchored) for a path as Apache and nginx match it: slashes merged,
  * escapes decoded, bytes outside printable ASCII written as \xHH. A Latin-1 path ("/caf%E9.html")
  * is the byte 0xE9 to the server, which a UTF-8 config file cannot hold as text.
  */
 export function pathBytesPattern(pathname: string): string {
-  return regexEscape(decodePathBytes(pathname.replace(/\/{2,}/g, '/')).toString('latin1')).replace(
+  return regexEscape(serverPath(pathname)).replace(
     /[\x00-\x1f\x7f-\xff]/g,
     (c) => '\\x' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'),
   );
