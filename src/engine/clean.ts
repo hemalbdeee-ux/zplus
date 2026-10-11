@@ -65,7 +65,21 @@ const TRACKER_LOADER = new RegExp(`${TRACKER_SRC.source}|GoogleAnalyticsObject|_
 const TRACKER_URL = (s: string) => (s.includes('/') && TRACKER_SRC.test(s)) || /\b(?:matomo|piwik)\.(?:js|php)\b/i.test(s);
 const IIFE = /^(?:[(!+~]|void\s)\s*(?:function\b|\(|async\b)/;
 // What a loader's function does: declare and assign, find and insert the script tag, queue calls.
-const LOADER_STEP = /^(?:(?:var|let|const)\s|(?:return|break|continue|if|try)\b|[\w$.[\]'"]+\s*=(?!=)|[^;{}]*?\.(?:push|insertBefore|appendChild|write|writeln)\s*\()/;
+// An if, try or loop in it is a step when what it holds is (isLoaderStep).
+const LOADER_STEP = /^(?:(?:var|let|const)\s|[\w$.[\]'"]+\s*=(?!=)|[^;{}]*?\.(?:push|insertBefore|appendChild|write|writeln)\s*\()/;
+const JUMP = /^(?:return|break|continue)\b[^;{}()]*$/;
+// What a loader calls as it runs: make and insert the script tag, queue the first hits, read the
+// date or the page's address. Calls in the functions it defines run later, from the tracker.
+const LOADER_CALL =
+  /^(?:createElement|getElementsByTagName|getElementById|querySelector|insertBefore|appendChild|setAttribute|addEventListener|attachEvent|write|writeln|push|Date|getTime|now|random|floor|round|escape|unescape|encodeURIComponent|encodeURI|indexOf|toString|String|Number|parseInt|replace|split|join|slice|substring|substr|toLowerCase|test|match|apply|call)$/;
+const NOT_CALLEE = /^(?:if|for|while|switch|catch|with|function|return|typeof|void|delete|in|of|instanceof|new|await|yield|case|do|else|throw)$/;
+// Yandex's watch.js runs its own insert function f now or on DOMContentLoaded: f(); d.addEventListener('...', f, false).
+const LOCAL_CALL = /^(?:[\w$.]+\.(?:addEventListener|attachEvent)\(\s*(['"])\w+\1\s*,\s*([\w$]+)\s*(?:,\s*\w+\s*)?|([\w$]+)\(\s*)\)$/;
+// A link to a tracker's site (a stats badge) loads nothing from it.
+const HREF = /\bhref\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/gi;
+const loadsFrom = (s: string) => TRACKER_URL(s.replace(HREF, ''));
+// /* ... */ and // ... comments, but not the // of a URL in a string ('https://', '//host', src=//host).
+const COMMENTS = /\/\*[\s\S]*?\*\/|(^|[^:'"\\=])\/\/.*$/gm;
 // How deep the search for a loader goes into blocks: callbacks, if bodies, functions.
 const MAX_DEPTH = 6;
 const TRACKER_CALL = /^(?:window\.)?(?:ga|gtag|fbq|ym|hj|__gaTracker|urchinTracker|(?:_gaq|_paq|_hmt|_qevents|dataLayer|clicky_site_ids)\.push|pageTracker\.\w+|clicky\.init)\s*\(/;
@@ -108,6 +122,17 @@ function templateEnd(code: string, i: number, depth = 0): number {
     }
   }
   return -1;
+}
+
+/** Is toks[k] one of these keywords, and not a property such as Symbol.for or promise.catch? */
+const isKeyword = (toks: Tok[], k: number, words: RegExp) => toks[k].kind === 'w' && words.test(toks[k].v) && toks[k - 1]?.v !== '.';
+const endsExpression = (t: Tok) => t.kind === 's' || (t.kind === 'w' && !EXPR_KEYWORDS.has(t.v)) || /^[)\]}]$/.test(t.v);
+
+/** Do the tokens end with ++ or --? A / after n++ divides; it does not start a regex. */
+function postfix(out: Tok[]): boolean {
+  const a = out[out.length - 2];
+  const b = out[out.length - 1];
+  return !!a && (b.v === '+' || b.v === '-') && a.v === b.v && a.end === b.start;
 }
 
 /** A rough JavaScript tokenizer: enough to find statements; null when the code does not lex. */
@@ -153,7 +178,7 @@ function jsTokens(code: string): Tok[] | null {
       }
       if (i++ >= code.length) return null;
       kind = 's';
-    } else if (c === '/' && (!prev || (prev.kind === 'w' ? EXPR_KEYWORDS.has(prev.v) : prev.kind === 'p' && !/[)\]}]/.test(prev.v)))) {
+    } else if (c === '/' && (!prev || (prev.kind === 'w' ? EXPR_KEYWORDS.has(prev.v) : prev.kind === 'p' && !/[)\]}]/.test(prev.v) && !postfix(out)))) {
       let inClass = false;
       for (i++; i < code.length && (inClass || code[i] !== '/'); i++) {
         if (code[i] === '\\') i++;
@@ -174,23 +199,74 @@ function jsTokens(code: string): Tok[] | null {
   return out;
 }
 
-/** Does token t, at the top level, start a new statement after the tokens of the current one? */
-function startsStatement(cur: Tok[], t: Tok): boolean {
-  const last = cur[cur.length - 1];
-  if (t.kind === 'p' && t.v !== '!' && t.v !== '~') return false; // ( [ . + = ... continue an expression
-  if (t.kind === 'w' && /^(?:else|catch|finally|in|instanceof|of)$/.test(t.v)) return false;
-  if (t.v === 'while' && cur[0].v === 'do') return false;
-  const ends = last.kind === 's' || (last.kind === 'w' && !EXPR_KEYWORDS.has(last.v)) || /^[)\]}]$/.test(last.v);
-  if (!ends || !(t.nl || last.v === '}')) return false;
-  // if (x) / for (...) / while (x) followed by its body on the next line.
-  if (last.v === ')' && /^(?:if|for|while|with)$/.test(cur[0].v)) {
-    let depth = 0;
-    for (let k = 1; k < cur.length; k++) {
-      if (cur[k].v === '(') depth++;
-      else if (cur[k].v === ')' && --depth === 0) return k !== cur.length - 1;
-    }
+/** Index of the bracket that closes the one at toks[k], or -1. */
+function closing(toks: Tok[], k: number): number {
+  for (let depth = 0; k < toks.length; k++) {
+    if (toks[k].kind !== 'p') continue;
+    if ('([{'.includes(toks[k].v)) depth++;
+    else if (')]}'.includes(toks[k].v) && --depth === 0) return k;
   }
-  return true;
+  return -1;
+}
+
+/** Index of the bracket that opens the one that closes at toks[k], or -1. */
+function opening(toks: Tok[], k: number): number {
+  for (let depth = 0; k >= 0; k--) {
+    if (toks[k].kind !== 'p') continue;
+    if (')]}'.includes(toks[k].v)) depth++;
+    else if ('([{'.includes(toks[k].v) && --depth === 0) return k;
+  }
+  return -1;
+}
+
+type BodyEnd = '' | 'statement' | 'do' | 'arrow';
+
+/**
+ * What the { at cur[open] opens: the body of a statement (a block, if, loop, try, switch, or a
+ * function or class declaration), the body of a do-while or of an arrow function, or an
+ * expression (an object literal, a function expression's body).
+ */
+function bodyKind(cur: Tok[], open: number): BodyEnd {
+  if (open === 0) return 'statement';
+  const prev = cur[open - 1];
+  if (prev.kind === 'w') {
+    if (prev.v === 'do') return 'do';
+    if (/^(?:else|try|finally|catch)$/.test(prev.v)) return 'statement';
+    return cur[0].v === 'class' && cur.findIndex((t) => t.v === '{') === open ? 'statement' : '';
+  }
+  if (prev.v === '>' && cur[open - 2]?.v === '=' && cur[open - 2].end === prev.start) return 'arrow';
+  if (open === 2 && prev.v === ':' && cur[0].kind === 'w') return 'statement'; // label: { ... }
+  if (prev.v !== ')') return '';
+  const p = opening(cur, open - 1);
+  if (p > 0 && isKeyword(cur, p - 1, /^(?:if|for|while|with|switch|catch)$/)) return 'statement';
+  // function name(...) { at the start of the statement declares the function.
+  let k = cur[0].v === 'async' ? 1 : 0;
+  if (cur[k]?.v !== 'function') return '';
+  if (cur[++k]?.v === '*') k++;
+  return cur[k]?.kind === 'w' && k + 1 === p ? 'statement' : '';
+}
+
+/** Does token t, at the top level, start a new statement after the tokens of the current one? */
+function startsStatement(cur: Tok[], t: Tok, bodyEnd: BodyEnd, next: Tok | undefined): boolean {
+  const last = cur[cur.length - 1];
+  if (t.v === ';') return false;
+  if (t.kind === 'w' && /^(?:else|catch|finally|in|instanceof|of)$/.test(t.v)) return false;
+  if (t.v === 'while' && (bodyEnd === 'do' || cur[0].v === 'do')) return false;
+  // A function declaration or a block statement ends at its closing }, so even a ( or [ after it
+  // starts the next statement. Nothing can call an arrow function's body either, though a comma
+  // or the : of a ?: can follow it.
+  if (bodyEnd === 'statement' || bodyEnd === 'do' || (bodyEnd === 'arrow' && t.nl && t.v !== ',' && t.v !== ':')) return true;
+  // The ) of if (x), for (...) or while (x) comes before its body, maybe on the next line; the ) of
+  // do { ... } while (x) ends the statement.
+  const head = last.v === ')' ? opening(cur, cur.length - 1) : -1;
+  if (head > 0 && cur[head - 1].v === 'while' && (cur[head - 2]?.v === '}' ? cur[opening(cur, head - 2) - 1]?.v === 'do' : cur[0].v === 'do')) return true;
+  if (head > 0 && isKeyword(cur, head - 1, /^(?:if|for|while|with)$/)) return false;
+  // return, break and continue end at a line break; so does the expression before a ++ or -- there.
+  if (t.nl && last.kind === 'w' && /^(?:return|break|continue)$/.test(last.v)) return true;
+  const ends = endsExpression(last) || (postfix(cur) && !!cur[cur.length - 3] && endsExpression(cur[cur.length - 3]));
+  if (ends && t.nl && (t.v === '+' || t.v === '-') && next?.v === t.v && next.start === t.end) return true;
+  if (t.kind === 'p' && t.v !== '!' && t.v !== '~') return false; // ( [ . + = ... continue an expression
+  return ends && (t.nl || (last.v === '}' && t.v !== 'from')); // import { a } from 'b'
 }
 
 /** The top-level statements of a script (each with its own tokens), or null when it cannot be split. */
@@ -199,22 +275,31 @@ function statements(code: string): Tok[][] | null {
   if (!toks) return null;
   const out: Tok[][] = [];
   let cur: Tok[] = [];
-  let depth = 0;
-  for (const t of toks) {
-    if (depth === 0 && cur.length && startsStatement(cur, t)) {
-      out.push(cur);
-      cur = [];
+  const opens: number[] = []; // where in cur each open bracket is
+  let bodyEnd: BodyEnd = '';
+  for (const [i, t] of toks.entries()) {
+    if (!opens.length) {
+      // if (a) x(); else y(); and do x(); while (y); are one statement each.
+      if (!cur.length && out.length && (t.v === 'else' || (t.v === 'while' && out[out.length - 1][0].v === 'do' && !out[out.length - 1].some((x) => x.v === 'while')))) cur = out.pop()!;
+      else if (cur.length && startsStatement(cur, t, bodyEnd, toks[i + 1])) {
+        out.push(cur);
+        cur = [];
+      }
     }
     cur.push(t);
+    bodyEnd = '';
     if (t.kind !== 'p') continue;
-    if ('([{'.includes(t.v)) depth++;
-    else if (')]}'.includes(t.v) && --depth < 0) return null;
-    else if (t.v === ';' && depth === 0) {
-      out.push(cur);
+    if ('([{'.includes(t.v)) opens.push(cur.length - 1);
+    else if (')]}'.includes(t.v)) {
+      const open = opens.pop();
+      if (open === undefined) return null;
+      if (t.v === '}' && !opens.length) bodyEnd = bodyKind(cur, open);
+    } else if (t.v === ';' && !opens.length) {
+      if (cur.length > 1) out.push(cur); // a lone ; is an empty statement
       cur = [];
     }
   }
-  if (depth !== 0) return null;
+  if (opens.length) return null;
   if (cur.length) out.push(cur);
   return out;
 }
@@ -248,26 +333,143 @@ function loopBody(code: string, st: Tok[]): string | null {
   return braced ? code.slice(body[0].end, body[body.length - 1].start) : code.slice(body[0].start, body[body.length - 1].end);
 }
 
-function isLoaderStep(code: string, st: Tok[], depth = 0): boolean {
-  // Yandex's tag first checks whether the page has it already: for (...) { if (s.src === r) return; }
-  if (st[0].v === 'for' || st[0].v === 'while') {
-    const body = depth < 2 ? loopBody(code, st) : null; // no snippet nests loops deeper
-    const inner = body === null ? null : statements(body);
-    return body !== null && !!inner && inner.every((s) => isLoaderStep(body, s, depth + 1));
+type Part = { body: string; start: number; braced: boolean };
+
+/** The branches of an if statement (if, else if, else) and where each starts; null when it cannot tell. */
+function ifBranches(code: string, st: Tok[]): Part[] | null {
+  const out: Part[] = [];
+  const end = st.length > 1 && st[st.length - 1].v === ';' ? st.length - 1 : st.length;
+  // The branch that starts at st[k], a block or one statement up to its else; its last token.
+  const branch = (k: number): number => {
+    // A nested if or loop without braces leaves open whose else comes next.
+    if (k >= end || /^(?:if|for|while|do|with|try|switch)$/.test(st[k].v)) return -1;
+    let stop = k;
+    if (st[k].v === '{') stop = closing(st, k);
+    else {
+      for (let depth = 0; stop < end - 1; stop++) {
+        const v = st[stop].kind === 'p' ? st[stop].v : '';
+        if (v && '([{'.includes(v)) depth++;
+        else if (v && ')]}'.includes(v)) depth--;
+        if (depth === 0 && st[stop + 1].v === 'else') break;
+      }
+    }
+    if (stop < 0 || stop >= end) return -1;
+    const braced = st[k].v === '{';
+    out.push(braced ? { body: code.slice(st[k].end, st[stop].start), start: st[k].end, braced } : { body: code.slice(st[k].start, st[stop].end), start: st[k].start, braced });
+    return stop;
+  };
+  for (let k = 0; ; ) {
+    if (st[k]?.v !== 'if' || st[k + 1]?.v !== '(') return null;
+    const stop = branch(closing(st, k + 1) + 1);
+    if (stop < 0) return null;
+    k = stop + 1;
+    if (k >= end) return out;
+    if (st[k].v !== 'else') return null;
+    if (st[++k]?.v !== 'if') return branch(k) === end - 1 ? out : null;
   }
-  return LOADER_STEP.test(textOf(code, st));
+}
+
+/** Does every statement in each part pass the test? */
+function everyStatement(parts: Array<{ body: string }>, ok: (code: string, st: Tok[]) => boolean): boolean {
+  return parts.every((p) => {
+    const list = statements(p.body);
+    return !!list && list.every((st) => ok(p.body, st));
+  });
+}
+
+/** return, break or continue, or an if that does nothing else. */
+function isJump(code: string, st: Tok[], depth = 0): boolean {
+  if (st[0].v !== 'if') return JUMP.test(textOf(code, st));
+  const branches = depth < 3 ? ifBranches(code, st) : null;
+  return !!branches && everyStatement(branches, (c, s) => isJump(c, s, depth + 1));
+}
+
+/** Names that the statements declare with var, let, const or function. */
+function declared(list: Tok[][]): Set<string> {
+  const names = new Set<string>();
+  for (const st of list) {
+    if (st[0].v === 'function' && st[1]?.kind === 'w') names.add(st[1].v);
+    if (!/^(?:var|let|const)$/.test(st[0].v)) continue;
+    let depth = 0;
+    for (let k = 1; k < st.length; k++) {
+      const t = st[k];
+      if (t.kind === 'w' && depth === 0 && (k === 1 || st[k - 1].v === ',')) names.add(t.v);
+      if (t.kind !== 'p') continue;
+      if ('([{'.includes(t.v)) depth++;
+      else if (')]}'.includes(t.v)) depth--;
+    }
+  }
+  return names;
+}
+
+/** Is st a statement of a loader's function? locals are the names that function declares. */
+function isLoaderStep(code: string, st: Tok[], locals: Set<string>, depth = 0): boolean {
+  const head = st[0].v;
+  // A loop only checks whether the page has the tracker already (Yandex):
+  // for (...) { if (document.scripts[j].src === r) { return; } }
+  if (head === 'for' || head === 'while') {
+    const body = depth < 2 ? loopBody(code, st) : null; // no snippet nests loops deeper
+    return body !== null && everyStatement([{ body }], isJump);
+  }
+  // The branches of an if and the blocks of a try hold steps too, not the site's own code:
+  // if (!f._fbq) f._fbq = n; but not if (nav) { initDropdowns(nav); }
+  if (head === 'if' || head === 'try') {
+    const parts = depth < 3 ? (head === 'if' ? ifBranches(code, st) : blocks(code, st)) : null;
+    return !!parts && parts.length > 0 && everyStatement(parts, (c, s) => isLoaderStep(c, s, locals, depth + 1));
+  }
+  const text = textOf(code, st);
+  const call = LOCAL_CALL.exec(text);
+  const step = JUMP.test(text) || LOADER_STEP.test(text) || (!!call && locals.has(call[2] ?? call[3]));
+  return step && loaderCallsOnly(st, locals);
+}
+
+/** Does the statement call only what a loader calls (LOADER_CALL) and the loader's own functions? */
+function loaderCallsOnly(st: Tok[], locals: Set<string>): boolean {
+  for (let k = 0; k < st.length; k++) {
+    const t = st[k];
+    // The body of a function it defines: function (...) { ... } and () => { ... }
+    if (t.v === 'function' && t.kind === 'w') {
+      let j = k + 1;
+      if (st[j]?.v === '*') j++;
+      if (st[j]?.kind === 'w') j++;
+      if (st[j]?.v !== '(') return false;
+      j = closing(st, j) + 1;
+      if (st[j]?.v !== '{') return false;
+      k = closing(st, j);
+      if (k < 0) return false;
+    } else if (t.v === '>' && st[k - 1]?.v === '=' && st[k - 1].end === t.start && st[k + 1]?.v === '{') {
+      k = closing(st, k + 1);
+      if (k < 0) return false;
+    } else if (t.v === '(' && t.kind === 'p' && k > 0) {
+      const callee = st[k - 1];
+      if (callee.kind === 'w' ? !NOT_CALLEE.test(callee.v) && !LOADER_CALL.test(callee.v) && !locals.has(callee.v) : /^[)\]]$|^[`'"]/.test(callee.v)) return false;
+    }
+  }
+  return true;
+}
+
+/** What a document.write call writes, as far as its strings say: '<sc' + 'ript', %3C and \x3C put back. */
+function written(st: Tok[]): string {
+  return st
+    .filter((t) => t.kind === 's' && t.v[0] !== '/')
+    .map((t) => t.v.slice(1, -1))
+    .join('')
+    .replace(/\\x([0-9a-f]{2})|%([0-9a-f]{2})/gi, (_, x?: string, pct?: string) => String.fromCharCode(parseInt(x ?? pct ?? '', 16)))
+    .replace(/\\(.)/g, '$1');
 }
 
 function isLoader(code: string, st: Tok[], inTry = false): boolean {
   const text = textOf(code, st);
-  if (/^document\.write(?:ln)?\s*\(/.test(text)) return TRACKER_LOADER.test(text) && !/\bfunction\b/.test(text);
+  if (/^document\.write(?:ln)?\s*\(/.test(text)) return TRACKER_LOADER.test(written(st).replace(HREF, '')) && !/\bfunction\b/.test(text);
   if (IIFE.test(text)) {
     if (!TRACKER_LOADER.test(text)) return false;
     // A loader's function only sets up its queue and inserts the script tag. One that does more is
     // the site's own code wrapped around a snippet.
     const fn = iifeBody(code, st);
     const inner = fn && statements(fn.body);
-    return !!fn && !!inner && inner.every((s) => isLoaderStep(fn.body, s));
+    if (!fn || !inner) return false;
+    const locals = declared(inner);
+    return inner.every((s) => isLoaderStep(fn.body, s, locals));
   }
   // try { var pageTracker = _gat._getTracker("UA-1"); pageTracker._trackPageview(); } catch (err) {}
   const m = /^try\s*\{([\s\S]*)\}\s*catch\s*\(\s*\w+\s*\)\s*\{\s*\}$/.exec(text);
@@ -350,11 +552,15 @@ function blocks(code: string, st: Tok[]): Array<{ body: string; start: number }>
  * script tag at a tracker, also inside the site's own functions, callbacks and if blocks (a
  * consent check, a delayed loadGTM(), MonsterInsights' if (mi_track_user) { ... }).
  */
-function loaderRanges(code: string, base = 0, depth = 0): Array<[number, number]> {
-  const out: Array<[number, number]> = [];
+function loaderRanges(code: string, base = 0, depth = 0, fill = ''): Array<[number, number, string]> {
+  const out: Array<[number, number, string]> = [];
   for (const st of statements(code) ?? []) {
-    if (isLoader(code, st) || setsTrackerSrc(code, st)) out.push([base + st[0].start, base + st[st.length - 1].end]);
-    else if (depth < MAX_DEPTH) for (const b of blocks(code, st)) out.push(...loaderRanges(b.body, base + b.start, depth + 1));
+    if (isLoader(code, st) || setsTrackerSrc(code, st)) out.push([base + st[0].start, base + st[st.length - 1].end, fill]);
+    else if (depth < MAX_DEPTH) {
+      const parts: Part[] = (st[0].v === 'if' && ifBranches(code, st)) || blocks(code, st).map((b) => ({ ...b, braced: true }));
+      // A branch without braces keeps an empty statement in place of the loader: if (ok) ; else ...
+      for (const b of parts) out.push(...loaderRanges(b.body, base + b.start, depth + 1, b.braced ? '' : ';'));
+    }
   }
   return out;
 }
@@ -365,8 +571,8 @@ function withoutLoaders(code: string): string {
   if (!cuts.length) return code;
   let out = '';
   let at = 0;
-  for (const [start, end] of cuts) {
-    out += code.slice(at, start);
+  for (const [start, end, fill] of cuts) {
+    out += code.slice(at, start) + fill;
     at = end;
   }
   out += code.slice(at);
@@ -443,7 +649,8 @@ export function cleanDocument($: Doc, opts: { stripTracking: boolean }): CleanSt
     }
     const kept = withoutLoaders(code);
     const tokens = jsTokens(kept);
-    const pointsAtTracker = tokens ? tokens.some((t) => t.kind === 's' && TRACKER_URL(t.v)) : TRACKER_URL(kept);
+    // When the script does not lex, comments are cut roughly so that a URL in one does not count.
+    const pointsAtTracker = tokens ? tokens.some((t) => t.kind === 's' && loadsFrom(t.v)) : loadsFrom(kept.replace(COMMENTS, '$1'));
     // Last resort, as before: a script that calls a tracker and still names where one loads from
     // (a loader that could not be cut out cleanly) goes whole rather than load it.
     if (calls && pointsAtTracker) {
