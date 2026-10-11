@@ -10,7 +10,8 @@ function validLabel(label: string): string | null {
 }
 
 const SPACE = /[\t\n\f\r ]/;
-const RAW_TEXT = new Set(['script', 'style', 'title', 'textarea', 'xmp', 'iframe', 'noembed', 'noframes', 'noscript']);
+// <noscript> is not one of them: the prescan runs with scripting off, so the tags in it count.
+const RAW_TEXT = new Set(['script', 'style', 'title', 'textarea', 'xmp', 'iframe', 'noembed', 'noframes']);
 
 type Attribute = { name: string; value: string; end: number };
 
@@ -73,29 +74,31 @@ function contentCharset(value: string): string | null {
 function metaEncoding(text: string): string | null {
   for (let i = text.indexOf('<'); i >= 0 && i < text.length; i = text.indexOf('<', i)) {
     if (text.startsWith('<!--', i)) {
+      // A comment ends at --> (<!--> and <!---> are empty ones) or at --!>, as the tokenizer reads it.
       const end = text.indexOf('-->', i + 2);
-      if (end < 0) return null;
-      i = end + 3;
+      const bang = text.indexOf('--!>', i + 4);
+      if (end < 0 && bang < 0) return null;
+      i = bang >= 0 && (end < 0 || bang < end) ? bang + 4 : end + 3;
     } else if (/^<meta[\t\n\f\r /]/i.test(text.slice(i, i + 6))) {
-      const seen = new Set<string>();
+      // Every attribute counts, a repeated one too, the last one winning, as in Chromium; a charset
+      // attribute wins over content= whatever their order.
       let pragma = false;
       let need: boolean | null = null;
-      let charset: string | null | undefined; // undefined: none yet; null: one that is not an encoding
+      let charset: string | null = null;
       const end = readTag(text, i + 5, (a) => {
-        if (seen.has(a.name)) return;
-        seen.add(a.name);
         if (a.name === 'http-equiv') pragma ||= a.value === 'content-type';
-        else if (a.name === 'content' && charset === undefined) {
+        else if (a.name === 'charset') [charset, need] = [validLabel(a.value), false];
+        else if (a.name === 'content' && need !== false) {
           const found = contentCharset(a.value);
           if (found) [charset, need] = [found, true];
-        } else if (a.name === 'charset' && charset === undefined) [charset, need] = [validLabel(a.value), false];
+        }
       });
       if (end < 0) return null;
       if (charset && need !== null && (pragma || !need)) return charset;
       i = end + 1;
     } else if (/^<\/?[a-z]/i.test(text.slice(i, i + 3))) {
       let at = i + 2;
-      while (at < text.length && !SPACE.test(text[at]) && text[at] !== '>') at++;
+      while (at < text.length && !SPACE.test(text[at]) && text[at] !== '>' && text[at] !== '/') at++;
       const name = text.slice(i + 1, at).toLowerCase();
       const end = readTag(text, at, () => {});
       if (end < 0) return null;

@@ -133,7 +133,8 @@ function keepFormOwners($: Doc, html: string): void {
   const endTags: Array<[number, number]> = [];
   const forms: Element[] = [];
   const controls: Element[] = [];
-  const ids = new Map<string, number>();
+  // The elements with each id, in document order: form="x" and getElementById find the first.
+  const ids = new Map<string, Element[]>();
   // For each control under copies the adoption agency made: each copy and the child of it the control is in.
   const copies = new Map<Element, Array<{ copy: Element; child: Element }>>();
   const trail: Array<{ copy: Element; child: Element }> = [];
@@ -150,7 +151,10 @@ function keepFormOwners($: Doc, html: string): void {
         continue;
       }
       if (copy) trail.push({ copy, child: n });
-      if (n.attribs.id) ids.set(n.attribs.id, (ids.get(n.attribs.id) ?? 0) + 1);
+      if (n.attribs.id) {
+        if (!ids.has(n.attribs.id)) ids.set(n.attribs.id, []);
+        ids.get(n.attribs.id)!.push(n);
+      }
       if (loc?.startTag) {
         opaque.push([loc.startTag.startOffset, loc.startTag.endOffset]);
         if (loc.endTag && n.name !== 'form') endTags.push([loc.endTag.startOffset, loc.endTag.endOffset]);
@@ -169,15 +173,18 @@ function keepFormOwners($: Doc, html: string): void {
   };
   walk($.root().get(0)?.children ?? [], undefined);
   let made = 0;
-  const newId = () => {
+  const newId = (form: Element) => {
     let id: string;
     do id = `wbd-form-${++made}`;
     while (ids.has(id));
-    ids.set(id, 1);
-    return id;
+    ids.set(id, [form]);
+    return (form.attribs.id = id);
   };
   if (controls.length && forms.length) tieOrphans($, html, forms, controls, ids, newId, opaque, endTags, copies);
-  if (forms.length > 1) unnestForms($, ids, newId);
+  if (forms.length > 1) {
+    closeLikeBlink(forms.sort((a, b) => locOf(a)!.startOffset - locOf(b)!.startOffset));
+    unnestForms($, ids, newId);
+  }
 }
 
 function tieOrphans(
@@ -185,8 +192,8 @@ function tieOrphans(
   html: string,
   forms: Element[],
   controls: Element[],
-  ids: Map<string, number>,
-  newId: () => string,
+  ids: Map<string, Element[]>,
+  newId: (form: Element) => string,
   opaque: Array<[number, number]>,
   endTags: Array<[number, number]>,
   copies: Map<Element, Array<{ copy: Element; child: Element }>>,
@@ -211,14 +218,70 @@ function tieOrphans(
       if (!inside(controls[j], form) && !moved(controls[j], form)) orphans.push(controls[j]);
     }
     if (!orphans.length) continue;
-    let id = form.attribs.id;
-    if (id && ids.get(id) !== 1) continue; // form="..." would find another element first
-    if (!id) id = form.attribs.id = newId();
+    const id = form.attribs.id || newId(form);
+    if (ids.get(id)![0] !== form) continue; // form="..." would find another element first
     for (const el of orphans) el.attribs.form = id;
   }
 }
 
 const TABLE_PARTS = new Set(['table', 'tbody', 'thead', 'tfoot', 'tr']);
+// What makes a form a form, as opposed to what styles it: left off the block that takes its place.
+const FORM_ONLY = /^(?:id|name|action|method|enctype|encoding|target|accept-charset|autocomplete|novalidate|rel|onsubmit|onreset|onformdata)$/i;
+// The parser's "special" elements: an end tag that matches no open element stops at them.
+const SPECIAL = new Set(
+  'address applet area article aside base basefont bgsound blockquote body br button caption center col colgroup dd details dir div dl dt embed fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hgroup hr html iframe img input keygen li link listing main marquee menu meta nav noembed noframes noscript object ol p param plaintext pre script search section select source style summary table tbody td template textarea tfoot th thead title tr track ul wbr xmp'.split(' '),
+);
+
+/** Puts the nodes in just after `ref`, beside it. */
+function insertAfter(ref: ChildNode, nodes: ChildNode[]): void {
+  const parent = ref.parent!;
+  const at = parent.children.indexOf(ref);
+  relink(parent, [...parent.children.slice(0, at + 1), ...nodes, ...parent.children.slice(at + 1)]);
+}
+
+/**
+ * Blink and WebKit follow the </form> that closes a form with the generic end-tag step, which also
+ * closes the element then open when it is a form, or an inline element (<font>, <span>, <b>) inside
+ * one. So the form that a </form> in a cell left open ends right after the inner form that closes
+ * cleanly in it, and what follows goes beside it, with a <font> or <b> it was in opened again
+ * around it. The parser here, like Firefox, keeps that form open to the end of its parent, so the
+ * controls after the inner form would post with it. What follows moves out after it, in each form
+ * in document order (`forms`), before the nested forms are taken apart.
+ */
+function closeLikeBlink(forms: Element[]): void {
+  for (const form of forms) {
+    const end = locOf(form)?.endTag?.startOffset;
+    if (end === undefined || !isHtml(form)) continue;
+    // The form must have been the open element once the end tag's implied end tags closed (no
+    // <div> left open in it), and the elements around it up to the outer form still open.
+    const last = form.children.findLast(isElement);
+    if (last && !((locOf(last)?.endOffset ?? Infinity) <= end)) continue;
+    const chain: Element[] = [];
+    let outer = form.parent;
+    while (outer && isElement(outer) && isHtml(outer) && outer.name !== 'form' && !SPECIAL.has(outer.name)) {
+      chain.push(outer);
+      outer = outer.parent;
+    }
+    if (!outer || !isElement(outer) || !isHtml(outer) || outer.name !== 'form') continue;
+    if ([...chain, outer].some((el) => (locOf(el)?.endOffset ?? Infinity) <= end)) continue;
+    let from: ChildNode = form;
+    let carry: ChildNode[] = [];
+    for (const el of [...chain, outer]) {
+      const at = el.children.indexOf(from);
+      const after = el.children.slice(at + 1);
+      if (after.length) relink(el, el.children.slice(0, at + 1));
+      carry = [...carry, ...after];
+      // A formatting element the generic step closed is made again for what came after it.
+      if (el !== outer && carry.length && FORMATTING.has(el.name)) {
+        const again = el.cloneNode(false);
+        relink(again, carry);
+        carry = [again];
+      }
+      from = el;
+    }
+    if (carry.length) insertAfter(outer, carry);
+  }
+}
 
 /**
  * A form the parser left open (its </form> in a later cell, or met while a <font> or <div> in it
@@ -226,10 +289,11 @@ const TABLE_PARTS = new Set(['table', 'tbody', 'thead', 'tfoot', 'tr']);
  * pointer was clear, and gave them their controls; in the written page an inner <form> tag comes
  * while the outer form is open, so it is dropped and its controls go to the outer form. Each inner
  * form moves out to just after the outermost form around it, emptied and hidden, and its controls
- * get form="<its id>"; what it held stays in place, in a <div> (a form is a block) unless it sat
- * straight in a table. The forms keep their order, so document.forms[1] is still the same form.
+ * get form="<its id>"; what it held stays in place, in a <div> (a form is a block) with the
+ * form's class and style, unless it sat straight in a table. The forms keep their order, so
+ * document.forms[1] is still the same form.
  */
-function unnestForms($: Doc, ids: Map<string, number>, newId: () => string): void {
+function unnestForms($: Doc, ids: Map<string, Element[]>, newId: (form: Element) => string): void {
   // One walk, in document order, finds the outermost form around each nested form and the form
   // around each control.
   const tops = new Map<Element, Element>();
@@ -252,18 +316,34 @@ function unnestForms($: Doc, ids: Map<string, number>, newId: () => string): voi
   }
   if (!tops.size) return;
 
-  const moved = new Set<Element>();
+  // form="..." finds the first element with an id. A nested form that is the first of several with
+  // its id keeps it on its copy after `top`, so it stays where it is when another element that
+  // keeps the id would come first then (the nested forms among them get ids of their own).
+  const holdersOf = (form: Element) => (form.attribs.id ? ids.get(form.attribs.id)! : []);
+  const plan = [...tops].filter(([form, top]) => {
+    const holders = holdersOf(form);
+    return holders[0] !== form || !holders.some((el) => el !== form && !tops.has(el) && inside(el, top));
+  });
+  const planned = new Set(plan.map(([form]) => form));
+  const moved = new Map<Element, Record<string, string>>(); // moved form -> what the block in its place keeps
   const after = new Map<Element, Element[]>(); // outer form -> the forms moved out after it, in order
   const parents = new Set<ParentNode>();
-  for (const [form, top] of tops) {
-    let id = form.attribs.id;
-    if (id && ids.get(id) !== 1) continue; // form="..." would find another element first
-    if (!id) id = form.attribs.id = newId();
+  for (const [form, top] of plan) {
+    // The block keeps what styles the form (class, style, align ...), not what makes it a form.
+    const keep = Object.fromEntries(Object.entries(form.attribs).filter(([name]) => !FORM_ONLY.test(name)));
+    const holders = holdersOf(form);
+    if (holders.length && holders[0] !== form) {
+      // Not the first: the copy gets an id of its own, and the block keeps the old one for the CSS
+      // that styles it, unless that would put it before the first one's copy.
+      const first = holders[0];
+      if (!planned.has(first) || !inside(form, tops.get(first)!)) keep.id = form.attribs.id;
+      newId(form);
+    } else if (!holders.length) newId(form);
     const copy = form.cloneNode(false);
     copy.attribs.style = 'display:none !important';
     if (!after.has(top)) after.set(top, []);
     after.get(top)!.push(copy);
-    moved.add(form);
+    moved.set(form, keep);
     parents.add(form.parent!).add(top.parent!);
   }
   // Each parent's children are rebuilt once, the deepest first, so a moved form that held another
@@ -278,9 +358,11 @@ function unnestForms($: Doc, ids: Map<string, number>, newId: () => string): voi
   for (const parent of [...parents].sort((x, y) => depth.get(y)! - depth.get(x)!)) {
     const kids: ChildNode[] = [];
     for (const c of parent.children) {
-      if (isElement(c) && moved.has(c)) {
+      const keep = isElement(c) ? moved.get(c) : undefined;
+      if (isElement(c) && keep) {
         if (c.children.length && !(isElement(parent) && TABLE_PARTS.has(parent.name))) {
           const div = block.cloneNode(false);
+          div.attribs = { ...keep };
           relink(div, c.children);
           kids.push(div);
         } else for (const k of c.children) kids.push(k);
