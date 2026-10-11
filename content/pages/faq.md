@@ -1,7 +1,7 @@
 ---
 title: Frequently asked questions
 slug: faq
-meta_description: How Wayback Downloader picks a snapshot, why it never changes URLs, which hosting works, and what a demo restore includes.
+meta_description: How zplus.ai picks a snapshot, why it never changes URLs, which hosting works, and what a demo restore includes.
 ---
 
 ## Which snapshot do you restore?
@@ -18,7 +18,12 @@ No. Every original URL works at exactly the same address, including `.php` pages
 
 ## Which hosting can I use?
 
-Any Apache or LiteSpeed hosting (most shared hosting, including cPanel and hPanel) works with the included `.htaccess`. For nginx we include a server configuration. Netlify and Cloudflare Pages work too, except for URLs with a query string, which they cannot match.
+Any Apache or LiteSpeed hosting (most shared hosting, including cPanel and hPanel) works with the included `.htaccess`. For nginx we include a server configuration. Both keep every original URL, including URLs with a query string.
+
+Netlify and Cloudflare Pages read the included `_redirects` and `_headers` files, with limits:
+
+- Neither can match a query string, so a URL such as `/index.php?page=contact` does not work there.
+- Cloudflare Pages on its own redirects `/about.html` to `/about` and `/blog/index.html` to `/blog/`. The rules in `_redirects` keep those URLs as they are, but Pages reads at most 2,000 plain and 100 pattern rules from `_redirects` and 100 rules from `_headers`. A large site with many rewritten URLs or `.php` pages needs Apache, LiteSpeed or nginx.
 
 ## What do you change in the pages?
 

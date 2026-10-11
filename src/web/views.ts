@@ -9,7 +9,7 @@ import type { PageMeta } from '../engine/meta.ts';
 import { seoHead, type SiteContext } from '../engine/seo.ts';
 
 export interface ViewContext {
-  site: SiteContext & { description: string; lang: string; navigation: unknown; secondaryNavigation: unknown; year: number };
+  site: SiteContext & { description: string; tagline?: string; lang: string; navigation: unknown; secondaryNavigation: unknown; year: number };
   seo: PageMeta;
   /** Shown in <title>. */
   title: string;

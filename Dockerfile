@@ -1,4 +1,4 @@
-# Wayback Downloader: web app + job worker in one container (each job in its own child process).
+# zplus.ai: web app + job worker in one container (each job in its own child process).
 # Node runs the TypeScript directly.
 FROM node:22-alpine
 WORKDIR /app

@@ -36,6 +36,8 @@ export interface Entry {
 
 export interface Settings {
   title: string;
+  /** A few words on what the site is, shown on the homepage and in its title. */
+  tagline?: string;
   description: string;
   lang: string;
   navigation: Array<{ label: string; url: string }>;

@@ -1,10 +1,10 @@
 ---
 title: Terms of use
 slug: terms
-meta_description: The terms for using Wayback Downloader.
+meta_description: The terms for using zplus.ai.
 ---
 
-Wayback Downloader downloads publicly archived copies of websites from the Internet Archive's Wayback Machine and rebuilds them as files you can host. We are not affiliated with the Internet Archive.
+zplus.ai downloads publicly archived copies of websites from the Internet Archive's Wayback Machine and rebuilds them as files you can host. We are not affiliated with the Internet Archive.
 
 ## Your responsibility for content
 
