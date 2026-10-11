@@ -66,7 +66,17 @@ const { values, positionals } = parseArgs({
 const [command, arg] = positionals;
 const color = process.stdout.isTTY;
 const paint = (code: string, s: string) => (color ? `\x1b[${code}m${s}\x1b[0m` : s);
-const num = (v: string | undefined) => (v === undefined ? undefined : Number(v));
+
+/** A whole-number option. A typo must be an error: NaN would mean no workers, no limit or no delay. */
+function num(name: 'max-urls' | 'concurrency' | 'delay' | 'probes' | 'port', min: number): number | undefined {
+  const v = values[name];
+  if (v === undefined) return undefined;
+  const n = Number(v.trim());
+  if (!/^\s*\d+\s*$/.test(v) || !Number.isSafeInteger(n) || n < min) {
+    throw new Error(`--${name} needs a whole number${min > 0 ? ` of at least ${min}` : ''}, not "${v}"`);
+  }
+  return n;
+}
 
 function printTimeline(h: HealthReport): void {
   const years = [...new Set(h.months.map((m) => m.month.slice(0, 4)))];
@@ -91,8 +101,8 @@ async function main(): Promise<void> {
   if (command === 'scan') {
     if (!arg) throw new Error('Give a domain: wbd scan example.com');
     const domain = normalizeDomain(arg);
-    const client = new ArchiveClient({ base: values.archive, concurrency: num(values.concurrency), minIntervalMs: num(values.delay), log: (m) => console.error(paint('2', m)) });
-    const h = await scanHealth(client, domain, { maxProbes: num(values.probes), log: (m) => console.error(paint('2', m)) });
+    const client = new ArchiveClient({ base: values.archive, concurrency: num('concurrency', 1), minIntervalMs: num('delay', 0), log: (m) => console.error(paint('2', m)) });
+    const h = await scanHealth(client, domain, { maxProbes: num('probes', 1), log: (m) => console.error(paint('2', m)) });
     if (!h.months.length) {
       console.log(`The Wayback Machine has no captures of ${domain}.`);
       return;
@@ -113,6 +123,8 @@ async function main(): Promise<void> {
   if (command === 'restore') {
     if (!arg) throw new Error('Give a domain: wbd restore example.com');
     if (values['no-health'] && !values.target) throw new Error('--no-health needs --target');
+    const archive = { base: values.archive, concurrency: num('concurrency', 1), minIntervalMs: num('delay', 0) };
+    const maxUrls = num('max-urls', 1);
     let last = 0;
     const result = await restore({
       domain: arg,
@@ -121,13 +133,13 @@ async function main(): Promise<void> {
       from: values.from,
       to: values.to,
       siteUrl: values['site-url'],
-      maxUrls: num(values['max-urls']),
+      maxUrls,
       maxPages: values.demo ? 4 : undefined,
-      orphans: !values['no-orphans'],
+      orphans: values['no-orphans'] ? false : undefined,
       stripTracking: !values['keep-tracking'],
       skipHealth: values['no-health'],
       zip: !values['no-zip'],
-      archive: { base: values.archive, concurrency: num(values.concurrency), minIntervalMs: num(values.delay) },
+      archive,
       onEvent: (e) => {
         if (e.phase === 'download' && e.done !== undefined) {
           if (Date.now() - last < 1000 && color) return;
@@ -149,8 +161,8 @@ async function main(): Promise<void> {
   }
   if (command === 'serve') {
     if (!arg) throw new Error('Give the site folder: wbd serve out/example.com/site');
+    const port = num('port', 1)!;
     const server = await createPreviewServer(arg);
-    const port = Number(values.port);
     server.listen(port, () => console.log(`Preview: http://localhost:${port}/`));
     return;
   }

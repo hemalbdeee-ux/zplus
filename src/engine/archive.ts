@@ -29,9 +29,11 @@ export interface CdxQuery {
 }
 
 export type CaptureResult =
-  | { kind: 'ok'; timestamp: string; status: number; contentType: string; body: Buffer }
+  /** original: the URL the served capture is filed under; the archive can move to another spelling. */
+  | { kind: 'ok'; timestamp: string; original: string; status: number; contentType: string; body: Buffer }
   | { kind: 'redirect'; timestamp: string; status: number; location: string }
-  | { kind: 'missing'; status: number; reason: string };
+  /** transient: the archive itself failed or refused (429, 5xx), so a later try may work. */
+  | { kind: 'missing'; status: number; reason: string; transient?: boolean };
 
 export interface ArchiveOptions {
   base?: string;
@@ -74,13 +76,15 @@ export class ArchiveClient {
   #pausedUntil = 0;
 
   constructor(opts: ArchiveOptions = {}) {
+    // NaN would silently turn off the gate (no concurrency cap, no gap, no 429 pause).
+    const num = (v: number | undefined, fallback: number, min: number) => (v !== undefined && Number.isFinite(v) ? Math.max(min, v) : fallback);
     this.base = (opts.base ?? 'https://web.archive.org').replace(/\/+$/, '');
-    this.concurrency = Math.max(1, opts.concurrency ?? 3);
-    this.minIntervalMs = opts.minIntervalMs ?? 350;
-    this.retries = opts.retries ?? 5;
-    this.timeoutMs = opts.timeoutMs ?? 90_000;
-    this.maxBytes = opts.maxBytes ?? 50 * 1024 * 1024;
-    this.backoffMs = opts.backoffMs ?? 2_000;
+    this.concurrency = Math.floor(num(opts.concurrency, 3, 1));
+    this.minIntervalMs = num(opts.minIntervalMs, 350, 0);
+    this.retries = Math.floor(num(opts.retries, 5, 0));
+    this.timeoutMs = num(opts.timeoutMs, 90_000, 1);
+    this.maxBytes = num(opts.maxBytes, 50 * 1024 * 1024, 0);
+    this.backoffMs = num(opts.backoffMs, 2_000, 0);
     this.userAgent = opts.userAgent ?? 'WaybackDownloader/0.1 (+site restore tool)';
     this.signal = opts.signal;
     this.log = opts.log ?? (() => {});
@@ -118,7 +122,11 @@ export class ArchiveClient {
           headers: { 'user-agent': this.userAgent },
           signal: AbortSignal.any(signals),
         });
-        const retryable = res.status === 429 || (res.status >= 500 && res.status !== 501);
+        // A replayed capture of an error page (the site answered 429 or 503 when it was crawled)
+        // carries Memento-Datetime. It is an answer, not the archive failing: retrying it or pausing
+        // every request would not change it.
+        const memento = res.headers.has('memento-datetime');
+        const retryable = !memento && isRetryable(res.status);
         if (retryable && attempt < this.retries) {
           await res.body?.cancel();
           retryIn = parseRetryAfter(res.headers.get('retry-after')) ?? this.#backoff(attempt);
@@ -132,7 +140,8 @@ export class ArchiveClient {
             await res.body?.cancel();
             return { status: 413, headers: res.headers, body: Buffer.alloc(0) };
           }
-          const body = Buffer.from(await res.arrayBuffer());
+          const body = await this.#readBody(res);
+          if (!body) return { status: 413, headers: res.headers, body: Buffer.alloc(0) };
           return { status: res.status, headers: res.headers, body };
         }
       } catch (err) {
@@ -145,6 +154,28 @@ export class ArchiveClient {
       }
       await sleep(retryIn, undefined, { signal: this.signal });
     }
+  }
+
+  /**
+   * Reads a body up to maxBytes; null when it is bigger. Content-Length is missing on chunked
+   * replies and is the compressed size of a gzipped one, so the bytes are counted as they arrive.
+   */
+  async #readBody(res: Response): Promise<Buffer | null> {
+    if (!res.body) return Buffer.alloc(0);
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > this.maxBytes) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(value);
+    }
+    return Buffer.concat(chunks, total);
   }
 
   /** Pages through the CDX index; yields captures in index order (by URL, then time). */
@@ -183,10 +214,15 @@ export class ArchiveClient {
     if (!wanted) return { kind: 'missing', status: 0, reason: 'invalid URL' };
     const wantedKey = urlKey(wanted);
     let ts = timestamp;
+    let orig = original;
     let url = `${this.base}/web/${ts}id_/${original}`;
+    const visited = new Set<string>();
 
     for (let hop = 0; hop < 8; hop++) {
+      visited.add(url);
       const res = await this.#get(url);
+      // Every replayed capture carries Memento-Datetime, an archived redirect included.
+      const memento = res.headers.has('memento-datetime');
       if (res.status >= 300 && res.status < 400) {
         const loc = res.headers.get('location');
         if (!loc) return { kind: 'missing', status: res.status, reason: 'redirect without location' };
@@ -194,10 +230,16 @@ export class ArchiveClient {
         const archived = parseArchiveUrl(abs, this.base);
         if (archived) {
           const target = toUrl(archived.original);
-          if (target && urlKey(target) === wantedKey) {
+          // Without Memento-Datetime the 3xx is the archive's own move to the nearest capture it has
+          // for this URL. Its index ignores case, a trailing slash and query order, so the target
+          // can be spelled differently; it is still this URL and never a redirect the site made.
+          if (!memento || (target && urlKey(target) === wantedKey)) {
             // Same resource: the archive moved us to the nearest timestamp, or the site switched http/https or www.
+            const nextUrl = `${this.base}/web/${archived.timestamp}id_/${archived.original}`;
+            if (visited.has(nextUrl)) return { kind: 'missing', status: res.status, reason: 'redirect loop' };
             ts = archived.timestamp;
-            url = `${this.base}/web/${ts}id_/${archived.original}`;
+            orig = archived.original;
+            url = nextUrl;
             continue;
           }
           return { kind: 'redirect', timestamp: archived.timestamp, status: res.status, location: archived.original };
@@ -212,12 +254,15 @@ export class ArchiveClient {
         return {
           kind: 'ok',
           timestamp: fromHeader ?? ts,
+          original: orig,
           status: 200,
           contentType: res.headers.get('content-type') ?? '',
           body: res.body,
         };
       }
-      return { kind: 'missing', status: res.status, reason: res.status === 413 ? 'file too large' : `HTTP ${res.status}` };
+      if (res.status === 413) return { kind: 'missing', status: 413, reason: 'file too large' };
+      if (memento) return { kind: 'missing', status: res.status, reason: `archived as HTTP ${res.status}` };
+      return { kind: 'missing', status: res.status, reason: `HTTP ${res.status}`, transient: isRetryable(res.status) };
     }
     return { kind: 'missing', status: 0, reason: 'too many redirects' };
   }
@@ -274,6 +319,10 @@ function parseArchiveUrl(u: URL, base: string): { timestamp: string; original: s
   let original = m[2].replace(/^(https?):\/(?!\/)/i, '$1://');
   if (!/^https?:\/\//i.test(original)) original = 'http://' + original.replace(/^\/+/, '');
   return { timestamp: m[1].padEnd(14, '0'), original };
+}
+
+function isRetryable(status: number): boolean {
+  return status === 429 || (status >= 500 && status !== 501);
 }
 
 function mementoTimestamp(header: string | null): string | undefined {

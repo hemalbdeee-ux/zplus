@@ -75,9 +75,11 @@ export function reportHtml(r: RestoreReport): string {
   const months = r.health?.months ?? [];
   const years = [...new Set(months.map((m) => m.month.slice(0, 4)))];
   const cell = (y: string, mo: number) => {
-    const m = months.find((x) => x.month === `${y}${String(mo).padStart(2, '0')}`);
+    const ym = `${y}${String(mo).padStart(2, '0')}`;
+    const m = months.find((x) => x.month === ym);
     const cls = m ? m.verdict : 'none';
-    const pick = r.health?.lastGood?.month === m?.month ? ' pick' : '';
+    // The month of the snapshot actually restored (--target may differ from the last good one).
+    const pick = ym === r.target.slice(0, 6) ? ' pick' : '';
     const title = m ? `${y}-${String(mo).padStart(2, '0')}: ${m.verdict}${m.score !== null ? ` (${m.score})` : ''}${m.reasons.length ? ' · ' + m.reasons.join('; ') : ''}` : `${y}-${mo}: no capture`;
     return `<td class="${cls}${pick}" title="${esc(title)}"></td>`;
   };
