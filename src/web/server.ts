@@ -53,9 +53,10 @@ export function configFromEnv(env = process.env): WebConfig {
 
 const PER_PAGE = 10;
 const MONTHS = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split(' ');
+/** Wrong access codes allowed per address and hour before every full restore is refused. */
+const CODE_TRIES = 5;
 
 function codeMatches(given: string, expected: string): boolean {
-  if (!expected) return false;
   const a = Buffer.from(given);
   const b = Buffer.from(expected);
   return a.length === b.length && timingSafeEqual(a, b);
@@ -77,9 +78,15 @@ function timelineRows(h: HealthReport) {
   }));
 }
 
+/** Good snapshots inside the healthy window: restore() takes pages from that window only, so a date outside it cannot be honoured. */
+function restorable(h: HealthReport) {
+  return h.months.filter(
+    (m) => m.verdict === 'good' && m.timestamp && (!h.window.from || m.timestamp >= h.window.from) && (!h.window.to || m.timestamp <= h.window.to),
+  );
+}
+
 function snapshotChoices(h: HealthReport) {
-  return h.months
-    .filter((m) => m.verdict === 'good' && m.timestamp)
+  return restorable(h)
     .reverse()
     .slice(0, 36)
     .map((m) => ({ timestamp: m.timestamp!, score: m.score, selected: m.timestamp === h.lastGood?.timestamp }));
@@ -168,6 +175,8 @@ export async function createApp(config: WebConfig) {
   // Ghost style: every page URL ends with a slash.
   app.use((req, res, next) => {
     if ((req.method === 'GET' || req.method === 'HEAD') && !req.path.endsWith('/') && !/\.[a-z0-9]+$/i.test(req.path) && !/^\/(api|assets)\/|^\/job\/[^/]+\/(download|report)$/.test(req.path)) {
+      // "//evil.example/x" would become the protocol-relative Location "//evil.example/x/", another site.
+      if (/^\/[/\\]/.test(req.path)) return notFound(res);
       const q = req.originalUrl.slice(req.path.length);
       res.redirect(301, req.path + '/' + q);
       return;
@@ -204,8 +213,8 @@ export async function createApp(config: WebConfig) {
       bodyClass: 'home-template',
       posts: content.posts.slice(0, 3),
       sample: sampleRows,
-      error: req.query.error,
-      domain: typeof req.query.domain === 'string' ? req.query.domain : '',
+      // No error from the query string: anyone could put their own text in the alert box.
+      domain: typeof req.query.domain === 'string' ? req.query.domain.slice(0, 200) : '',
     });
   });
 
@@ -353,7 +362,7 @@ export async function createApp(config: WebConfig) {
       isScan: job.kind === 'scan',
       demo: job.max_pages !== null,
       parentId: job.parent_id,
-      accessEnabled: !!config.accessCode,
+      codeRequired: !!config.accessCode,
     };
     if (job.kind === 'scan' && result) {
       const h = (result as ScanResult).health;
@@ -391,35 +400,45 @@ export async function createApp(config: WebConfig) {
     if (scan.kind !== 'scan' || scan.status !== 'done') return res.redirect(303, `/job/${scan.id}/`);
     const health = (JSON.parse(scan.result!) as ScanResult).health;
     const target = String(req.body?.target ?? '');
-    const valid = health.months.some((m) => m.timestamp === target);
+    const valid = restorable(health).some((m) => m.timestamp === target);
     const full = req.body?.mode === 'full';
+    const ip = req.ip ?? '';
     const fail = (msg: string, status: number) => {
       res.locals.formError = msg;
       res.status(status);
       render(res, 'job', { title: `Snapshots of ${scan.domain} · ${s.title}`, seo: meta({ path: `/job/${scan.id}/`, noindex: true }), job: jobView(scan), formError: msg }, status);
     };
     if (!valid) return fail('Choose one of the snapshots in the list.', 422);
-    if (full && !codeMatches(String(req.body?.code ?? ''), config.accessCode)) return fail('That access code is not valid.', 403);
-    if (store.countByIp(req.ip ?? '', 24 * 3600_000, 'restore') >= config.restoreLimit) return fail('Too many restores from your address today. Please try again tomorrow.', 429);
+    // Limits come before the code check, and once the tries are used up every code gets the same
+    // answer, so the response never tells a right code from a wrong one.
+    if (store.countByIp(ip, 24 * 3600_000, 'restore') >= config.restoreLimit) return fail('Too many restores from your address today. Please try again tomorrow.', 429);
+    if (full && config.accessCode) {
+      if (store.codeFailures(ip, 3600_000) >= CODE_TRIES) return fail('Too many wrong access codes from your address. Please try again in an hour.', 429);
+      if (!codeMatches(String(req.body?.code ?? ''), config.accessCode)) {
+        store.recordCodeFailure(ip);
+        return fail('That access code is not valid.', 403);
+      }
+    }
     const job = store.create({ kind: 'restore', domain: scan.domain, target, maxPages: full ? undefined : 4, parentId: scan.id, ip: req.ip });
     runner.tick();
     res.redirect(303, `/job/${job.id}/`);
   });
 
+  // With root, send checks only the path below it for dotfiles, so a data folder like ~/.local/share/wbd works.
   app.get('/job/:id/download', loadJob, (_req, res) => {
     const job = res.locals.job as Job;
     const r = job.result ? (JSON.parse(job.result) as RestoreJobResult) : undefined;
-    const file = r?.zip ? path.join(runner.jobDir(job.id), r.zip) : '';
-    if (job.kind !== 'restore' || !file || !existsSync(file)) return notFound(res);
-    res.download(file, `${job.domain}-restored.zip`);
+    const dir = runner.jobDir(job.id);
+    if (job.kind !== 'restore' || !r?.zip || !existsSync(path.join(dir, r.zip))) return notFound(res);
+    res.download(r.zip, `${job.domain}-restored.zip`, { root: dir });
   });
 
   app.get('/job/:id/report', loadJob, (_req, res) => {
     const job = res.locals.job as Job;
     const r = job.result ? (JSON.parse(job.result) as RestoreJobResult) : undefined;
-    const file = r ? path.join(runner.jobDir(job.id), r.reportHtml) : '';
-    if (job.kind !== 'restore' || !file || !existsSync(file)) return notFound(res);
-    res.set('x-robots-tag', 'noindex').sendFile(file);
+    const dir = runner.jobDir(job.id);
+    if (job.kind !== 'restore' || !r || !existsSync(path.join(dir, r.reportHtml))) return notFound(res);
+    res.set('x-robots-tag', 'noindex').sendFile(r.reportHtml, { root: dir });
   });
 
   // ---- Posts and pages: /{slug}/ like Ghost ----
@@ -438,7 +457,14 @@ export async function createApp(config: WebConfig) {
   });
 
   app.use((_req, res) => notFound(res));
-  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: Error & { status?: number; statusCode?: number }, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) return next(err);
+    // Errors from body parsing and file sending carry their own 4xx status; only the rest are ours.
+    const status = err.status ?? err.statusCode ?? 500;
+    if (status === 404) return notFound(res);
+    if (status >= 400 && status < 500) {
+      return render(res, 'error', { title: `Error · ${s.title}`, seo: meta({ path: `/${status}/`, noindex: true }), code: status, message: 'This request could not be handled.' }, status);
+    }
     console.error(err);
     render(res, 'error', { title: `Error · ${s.title}`, seo: meta({ path: '/500/', noindex: true }), code: 500, message: 'Something went wrong on our side. Please try again.' }, 500);
   });

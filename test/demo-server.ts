@@ -14,8 +14,8 @@ const config = {
   archiveBase: archive.base,
   archiveDelayMs: 150,
   archiveBackoffMs: 50,
-  accessCode: process.env.WBD_ACCESS_CODE ?? 'demo',
 };
 const { app, runner } = await createApp(config);
 runner.start();
-app.listen(config.port, () => console.log(`Demo on http://localhost:${config.port}/ (fake archive ${archive.base}, access code "${config.accessCode}")`));
+const code = config.accessCode ? `access code "${config.accessCode}"` : 'no access code needed';
+app.listen(config.port, () => console.log(`Demo on http://localhost:${config.port}/ (fake archive ${archive.base}, ${code})`));

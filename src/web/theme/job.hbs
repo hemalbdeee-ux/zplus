@@ -51,9 +51,9 @@
                         </select>
                         <fieldset>
                             <legend>What to restore</legend>
-                            <label class="radio"><input type="radio" name="mode" value="demo" checked> <span><b>Demo</b>: the homepage and 3 more pages, free</span></label>
-                            {{#if job.accessEnabled}}
-                            <label class="radio"><input type="radio" name="mode" value="full"> <span><b>Full site</b>: up to 20,000 URLs</span></label>
+                            <label class="radio"><input type="radio" name="mode" value="demo" checked> <span><b>Demo</b>: a quick preview of the homepage and 3 more pages</span></label>
+                            <label class="radio"><input type="radio" name="mode" value="full"> <span><b>Full site</b>: every archived URL of the healthy period, up to 20,000</span></label>
+                            {{#if job.codeRequired}}
                             <label for="code">Access code for a full restore</label>
                             <input id="code" name="code" type="password" autocomplete="off">
                             {{/if}}
@@ -91,7 +91,7 @@
                     <div><dt>Not in the archive</dt><dd>{{number job.report.counts.missing}}</dd></div>
                 </dl>
                 <p class="actions">{{#if job.hasZip}}<a class="btn" href="/job/{{job.id}}/download">Download ZIP</a>{{/if}} <a class="btn btn-ghost" href="/job/{{job.id}}/report">Open the report</a></p>
-                {{#if job.demo}}<p class="notice">This demo contains the homepage and the first pages it links to. A full restore downloads every archived URL of the healthy period.</p>{{/if}}
+                {{#if job.demo}}<p class="notice">This demo contains the homepage and the first pages it links to. A <a href="/job/{{job.parentId}}/">full restore</a> downloads every archived URL of the healthy period.</p>{{/if}}
                 {{#each job.report.warnings}}<p class="notice">{{this}}</p>{{/each}}
                 <h3>Put it online</h3>
                 <ol class="howto">
