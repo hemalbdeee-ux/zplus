@@ -3,7 +3,7 @@
 // and the sitemaps are built from this.
 
 import type { Doc } from './html.ts';
-import { visibleText } from './html.ts';
+import { loadHtml, visibleText } from './html.ts';
 import { isInternal, pathAndQuery, toUrl } from './url.ts';
 
 export type PageType = 'home' | 'post' | 'page' | 'tag' | 'author' | 'archive';
@@ -95,7 +95,11 @@ export function extractMeta($: Doc, pageUrl: URL, domain: string, opts: ExtractO
   const title = $('title').first().text().replace(/\s+/g, ' ').trim();
   const ld = jsonLdObjects($);
   const ldType = ld.map((o) => String(o['@type'] ?? '')).join(' ');
-  const ldPublished = ld.map((o) => o.datePublished).find((v): v is string => typeof v === 'string');
+  // A WebPage node's datePublished (Yoast gives every static page one) says nothing about a post.
+  const ldPublished = ld
+    .filter((o) => ![o['@type']].flat().every((t) => typeof t === 'string' && /(Page|^WebSite)$/.test(t)))
+    .map((o) => o.datePublished)
+    .find((v): v is string => typeof v === 'string');
   const ldModified = ld.map((o) => o.dateModified).find((v): v is string => typeof v === 'string');
 
   const ogTitle = attr($, 'meta[property="og:title"]') ?? attr($, 'meta[name="twitter:title"]');
@@ -109,10 +113,12 @@ export function extractMeta($: Doc, pageUrl: URL, domain: string, opts: ExtractO
     attr($, 'meta[name="twitter:description"]') ??
     '';
   if (!description) {
-    const p = root
+    // A frameset page has no <body>; what it shows without frames is <noframes>, raw markup to the parser.
+    const frames = $('body').length || !$('noframes').length ? null : loadHtml($('noframes').first().text());
+    const p = (frames ? contentRoot(frames) : root)
       .find('p')
       .toArray()
-      .map((el) => $(el).text().replace(/\s+/g, ' ').trim())
+      .map((el) => (frames ?? $)(el).text().replace(/\s+/g, ' ').trim())
       .find((t) => t.length >= 60);
     description = p ?? visibleText($).slice(0, 400);
   }
@@ -141,7 +147,8 @@ export function extractMeta($: Doc, pageUrl: URL, domain: string, opts: ExtractO
     break;
   }
 
-  const timeEl = root.find('time[datetime]').first().attr('datetime') ?? $('time[datetime]').first().attr('datetime');
+  // Only a <time> in the content: one in a sidebar or footer widget dates another post.
+  const timeEl = root.find('time[datetime]').first().attr('datetime');
   const pathDate = DATE_IN_PATH.exec(pageUrl.pathname);
   const publishedAt =
     toIsoDate(attr($, 'meta[property="article:published_time"]')) ??
@@ -187,12 +194,16 @@ export function extractMeta($: Doc, pageUrl: URL, domain: string, opts: ExtractO
   const query = pageUrl.search;
   const ogType = (attr($, 'meta[property="og:type"]') ?? '').toLowerCase();
   const bodyClass = $('body').attr('class') ?? '';
+  // WordPress marks its static pages (body class page-id-N, <article class="type-page">). Yoast gives
+  // them og:type article and a dated WebPage too, but they are pages, not posts.
+  const wpPage = bodyClass.split(/\s+/).some((c) => /^page-id-\d+$/.test(c)) || $('article.type-page').length > 0;
   const looksLikePost =
-    !!pathDate ||
-    ogType === 'article' ||
-    /\b(BlogPosting|NewsArticle|Article)\b/.test(ldType) ||
-    /\b(single-post|single|post-template)\b/.test(bodyClass) ||
-    $('article').length === 1;
+    !wpPage &&
+    (!!pathDate ||
+      ogType === 'article' ||
+      /\b(BlogPosting|NewsArticle|Article)\b/.test(ldType) ||
+      /\b(single-post|single|post-template)\b/.test(bodyClass) ||
+      $('article').length === 1);
 
   let type: PageType;
   if (path === '/') type = 'home';

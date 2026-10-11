@@ -2,6 +2,7 @@
 // </head> with canonical, description, Open Graph, Twitter card, JSON-LD and the RSS link.
 // URLs are never changed here; the canonical of a page is its own original URL on the new host.
 
+import type { AnyNode } from 'domhandler';
 import { removeNode, type Doc } from './html.ts';
 import type { PageMeta } from './meta.ts';
 
@@ -142,7 +143,6 @@ const REMOVE = [
   'meta[property^="article:"]',
   'meta[name^="twitter:"]',
   'meta[property^="twitter:"]',
-  'script[type="application/ld+json"]',
   'meta[name="description" i]',
   'meta[name="generator" i]',
   'meta[charset]',
@@ -155,8 +155,96 @@ const REMOVE = [
   'link[type="text/xml+oembed"]',
 ];
 
+// The JSON-LD types the seo-head block writes, and the plain WebPage subtypes it stands in for; the
+// page's own nodes of these types make way for it. FAQPage and QAPage are WebPages too, but they
+// earn rich results of their own, so they stay.
+const REGENERATED = new Set([
+  'WebSite', 'WebPage', 'AboutPage', 'CheckoutPage', 'ContactPage', 'ItemPage', 'SearchResultsPage', 'CollectionPage', 'ProfilePage',
+  'Article', 'BlogPosting', 'NewsArticle', 'BreadcrumbList',
+]);
+// What a dropped page or article node holds that earns rich results of its own.
+const HOISTED = ['mainEntity', 'video'];
+
+type LdNode = Record<string, unknown>;
+const isNode = (v: unknown): v is LdNode => !!v && typeof v === 'object' && !Array.isArray(v);
+/** A bare {"@id": ...}: a reference to a node described elsewhere. */
+const isRef = (v: unknown): v is { '@id': string } => isNode(v) && typeof v['@id'] === 'string' && Object.keys(v).length === 1;
+
+/**
+ * What stays of one node: all of it; only its own types when the seo-head writes some of them
+ * (Yoast marks an FAQ page ["WebPage", "FAQPage"]); or, when it writes all of them, the Recipe,
+ * FAQPage or VideoObject the node held. A top-level node passes its @context on to what it held.
+ * The ids of dropped nodes go to `dropped`.
+ */
+function keepLd(node: unknown, top: boolean, dropped: Set<string>): unknown[] {
+  if (!isNode(node)) return [node];
+  const types = [node['@type']].flat().filter((t): t is string => typeof t === 'string');
+  const own = types.filter((t) => !REGENERATED.has(t));
+  if (own.length === types.length) return [node];
+  if (own.length) return [{ ...node, '@type': own.length === 1 ? own[0] : own }];
+  if (typeof node['@id'] === 'string') dropped.add(node['@id']);
+  const context = top ? node['@context'] : undefined;
+  return HOISTED.flatMap((k) => [node[k] ?? []].flat())
+    .filter((n): n is LdNode => isNode(n) && !isRef(n))
+    .flatMap((n) => keepLd(context && !('@context' in n) ? { '@context': context, ...n } : n, top, dropped));
+}
+
+/** The value without references to dropped nodes (isPartOf, breadcrumb, ...); the same object when it has none. */
+function unlink(v: unknown, dropped: Set<string>): unknown {
+  const gone = (x: unknown) => isRef(x) && dropped.has(x['@id']);
+  if (Array.isArray(v)) {
+    const out = v.filter((x) => !gone(x)).map((x) => unlink(x, dropped));
+    return out.length === v.length && out.every((x, i) => x === v[i]) ? v : out;
+  }
+  if (!isNode(v)) return v;
+  let out: LdNode | undefined;
+  for (const [k, x] of Object.entries(v)) {
+    const y = gone(x) ? undefined : unlink(x, dropped);
+    if (y === x) continue;
+    out ??= { ...v };
+    if (y === undefined || (Array.isArray(y) && !y.length)) delete out[k];
+    else out[k] = y;
+  }
+  return out ?? v;
+}
+
+/**
+ * Removes the page's own JSON-LD that the seo-head block replaces and keeps the rest: the Recipe,
+ * Product, FAQPage, Event or LocalBusiness markup that earned the page its rich results. Yoast and
+ * plugins put those in one @graph, so this works node by node, and references to the dropped
+ * nodes go with them.
+ */
+function pruneJsonLd($: Doc): void {
+  const blocks: Array<{ el: AnyNode; data: unknown; graph: boolean; nodes: unknown[]; kept: unknown[] }> = [];
+  const dropped = new Set<string>();
+  $('script[type="application/ld+json"]').each((_, el) => {
+    try {
+      const data: unknown = JSON.parse($(el).html() ?? '');
+      const graph = isNode(data) && Array.isArray(data['@graph']);
+      const nodes = graph ? (data['@graph'] as unknown[]) : Array.isArray(data) ? data : [data];
+      blocks.push({ el, data, graph, nodes, kept: nodes.flatMap((n) => keepLd(n, !graph, dropped)) });
+    } catch {
+      // Unreadable (or nested past what the parser can take): leave the site's markup as it was.
+    }
+  });
+  // A node another block still describes is not gone.
+  for (const b of blocks) for (const n of b.kept) if (isNode(n) && typeof n['@id'] === 'string') dropped.delete(n['@id']);
+  for (const { el, data, graph, nodes, kept: pruned } of blocks) {
+    let kept = pruned;
+    try {
+      if (dropped.size) kept = unlink(kept, dropped) as unknown[];
+      if (kept.length === nodes.length && kept.every((n, i) => n === nodes[i])) continue;
+      if (!kept.length) removeNode($, el);
+      else $(el).text(`\n${jsonLd(graph ? { ...(data as LdNode), '@graph': kept } : Array.isArray(data) || kept.length > 1 ? kept : kept[0])}\n`);
+    } catch {
+      // As above: too deep to walk or to write back.
+    }
+  }
+}
+
 export function applySeo($: Doc, meta: PageMeta, site: SiteContext): void {
   for (const sel of REMOVE) $(sel).each((_, el) => removeNode($, el));
+  pruneJsonLd($);
   $('meta[http-equiv]').each((_, el) => {
     if (($(el).attr('http-equiv') ?? '').toLowerCase() === 'content-type') removeNode($, el);
   });
