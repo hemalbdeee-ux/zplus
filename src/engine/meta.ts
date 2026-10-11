@@ -86,7 +86,10 @@ function contentRoot($: Doc) {
 }
 
 export interface ExtractOptions {
-  /** True when the restored site has a file for this original path (images that are not in the archive are skipped). */
+  /**
+   * True when the restored site has a file for this original path: images that are not in the
+   * archive are skipped, and so is an original canonical that names a page it does not have.
+   */
   hasPath?: (pathAndQuery: string) => boolean;
 }
 
@@ -185,10 +188,18 @@ export function extractMeta($: Doc, pageUrl: URL, domain: string, opts: ExtractO
     if (v && v.length <= 50) tags.add(v);
   });
 
-  const robots = (attr($, 'meta[name="robots" i]') ?? '').toLowerCase();
+  // Every robots meta counts, and one for Google's crawler too; Google follows the strictest.
+  // "none" is noindex, nofollow.
+  const robots = $('meta[name="robots" i], meta[name="googlebot" i]')
+    .toArray()
+    .map((el) => ($(el).attr('content') ?? '').toLowerCase())
+    .join(',');
   const canonicalHref = attr($, 'link[rel="canonical"]', 'href');
   const canonicalUrl = canonicalHref ? toUrl(canonicalHref, pageUrl) : null;
-  const canonicalPath = canonicalUrl && isInternal(canonicalUrl, domain) ? pathAndQuery(canonicalUrl) : undefined;
+  const canonicalTarget = canonicalUrl && isInternal(canonicalUrl, domain) ? pathAndQuery(canonicalUrl) : undefined;
+  // An original canonical that names a page the archive did not have (the post captured only as
+  // /?p=12) would send search engines to a 404 and keep the only copy out of the sitemaps.
+  const canonicalPath = canonicalTarget && (canonicalTarget === path || !opts.hasPath || opts.hasPath(canonicalTarget)) ? canonicalTarget : undefined;
 
   const pathOnly = pageUrl.pathname;
   const query = pageUrl.search;
@@ -225,7 +236,7 @@ export function extractMeta($: Doc, pageUrl: URL, domain: string, opts: ExtractO
     author,
     tags: [...tags].slice(0, 20),
     lang: $('html').attr('lang')?.trim() || undefined,
-    noindex: /\bnoindex\b/.test(robots),
+    noindex: /\b(?:noindex|none)\b/.test(robots),
     canonicalPath,
     siteNameHint: attr($, 'meta[property="og:site_name"]') ?? attr($, 'meta[name="application-name" i]'),
   };

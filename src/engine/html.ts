@@ -2,7 +2,7 @@
 
 import * as cheerio from 'cheerio';
 import type { CheerioAPI } from 'cheerio';
-import type { AnyNode, Element } from 'domhandler';
+import type { AnyNode, ChildNode, Element, ParentNode } from 'domhandler';
 
 export type Doc = CheerioAPI;
 
@@ -17,10 +17,65 @@ export function removeNode($: Doc, el: AnyNode): void {
 }
 
 export function loadHtml(html: string): Doc {
-  if (!/<form[\s/>]/i.test(html)) return cheerio.load(html);
-  const $ = cheerio.load(html, { sourceCodeLocationInfo: true });
-  keepFormOwners($, html);
+  const forms = /<form[\s/>]/i.test(html);
+  const $ = forms ? cheerio.load(html, { sourceCodeLocationInfo: true }) : cheerio.load(html);
+  capDepth($.root().get(0)!);
+  if (forms) keepFormOwners($, html);
   return $;
+}
+
+// Blink and WebKit stop nesting at 512 levels: an element deeper than that goes in beside the
+// open one instead of inside it. A guestbook or link list that leaves a <div> or <font> open per
+// entry nests thousands deep here, deep enough to overflow the stack of everything that walks the
+// tree (text(), html(), the selector engine). Flattened the same way, it stays as browsers show it.
+const MAX_TREE_DEPTH = 512;
+const hasNodes = (n: AnyNode): n is ParentNode => 'children' in n;
+/** The document fragment that holds a <template>'s content, a tree of its own. */
+const templateContent = (n: AnyNode): ParentNode | undefined =>
+  isElement(n) && n.name === 'template' && isHtml(n) && n.children[0] && hasNodes(n.children[0]) ? n.children[0] : undefined;
+
+function capDepth(root: ParentNode): void {
+  const todo: Array<[ParentNode, number]> = [[root, 0]];
+  while (todo.length) {
+    const [node, depth] = todo.pop()!;
+    for (const child of node.children) {
+      const content = templateContent(child);
+      if (content) todo.push([content, 0]);
+      else if (hasNodes(child)) {
+        if (depth + 1 < MAX_TREE_DEPTH) todo.push([child, depth + 1]);
+        else flatten(child, todo);
+      }
+    }
+  }
+}
+
+/**
+ * Puts every element under `box` straight in it, in document order, as Blink does past the limit:
+ * the elements go in beside each other, while text stays in the element that was open for it.
+ */
+function flatten(box: ParentNode, todo: Array<[ParentNode, number]>): void {
+  const out: ChildNode[] = [];
+  const next = [...box.children].reverse();
+  while (next.length) {
+    const n = next.pop()!;
+    out.push(n);
+    const content = templateContent(n);
+    if (content) todo.push([content, 0]);
+    else if (hasNodes(n) && n.children.some(hasNodes)) {
+      for (let i = n.children.length - 1; i >= 0; i--) if (hasNodes(n.children[i])) next.push(n.children[i]);
+      relink(n, n.children.filter((c) => !hasNodes(c)));
+    }
+  }
+  relink(box, out);
+}
+
+function relink(parent: ParentNode, children: ChildNode[]): void {
+  parent.children = children;
+  children.forEach((n, i) => {
+    n.parent = parent;
+    n.prev = children[i - 1] ?? null;
+    n.next = children[i + 1] ?? null;
+  });
 }
 
 // Old table layouts put forms where the parser cannot nest them: <table><form><tr><td><input>, or
@@ -113,8 +168,29 @@ function keepFormOwners($: Doc, html: string): void {
     }
   };
   walk($.root().get(0)?.children ?? [], undefined);
-  if (!forms.length || !controls.length) return;
+  let made = 0;
+  const newId = () => {
+    let id: string;
+    do id = `wbd-form-${++made}`;
+    while (ids.has(id));
+    ids.set(id, 1);
+    return id;
+  };
+  if (controls.length && forms.length) tieOrphans($, html, forms, controls, ids, newId, opaque, endTags, copies);
+  if (forms.length > 1) unnestForms($, ids, newId);
+}
 
+function tieOrphans(
+  $: Doc,
+  html: string,
+  forms: Element[],
+  controls: Element[],
+  ids: Map<string, number>,
+  newId: () => string,
+  opaque: Array<[number, number]>,
+  endTags: Array<[number, number]>,
+  copies: Map<Element, Array<{ copy: Element; child: Element }>>,
+): void {
   const formEnds = tagsOutside(html, /<\/form[\s/>]/gi, merge([...opaque, ...endTags]));
   const moved = copies.size || controls.some((el) => isCopy(el.children[0])) ? movedControls($, html, merge(opaque), copies) : () => false;
 
@@ -125,7 +201,6 @@ function keepFormOwners($: Doc, html: string): void {
   controls.sort((a, b) => at(a) - at(b));
   let e = 0;
   let c = 0;
-  let made = 0;
   for (const form of forms) {
     const from = locOf(form)!.startTag!.endOffset;
     while (e < formEnds.length && formEnds[e] < from) e++;
@@ -138,15 +213,84 @@ function keepFormOwners($: Doc, html: string): void {
     if (!orphans.length) continue;
     let id = form.attribs.id;
     if (id && ids.get(id) !== 1) continue; // form="..." would find another element first
-    if (!id) {
-      do {
-        id = `wbd-form-${++made}`;
-      } while (ids.has(id));
-      ids.set(id, 1);
-      form.attribs.id = id;
-    }
+    if (!id) id = form.attribs.id = newId();
     for (const el of orphans) el.attribs.form = id;
   }
+}
+
+const TABLE_PARTS = new Set(['table', 'tbody', 'thead', 'tfoot', 'tr']);
+
+/**
+ * A form the parser left open (its </form> in a later cell, or met while a <font> or <div> in it
+ * was still open) holds every form after it. Browsers made those inner forms anyway, as the form
+ * pointer was clear, and gave them their controls; in the written page an inner <form> tag comes
+ * while the outer form is open, so it is dropped and its controls go to the outer form. Each inner
+ * form moves out to just after the outermost form around it, emptied and hidden, and its controls
+ * get form="<its id>"; what it held stays in place, in a <div> (a form is a block) unless it sat
+ * straight in a table. The forms keep their order, so document.forms[1] is still the same form.
+ */
+function unnestForms($: Doc, ids: Map<string, number>, newId: () => string): void {
+  // One walk, in document order, finds the outermost form around each nested form and the form
+  // around each control.
+  const tops = new Map<Element, Element>();
+  const owned: Array<[Element, Element]> = [];
+  const todo: Array<[AnyNode, Element | undefined, Element | undefined]> = [];
+  const visit = (node: ParentNode, near?: Element, top?: Element) => {
+    for (let i = node.children.length - 1; i >= 0; i--) todo.push([node.children[i], near, top]);
+  };
+  visit($.root().get(0)!);
+  while (todo.length) {
+    const [n, near, top] = todo.pop()!;
+    if (!isElement(n) || (n.name === 'template' && isHtml(n))) continue; // template content is a tree of its own
+    if (n.name === 'form' && isHtml(n)) {
+      if (top) tops.set(n, top);
+      visit(n, n, top ?? n);
+      continue;
+    }
+    if (near && LISTED.has(n.name) && isHtml(n) && n.attribs.form === undefined && tops.has(near)) owned.push([n, near]);
+    visit(n, near, top);
+  }
+  if (!tops.size) return;
+
+  const moved = new Set<Element>();
+  const after = new Map<Element, Element[]>(); // outer form -> the forms moved out after it, in order
+  const parents = new Set<ParentNode>();
+  for (const [form, top] of tops) {
+    let id = form.attribs.id;
+    if (id && ids.get(id) !== 1) continue; // form="..." would find another element first
+    if (!id) id = form.attribs.id = newId();
+    const copy = form.cloneNode(false);
+    copy.attribs.style = 'display:none !important';
+    if (!after.has(top)) after.set(top, []);
+    after.get(top)!.push(copy);
+    moved.add(form);
+    parents.add(form.parent!).add(top.parent!);
+  }
+  // Each parent's children are rebuilt once, the deepest first, so a moved form that held another
+  // has its new children by the time its own parent takes them.
+  const depth = new Map<ParentNode, number>();
+  for (const p of parents) {
+    let d = 0;
+    for (let q = p.parent; q; q = q.parent) d++;
+    depth.set(p, d);
+  }
+  const block = $('<div></div>').get(0) as Element;
+  for (const parent of [...parents].sort((x, y) => depth.get(y)! - depth.get(x)!)) {
+    const kids: ChildNode[] = [];
+    for (const c of parent.children) {
+      if (isElement(c) && moved.has(c)) {
+        if (c.children.length && !(isElement(parent) && TABLE_PARTS.has(parent.name))) {
+          const div = block.cloneNode(false);
+          relink(div, c.children);
+          kids.push(div);
+        } else for (const k of c.children) kids.push(k);
+      } else kids.push(c);
+      if (isElement(c)) for (const copy of after.get(c) ?? []) kids.push(copy);
+    }
+    relink(parent, kids);
+  }
+  // Its controls: the ones the browser gave it by the pointer, or as the form around them.
+  for (const [control, form] of owned) if (moved.has(form)) control.attribs.form = form.attribs.id;
 }
 
 function inside(x: AnyNode, y: AnyNode): boolean {

@@ -142,7 +142,7 @@ ga('create', 'UA-1-1', 'auto'); ga('send', 'pageview');`;
   });
 
   it('drops a script whole, as before, when a tracker it loads cannot be cut out', () => {
-    const $ = loadHtml(`<html><head></head><body><script>jQuery(function($){ $('.slider').slick(); $.getScript('https://www.google-analytics.com/analytics.js', function(){ ga('create', 'UA-1-1', 'auto'); ga('send', 'pageview'); }); });</script></body></html>`);
+    const $ = loadHtml(`<html><head></head><body><script>jQuery(function($){ $('.slider').slick(); $('head').append('<script src="https://www.google-analytics.com/analytics.js"><\\/script>'); ga('create', 'UA-1-1', 'auto'); ga('send', 'pageview'); });</script></body></html>`);
     assert.equal(cleanDocument($, { stripTracking: true }).trackersRemoved, 1);
     assert.deepEqual(inlineScripts($).filter((c) => !c.includes('hitCallback')), []);
   });
