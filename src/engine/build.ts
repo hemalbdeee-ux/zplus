@@ -573,6 +573,17 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
     }),
   );
   const hasPath = (p: string) => available.has(p);
+  // The exact addresses the restored site answers: a page's content, or the original site's own
+  // redirect. A canonical may only name one of these; hasPath also knows the bare path of a
+  // query-string capture, which is right for finding images but would let a canonical 404.
+  const served = new Set<string>();
+  for (const r of manifest.resources) {
+    if (!(r.status === 200 && r.file) && !(r.status >= 300 && r.status < 400 && r.location)) continue;
+    const u = new URL(r.url);
+    served.add(r.path);
+    served.add(mergeSlashes(u.pathname) + cleanSearch(u.search));
+  }
+  const isServed = (p: string) => served.has(p);
 
   // 2. Site-wide facts: name, description, logo, feed address.
   const htmlPlans = plans.filter((p) => p.kind === 'html');
@@ -591,7 +602,7 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
     const { text } = decodeText(await readRaw(home.res), home.res.contentType ?? '');
     const source = htmlSource(text, home.res.contentType ?? '');
     const $ = loadHtml(source);
-    const meta = extractMeta($, new URL(home.res.url), opts.domain, { hasPath });
+    const meta = extractMeta($, new URL(home.res.url), opts.domain, { hasPath, isServed });
     homeTitle = meta.title;
     siteNameHint = meta.siteNameHint;
     siteDescription = meta.description;
@@ -657,7 +668,7 @@ export async function buildSite(manifest: Manifest, opts: BuildOptions): Promise
       // the URL as the browser has it.
       const pageAddress = new URL(pageUrl);
       pageAddress.pathname = p.route?.exact ? mergeSlashes(pageUrl.pathname) : pageUrl.pathname.replace(/^\/{2,}/, '/');
-      const meta = extractMeta($, pageAddress, opts.domain, { hasPath });
+      const meta = extractMeta($, pageAddress, opts.domain, { hasPath, isServed });
       for (const key of ['canonicalPath', 'image'] as const) meta[key] = meta[key]?.replace(/^\/{2,}/, '/');
       applySeo($, meta, site);
       // Only the parser's own doctype is replaced, not one in a comment before it.
