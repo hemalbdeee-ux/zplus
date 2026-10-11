@@ -9,16 +9,111 @@ function validLabel(label: string): string | null {
   }
 }
 
-/** The encoding of the first <meta> with a usable charset. Scans tag by tag, so a long or unclosed tag costs linear time. */
+const SPACE = /[\t\n\f\r ]/;
+// <noscript> is not one of them: the prescan runs with scripting off, so the tags in it count.
+const RAW_TEXT = new Set(['script', 'style', 'title', 'textarea', 'xmp', 'iframe', 'noembed', 'noframes']);
+
+type Attribute = { name: string; value: string; end: number };
+
+/**
+ * The next attribute of a tag from text[at], read as the prescan reads it ("get an attribute"):
+ * names and values lowercased, quoted values may hold > and <. A number when there is none: where
+ * the > that ends the tag is, or -1 when the text ends first.
+ */
+function nextAttribute(text: string, at: number): Attribute | number {
+  let i = at;
+  while (i < text.length && (SPACE.test(text[i]) || text[i] === '/')) i++;
+  if (i >= text.length) return -1;
+  if (text[i] === '>') return i;
+  let name = text[i++];
+  for (; i < text.length && text[i] !== '=' && !SPACE.test(text[i]) && text[i] !== '/' && text[i] !== '>'; i++) name += text[i];
+  while (i < text.length && SPACE.test(text[i])) i++;
+  if (text[i] !== '=') return { name: name.toLowerCase(), value: '', end: i };
+  for (i++; i < text.length && SPACE.test(text[i]); i++);
+  const quote = text[i] === '"' || text[i] === "'" ? text[i] : '';
+  const from = quote ? i + 1 : i;
+  if (quote) {
+    i = text.indexOf(quote, from);
+    if (i < 0) return -1;
+  } else while (i < text.length && !SPACE.test(text[i]) && text[i] !== '>') i++;
+  return { name: name.toLowerCase(), value: text.slice(from, i).toLowerCase(), end: quote ? i + 1 : i };
+}
+
+/** Reads the attributes of the tag from text[at] to its >; where that > is, or -1 when the text ends first. */
+function readTag(text: string, at: number, each: (a: Attribute) => void): number {
+  for (;;) {
+    const a = nextAttribute(text, at);
+    if (typeof a === 'number') return a;
+    each(a);
+    at = a.end;
+  }
+}
+
+/** The charset named in a content="text/html; charset=..." value ("extracting a character encoding from a meta element"). */
+function contentCharset(value: string): string | null {
+  const re = /charset\s*(=?)\s*/g;
+  for (let m = re.exec(value); m; m = re.exec(value)) {
+    if (!m[1]) continue;
+    const rest = value.slice(m.index + m[0].length);
+    if (rest[0] === '"' || rest[0] === "'") {
+      const end = rest.indexOf(rest[0], 1);
+      return end < 0 ? null : validLabel(rest.slice(1, end));
+    }
+    const label = /^[^\t\n\f\r ;]+/.exec(rest)?.[0];
+    return label ? validLabel(label) : null;
+  }
+  return null;
+}
+
+/**
+ * The encoding of the first <meta> that declares one, found the way browsers prescan a page:
+ * tag by tag, past comments and attribute values, and a content="...charset=..." only with
+ * http-equiv="Content-Type" (an old declaration left in a comment, or a keywords meta that says
+ * "charset=", is not one). Each step moves forward, so the scan takes linear time.
+ */
 function metaEncoding(text: string): string | null {
-  const re = /<meta[\s/]/gi;
-  for (let m = re.exec(text); m; m = re.exec(text)) {
-    const end = text.indexOf('>', m.index);
-    const label = /charset\s*=\s*(?:["']\s*)?([a-z0-9_:.-]+)/i.exec(text.slice(m.index, end < 0 ? undefined : end))?.[1];
-    const enc = label ? validLabel(label) : null;
-    if (enc) return enc;
-    if (end < 0) break;
-    re.lastIndex = end;
+  for (let i = text.indexOf('<'); i >= 0 && i < text.length; i = text.indexOf('<', i)) {
+    if (text.startsWith('<!--', i)) {
+      // A comment ends at --> (<!--> and <!---> are empty ones) or at --!>, as the tokenizer reads it.
+      const end = text.indexOf('-->', i + 2);
+      const bang = text.indexOf('--!>', i + 4);
+      if (end < 0 && bang < 0) return null;
+      i = bang >= 0 && (end < 0 || bang < end) ? bang + 4 : end + 3;
+    } else if (/^<meta[\t\n\f\r /]/i.test(text.slice(i, i + 6))) {
+      // Every attribute counts, a repeated one too, the last one winning, as in Chromium; a charset
+      // attribute wins over content= whatever their order.
+      let pragma = false;
+      let need: boolean | null = null;
+      let charset: string | null = null;
+      const end = readTag(text, i + 5, (a) => {
+        if (a.name === 'http-equiv') pragma ||= a.value === 'content-type';
+        else if (a.name === 'charset') [charset, need] = [validLabel(a.value), false];
+        else if (a.name === 'content' && need !== false) {
+          const found = contentCharset(a.value);
+          if (found) [charset, need] = [found, true];
+        }
+      });
+      if (end < 0) return null;
+      if (charset && need !== null && (pragma || !need)) return charset;
+      i = end + 1;
+    } else if (/^<\/?[a-z]/i.test(text.slice(i, i + 3))) {
+      let at = i + 2;
+      while (at < text.length && !SPACE.test(text[at]) && text[at] !== '>' && text[at] !== '/') at++;
+      const name = text.slice(i + 1, at).toLowerCase();
+      const end = readTag(text, at, () => {});
+      if (end < 0) return null;
+      i = end + 1;
+      // A script or style holds text, not tags, as the tokenizer browsers prescan with knows.
+      if (RAW_TEXT.has(name)) {
+        const close = text.slice(i).search(new RegExp(`</${name}[\\t\\n\\f\\r />]`, 'i'));
+        if (close < 0) return null;
+        i += close;
+      }
+    } else if (/^<[!/?]/.test(text.slice(i, i + 2))) {
+      const end = text.indexOf('>', i + 2);
+      if (end < 0) return null;
+      i = end + 1;
+    } else i++;
   }
   return null;
 }
@@ -26,7 +121,7 @@ function metaEncoding(text: string): string | null {
 /** The encoding a browser takes from a <meta> or <?xml?> declaration, or null when there is none. */
 function declaredInMarkup(body: Buffer): string | null {
   const head = body.subarray(0, 4096).toString('latin1');
-  const xml = /<\?xml[^>]+encoding\s*=\s*["']([a-z0-9_:.-]+)/i.exec(head)?.[1];
+  const xml = /^\s*<\?xml[^>]+encoding\s*=\s*["']([a-z0-9_:.-]+)/i.exec(head)?.[1];
   let enc = metaEncoding(head) ?? (xml ? validLabel(xml) : null);
   if (!enc && body.length > 4096) {
     // Browsers still switch when the parser reaches a later <meta> (after a long script or keyword

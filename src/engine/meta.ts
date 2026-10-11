@@ -2,6 +2,7 @@
 // tags, and whether it is a blog post, a plain page or a tag/author/date archive. The SEO layer
 // and the sitemaps are built from this.
 
+import type { AnyNode, Element } from 'domhandler';
 import type { Doc } from './html.ts';
 import { loadHtml, visibleText } from './html.ts';
 import { isInternal, pathAndQuery, toUrl } from './url.ts';
@@ -32,6 +33,12 @@ const TAG_PATH = /\/(tag|tags|category|categories|topics?|labels?|search\/label)
 const AUTHOR_PATH = /\/author\/[^/]+\/?$/i;
 const ARCHIVE_PATH = /\/page\/\d+\/?$|^\/(19|20)\d{2}\/((0[1-9]|1[0-2])\/)?((0[1-9]|[12]\d|3[01])\/)?$/;
 const DATE_IN_PATH = /\/((?:19|20)\d{2})\/(0[1-9]|1[0-2])(?:\/(0[1-9]|[12]\d|3[01]))?\//;
+
+/** Is the node in a <template>'s content, which is not part of the page? */
+function inTemplate(node: AnyNode): boolean {
+  for (let p = node.parent; p; p = p.parent) if (p.type === 'tag' && (p as Element).name === 'template') return true;
+  return false;
+}
 
 function attr($: Doc, selector: string, name = 'content'): string | undefined {
   const v = $(selector).first().attr(name);
@@ -86,8 +93,18 @@ function contentRoot($: Doc) {
 }
 
 export interface ExtractOptions {
-  /** True when the restored site has a file for this original path (images that are not in the archive are skipped). */
+  /**
+   * True when the restored site has a file for this original path: images that are not in the
+   * archive are skipped, and so is an original canonical that names a page it does not have
+   * (when isServed is not given).
+   */
   hasPath?: (pathAndQuery: string) => boolean;
+  /**
+   * True when the restored site answers exactly this path and query with a page or with the
+   * original site's redirect. hasPath also knows /item.php when only /item.php?id=5 was captured;
+   * an original canonical needs the address itself.
+   */
+  isServed?: (pathAndQuery: string) => boolean;
 }
 
 export function extractMeta($: Doc, pageUrl: URL, domain: string, opts: ExtractOptions = {}): PageMeta {
@@ -185,10 +202,20 @@ export function extractMeta($: Doc, pageUrl: URL, domain: string, opts: ExtractO
     if (v && v.length <= 50) tags.add(v);
   });
 
-  const robots = (attr($, 'meta[name="robots" i]') ?? '').toLowerCase();
+  // Every robots meta counts, and one for Google's crawler too; Google follows the strictest.
+  // The directive "none" is noindex, nofollow; the value of max-image-preview:none is not.
+  const robots = $('meta[name="robots" i], meta[name="googlebot" i]')
+    .toArray()
+    .filter((el) => !inTemplate(el))
+    .map((el) => ($(el).attr('content') ?? '').toLowerCase())
+    .join(',');
   const canonicalHref = attr($, 'link[rel="canonical"]', 'href');
   const canonicalUrl = canonicalHref ? toUrl(canonicalHref, pageUrl) : null;
-  const canonicalPath = canonicalUrl && isInternal(canonicalUrl, domain) ? pathAndQuery(canonicalUrl) : undefined;
+  const canonicalTarget = canonicalUrl && isInternal(canonicalUrl, domain) ? pathAndQuery(canonicalUrl) : undefined;
+  // An original canonical that names a page the archive did not have (the post captured only as
+  // /?p=12) would send search engines to a 404 and keep the only copy out of the sitemaps.
+  const served = opts.isServed ?? opts.hasPath;
+  const canonicalPath = canonicalTarget && (canonicalTarget === path || !served || served(canonicalTarget)) ? canonicalTarget : undefined;
 
   const pathOnly = pageUrl.pathname;
   const query = pageUrl.search;
@@ -225,7 +252,7 @@ export function extractMeta($: Doc, pageUrl: URL, domain: string, opts: ExtractO
     author,
     tags: [...tags].slice(0, 20),
     lang: $('html').attr('lang')?.trim() || undefined,
-    noindex: /\bnoindex\b/.test(robots),
+    noindex: /\bnoindex\b|(?<!:\s*)\bnone\b/.test(robots),
     canonicalPath,
     siteNameHint: attr($, 'meta[property="og:site_name"]') ?? attr($, 'meta[name="application-name" i]'),
   };

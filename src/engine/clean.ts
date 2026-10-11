@@ -56,7 +56,7 @@ const TRACKER_SRC = new RegExp(
 );
 
 const TRACKER_INLINE =
-  /(GoogleAnalyticsObject|_gaq\.push|\bgtag\(|\bga\(\s*['"](?:create|send)|googletagmanager\.com|\bfbq\(|_fbq|hotjar|_hmt\.push|\bym\(\d+|yaCounter|sc_project|_qevents|adsbygoogle|clicky_site_ids|addthis_config|__gaTracker|urchinTracker|pageTracker\._track|_paq\.push)/;
+  /(GoogleAnalyticsObject|_gaq\.push|\bgtag\(|\bga\(\s*['"](?:create|send)|googletagmanager\.com|\bfbq\(|_fbq|hotjar|_hmt\.push|\bym\(\d+|yaCounter|sc_project|_qevents|adsbygoogle|clicky_site_ids|addthis_config|__gaTracker|urchinTracker|pageTracker\._track|_paq\.push|\btwq\()/;
 
 // A tracker snippet is made of loaders (an IIFE or document.write that names a tracker), calls
 // such as ga('send', 'pageview') and tracker variables such as var _gaq = _gaq || [].
@@ -82,7 +82,7 @@ const loadsFrom = (s: string) => TRACKER_URL(s.replace(HREF, ''));
 const COMMENTS = /\/\*[\s\S]*?\*\/|(^|[^:'"\\=])\/\/.*$/gm;
 // How deep the search for a loader goes into blocks: callbacks, if bodies, functions.
 const MAX_DEPTH = 6;
-const TRACKER_CALL = /^(?:window\.)?(?:ga|gtag|fbq|ym|hj|__gaTracker|urchinTracker|(?:_gaq|_paq|_hmt|_qevents|dataLayer|clicky_site_ids)\.push|pageTracker\.\w+|clicky\.init)\s*\(/;
+const TRACKER_CALL = /^(?:window\.)?(?:ga|gtag|fbq|ym|hj|twq|__gaTracker|urchinTracker|(?:_gaq|_paq|_hmt|_qevents|dataLayer|clicky_site_ids)\.push|pageTracker\.\w+|clicky\.init)\s*\(/;
 const TRACKER_VAR =
   /^(?:window\.)?(?:_gaq|_gat|ga|gtag|dataLayer|fbq|_fbq|_paq|_hmt|_qevents|_qoptions|__gaTracker|pageTracker|_uacct|_udn|_uff|gaJsHost|scJsHost|sc_\w+|clicky_site_ids|clicky_custom|addthis_\w+|yaCounter\d+|_hjSettings|google_ad_\w+|google_analytics_\w+|_gaUserPrefs)(?:\.\w+)*$/;
 
@@ -384,26 +384,292 @@ function isJump(code: string, st: Tok[], depth = 0): boolean {
   return !!branches && everyStatement(branches, (c, s) => isJump(c, s, depth + 1));
 }
 
-/** Names that the statements declare with var, let, const or function. */
-function declared(list: Tok[][]): Set<string> {
-  const names = new Set<string>();
+/** Names that the statements declare with var, let, const or function, each with the source of its initial value ('' for none). */
+function declarations(code: string, list: Tok[][]): Map<string, string> {
+  const names = new Map<string, string>();
   for (const st of list) {
-    if (st[0].v === 'function' && st[1]?.kind === 'w') names.add(st[1].v);
+    if (st[0].v === 'function' && st[1]?.kind === 'w') names.set(st[1].v, '');
     if (!/^(?:var|let|const)$/.test(st[0].v)) continue;
     let depth = 0;
+    let name = '';
+    let from = -1;
+    const end = (k: number) => {
+      if (name) names.set(name, from < 0 || from >= k ? '' : code.slice(st[from].start, st[k - 1].end));
+      name = '';
+      from = -1;
+    };
     for (let k = 1; k < st.length; k++) {
       const t = st[k];
-      if (t.kind === 'w' && depth === 0 && (k === 1 || st[k - 1].v === ',')) names.add(t.v);
+      if (depth === 0 && t.v === ',') end(k);
+      else if (depth === 0 && t.v === ';' && k === st.length - 1) break;
+      else if (t.kind === 'w' && depth === 0 && (k === 1 || st[k - 1].v === ',')) name = t.v;
+      else if (depth === 0 && t.v === '=' && from < 0 && st[k - 1].kind === 'w') from = k + 1;
       if (t.kind !== 'p') continue;
       if ('([{'.includes(t.v)) depth++;
       else if (')]}'.includes(t.v)) depth--;
     }
+    end(st[st.length - 1].v === ';' ? st.length - 1 : st.length);
   }
   return names;
 }
 
-/** Is st a statement of a loader's function? locals are the names that function declares. */
-function isLoaderStep(code: string, st: Tok[], locals: Set<string>, depth = 0): boolean {
+// The global object and the document, by name. A loader may set tracker globals on them, nothing else.
+const GLOBAL_OBJECT = /^(?:window|document|self|top|parent|globalThis|this)$/;
+// What a page element or the global object comes from; createElement makes the loader's own script tag.
+const PAGE_VALUE = /^(?:window|document|self|top|parent|globalThis|this)\s*(?:$|[.[])|\b(?:getElementById|getElementsBy\w+|querySelector(?:All)?)\s*\(/;
+// Globals the snippets set on window besides TRACKER_VAR: hj, lintrk, i['GoogleAnalyticsObject'] ...
+const TRACKER_SLOT = /^(?:hj|lintrk|_linkedin_\w+|ym|uetq|twq|GoogleAnalyticsObject|yandex_metrika_callbacks)$/;
+
+// The elements a loader makes to load a tracker with: document.createElement('script').
+const LOADER_TAG = /^(['"])(?:script|img|iframe)\1$/i;
+// An argument that is nothing but a literal: 'script', "//bat.bing.com/bat.js", 123, null, !0.
+const LITERAL = /^(?:'[^']*'|"[^"]*"|-?\d[\w.]*|null|undefined|true|false|!\s*[01]|void\s+0)$/;
+
+/**
+ * What a loader's function works with: its parameters and the names it declares (locals); those
+ * of them that hold the window, the document or one of the page's elements (page); its
+ * parameters, which in a snippet carry the names of the globals it sets: i[r] = ..., w[l] = ...;
+ * and the locals that may hold something that is not the loader's own (foreign). A loader only
+ * sets what it made itself (its script tag, its queue function, an object or array literal), so a
+ * local given anything else (an element looked up later, jQuery or the site's namespace passed
+ * in) is foreign. fns holds the functions given to each local, which run as loader code when the
+ * loader calls them.
+ */
+interface Scope {
+  locals: Set<string>;
+  page: Set<string>;
+  params: Set<string>;
+  foreign: Set<string>;
+  fns: Map<string, Fn[]>;
+}
+
+type Fn = { params: string[]; body: string; checked: Map<number, boolean> };
+
+/** Is a declaration's initial value the window, the document or an element of the page? */
+function holdsPage(init: string, page: Set<string>): boolean {
+  const root = /^[\w$]+/.exec(init)?.[0];
+  return !/\bcreateElement\s*\(/.test(init) && (PAGE_VALUE.test(init) || (!!root && page.has(root) && /^[\w$]+\s*(?:$|[.[])/.test(init)));
+}
+
+/**
+ * Each value given to a name in the tokens, outside or inside the functions they define: var x =
+ * v, x = v, a = b = v. A compound assignment (x += v) gives an empty value.
+ */
+function assignedValues(toks: Tok[]): Array<[string, Tok[]]> {
+  const out: Array<[string, Tok[]]> = [];
+  for (let k = 0; k < toks.length; k++) {
+    if (toks[k].v !== '=' || toks[k].kind !== 'p') continue;
+    const end = assignmentTarget(toks, k);
+    if (end < 0 || toks[end].kind !== 'w' || toks[end - 1]?.v === '.') continue;
+    let j = k + 1;
+    for (let depth = 0; j < toks.length; j++) {
+      const t = toks[j];
+      // The value ends at a , or ; or at the bracket around it, or where a new line starts a statement.
+      if (depth === 0 && j > k + 1 && t.nl && t.kind !== 'p' && endsExpression(toks[j - 1])) break;
+      if (t.kind !== 'p') continue;
+      if ('([{'.includes(t.v)) depth++;
+      else if (')]}'.includes(t.v) && --depth < 0) break;
+      else if (depth === 0 && (t.v === ',' || t.v === ';')) break;
+    }
+    out.push([toks[end].v, end === k - 1 ? toks.slice(k + 1, j) : []]);
+  }
+  return out;
+}
+
+/** The value a chain of assignments ends with: function () {...} in n = f.fbq = function () {...}. */
+function lastValue(v: Tok[]): Tok[] {
+  let last = -1;
+  for (let k = 0, depth = 0; k < v.length; k++) {
+    if (v[k].kind !== 'p') continue;
+    if ('([{'.includes(v[k].v)) depth++;
+    else if (')]}'.includes(v[k].v)) depth--;
+    else if (depth === 0 && v[k].v === '=' && assignmentTarget(v, k) >= 0) last = k;
+  }
+  return v.slice(last + 1);
+}
+
+const isArrow = (v: Tok[], k: number) => v[k]?.v === '=' && v[k + 1]?.v === '>' && v[k].end === v[k + 1].start;
+
+/** The function a value is (function (...) {...} or (...) => ...): its parameters and body; null for any other value. */
+function functionOf(code: string, value: Tok[]): Fn | null {
+  const v = lastValue(value);
+  const words = (from: number, to: number) => v.slice(from, to).filter((t, k, a) => t.kind === 'w' && (k === 0 || a[k - 1].v === ',')).map((t) => t.v);
+  if (v[0]?.v === 'function') {
+    let j = v[1]?.v === '*' ? 2 : 1;
+    if (v[j]?.kind === 'w') j++;
+    const close = v[j]?.v === '(' ? closing(v, j) : -1;
+    const end = close > 0 && v[close + 1]?.v === '{' ? closing(v, close + 1) : -1;
+    return end === v.length - 1 ? { params: words(j + 1, close), body: code.slice(v[close + 1].end, v[end].start), checked: new Map() } : null;
+  }
+  const arrow = v[0]?.v === '(' ? closing(v, 0) + 1 : v[0]?.kind === 'w' ? 1 : -1;
+  if (arrow < 1 || !isArrow(v, arrow) || arrow + 2 >= v.length) return null;
+  const params = v[0].v === '(' ? words(1, arrow - 1) : [v[0].v];
+  const at = arrow + 2;
+  if (v[at].v !== '{') return { params, body: code.slice(v[at].start, v[v.length - 1].end), checked: new Map() };
+  return closing(v, at) === v.length - 1 ? { params, body: code.slice(v[at].end, v[v.length - 1].start), checked: new Map() } : null;
+}
+
+/** Is a value one the loader made (its script tag, a function, an object or array literal) or a literal? */
+function loaderValue(code: string, value: Tok[], tags: Set<string>): boolean {
+  const v = lastValue(value);
+  if (!v.length) return false;
+  if (v.length === 1) return LITERAL.test(v[0].v);
+  if (v.length === 2 && /^[!-]$|^void$/.test(v[0].v)) return /^\d/.test(v[1].v);
+  if (functionOf(code, v)) return true;
+  if ((v[0].v === '{' || v[0].v === '[') && closing(v, 0) === v.length - 1) return true;
+  if (v[0].v === 'new' && v[1].v === 'Image') return v.length === 2 || closing(v, 2) === v.length - 1;
+  // x.createElement('script'), or createElement(t) with t the 'script' the snippet passes in
+  const o = v.length - 5;
+  return v[o]?.v === '.' && v[o + 1].v === 'createElement' && v[o + 2].v === '(' && v[o + 4].v === ')' && (LOADER_TAG.test(v[o + 3].v) || tags.has(v[o + 3].v));
+}
+
+function iifeScope(code: string, st: Tok[], body: string, inner: Tok[][]): Scope {
+  const params = new Set<string>();
+  const page = new Set<string>();
+  const open = st.findIndex((t) => t.v === '{');
+  const arrow = st[open - 1]?.v === '>' && st[open - 2]?.v === '=';
+  const head = arrow ? open - 3 : open - 1;
+  const p = st[head]?.v === ')' ? opening(st, head) : -1;
+  const names = p < 0 ? [] : st.slice(p + 1, head).filter((t, k, a) => t.kind === 'w' && (k === 0 || a[k - 1].v === ','));
+  // The arguments it is called with: })(window, document, 'script', ...) or }(window, ...)
+  let k = closing(st, open) + 1;
+  if (st[k]?.v === ')') k++;
+  const args: string[] = [];
+  const close = st[k]?.v === '(' ? closing(st, k) : -1;
+  for (let from = k + 1, j = k + 1, depth = 0; close > 0 && j <= close; j++) {
+    if (depth === 0 && (st[j].v === ',' || j === close)) {
+      args.push(j > from ? code.slice(st[from].start, st[j - 1].end) : '');
+      from = j + 1;
+    } else if (st[j].kind === 'p' && '([{'.includes(st[j].v)) depth++;
+    else if (st[j].kind === 'p' && ')]}'.includes(st[j].v)) depth--;
+  }
+  const foreign = new Set<string>();
+  const tags = new Set<string>();
+  names.forEach((t, i) => {
+    const arg = args[i] ?? '';
+    params.add(t.v);
+    if (GLOBAL_OBJECT.test(arg) || /^(?:window|self|top)\.document$/.test(arg)) page.add(t.v);
+    // What a snippet passes in is a literal ('script', its URL, the name of its global) or the
+    // window and the document; jQuery or an element of the page is the site's.
+    if (arg && !LITERAL.test(arg)) foreign.add(t.v);
+    if (LOADER_TAG.test(arg)) tags.add(t.v);
+  });
+  const locals = new Set(params);
+  for (const [name, init] of declarations(body, inner)) {
+    locals.add(name);
+    page.delete(name);
+    if (holdsPage(init, page)) page.add(name);
+  }
+  const values = assignedValues(inner.flat());
+  const notTag = new Set(values.filter(([, v]) => v.length !== 1 || !LOADER_TAG.test(v[0].v)).map(([name]) => name));
+  for (const [name] of values) {
+    if (notTag.has(name)) tags.delete(name);
+    else if (!params.has(name)) tags.add(name);
+  }
+  const fns = new Map<string, Fn[]>();
+  for (const [name, v] of values) {
+    if (!loaderValue(body, v, tags)) foreign.add(name);
+    const fn = functionOf(body, v);
+    if (fn) fns.set(name, [...(fns.get(name) ?? []), fn]);
+  }
+  return { locals, page, params, foreign, fns };
+}
+
+/** The scope inside a function the loader defines: its parameters, given what it is called with, are foreign. */
+function functionScope(scope: Scope, fn: Fn, inner: Tok[][]): Scope {
+  const locals = new Set(scope.locals);
+  const page = new Set(scope.page);
+  const params = new Set(scope.params);
+  const foreign = new Set(scope.foreign);
+  for (const name of fn.params) {
+    locals.add(name);
+    page.delete(name);
+    params.delete(name);
+    foreign.add(name);
+  }
+  for (const [name, init] of declarations(fn.body, inner)) {
+    locals.add(name);
+    page.delete(name);
+    params.delete(name);
+    if (holdsPage(init, page)) page.add(name);
+  }
+  return { locals, page, params, foreign, fns: scope.fns };
+}
+
+/**
+ * Does a function the loader calls as it runs (f(), or d.addEventListener('DOMContentLoaded', f))
+ * do only what a loader does? Its body runs now, unlike the functions the tracker calls later.
+ */
+function runsAsLoader(name: string, scope: Scope, depth: number): boolean {
+  const fns = scope.fns.get(name);
+  return (
+    !!fns &&
+    depth < 3 &&
+    fns.every((fn) => {
+      // Once per function and depth, however often it is called.
+      const known = fn.checked.get(depth);
+      if (known !== undefined) return known;
+      const inner = statements(fn.body);
+      const inside = inner && functionScope(scope, fn, inner);
+      const ok = !!inner && !!inside && inner.every((st) => isLoaderStep(fn.body, st, inside, depth + 1));
+      fn.checked.set(depth, ok);
+      return ok;
+    })
+  );
+}
+
+/** Does the = at st[k] assign (=, +=, ||= ...), as opposed to compare (==, !=, <=) or start an arrow (=>)? Where its target ends, or -1. */
+function assignmentTarget(st: Tok[], k: number): number {
+  const adjacent = (a: Tok | undefined, b: Tok | undefined) => !!a && !!b && a.end === b.start;
+  if (adjacent(st[k], st[k + 1]) && (st[k + 1].v === '=' || st[k + 1].v === '>')) return -1;
+  let j = k - 1;
+  if (adjacent(st[j], st[k]) && st[j].kind === 'p') {
+    if (st[j].v === '=' || st[j].v === '!') return -1;
+    if ((st[j].v === '<' || st[j].v === '>') && !(adjacent(st[j - 1], st[j]) && st[j - 1].v === st[j].v)) return -1;
+    while (st[j]?.kind === 'p' && /^[-+*/%&|^<>?]$/.test(st[j].v) && adjacent(st[j], st[j + 1])) j--;
+  }
+  return j;
+}
+
+/**
+ * May a loader make this assignment? It may set its own variables and what they hold (the script
+ * tag it made, its queue function), and tracker globals on the window; not a handler, a function
+ * or settings of the site's own on the window or on an element of the page.
+ */
+function loaderMayAssign(st: Tok[], end: number, scope: Scope): boolean {
+  // The target is a name followed by .name and [key] parts: find its root and the part after it.
+  let j = end;
+  let first: { key: Tok[]; bracket: boolean } | undefined;
+  while (st[j]?.v === ']' || (st[j]?.kind === 'w' && st[j - 1]?.v === '.')) {
+    if (st[j].v === ']') {
+      const o = opening(st, j);
+      if (o < 1) return false;
+      first = { key: st.slice(o + 1, j), bracket: true };
+      j = o - 1;
+    } else {
+      first = { key: [st[j]], bracket: false };
+      j -= 2;
+    }
+  }
+  // Anything but a name is the result of a call: document.getElementById('menu').onclick = ...
+  if (st[j]?.kind !== 'w') return false;
+  const root = st[j].v;
+  const trackerName = (name: string) => TRACKER_VAR.test(name) || TRACKER_SLOT.test(name);
+  if (!first) return scope.locals.has(root) || trackerName(root);
+  if (scope.page.has(root) || (GLOBAL_OBJECT.test(root) && !scope.locals.has(root))) {
+    // On the window or the document only a tracker global: w.fbq, i['GoogleAnalyticsObject'], or
+    // w[l] with the name l passed in as the snippet's argument.
+    const [t, more] = first.key;
+    if (!t || more) return false;
+    if (first.bracket && t.kind === 'w') return scope.params.has(t.v);
+    return trackerName(t.kind === 's' ? t.v.slice(1, -1) : t.v);
+  }
+  // Elsewhere only on what the loader made itself: its script tag, its queue function.
+  return (scope.locals.has(root) && !scope.foreign.has(root)) || trackerName(root);
+}
+
+/** Is st a statement of a loader's function? */
+function isLoaderStep(code: string, st: Tok[], scope: Scope, depth = 0): boolean {
   const head = st[0].v;
   // A loop only checks whether the page has the tracker already (Yandex):
   // for (...) { if (document.scripts[j].src === r) { return; } }
@@ -415,16 +681,19 @@ function isLoaderStep(code: string, st: Tok[], locals: Set<string>, depth = 0): 
   // if (!f._fbq) f._fbq = n; but not if (nav) { initDropdowns(nav); }
   if (head === 'if' || head === 'try') {
     const parts = depth < 3 ? (head === 'if' ? ifBranches(code, st) : blocks(code, st)) : null;
-    return !!parts && parts.length > 0 && everyStatement(parts, (c, s) => isLoaderStep(c, s, locals, depth + 1));
+    return !!parts && parts.length > 0 && everyStatement(parts, (c, s) => isLoaderStep(c, s, scope, depth + 1));
   }
   const text = textOf(code, st);
   const call = LOCAL_CALL.exec(text);
-  const step = JUMP.test(text) || LOADER_STEP.test(text) || (!!call && locals.has(call[2] ?? call[3]));
-  return step && loaderCallsOnly(st, locals);
+  const step = JUMP.test(text) || LOADER_STEP.test(text) || (!!call && scope.locals.has(call[2] ?? call[3]));
+  return step && loaderCallsOnly(st, scope, depth) && (!call?.[2] || runsAsLoader(call[2], scope, depth));
 }
 
-/** Does the statement call only what a loader calls (LOADER_CALL) and the loader's own functions? */
-function loaderCallsOnly(st: Tok[], locals: Set<string>): boolean {
+/**
+ * Does the statement call only what a loader calls (LOADER_CALL) and the loader's own functions
+ * (those that do only what a loader does), and assign only what a loader may (loaderMayAssign)?
+ */
+function loaderCallsOnly(st: Tok[], scope: Scope, depth: number): boolean {
   for (let k = 0; k < st.length; k++) {
     const t = st[k];
     // The body of a function it defines: function (...) { ... } and () => { ... }
@@ -442,7 +711,11 @@ function loaderCallsOnly(st: Tok[], locals: Set<string>): boolean {
       if (k < 0) return false;
     } else if (t.v === '(' && t.kind === 'p' && k > 0) {
       const callee = st[k - 1];
-      if (callee.kind === 'w' ? !NOT_CALLEE.test(callee.v) && !LOADER_CALL.test(callee.v) && !locals.has(callee.v) : /^[)\]]$|^[`'"]/.test(callee.v)) return false;
+      if (callee.kind === 'w' ? !NOT_CALLEE.test(callee.v) && !LOADER_CALL.test(callee.v) && !scope.locals.has(callee.v) : /^[)\]]$|^[`'"]/.test(callee.v)) return false;
+      if (callee.kind === 'w' && st[k - 2]?.v !== '.' && !LOADER_CALL.test(callee.v) && scope.locals.has(callee.v) && !runsAsLoader(callee.v, scope, depth)) return false;
+    } else if (t.v === '=' && t.kind === 'p') {
+      const end = assignmentTarget(st, k);
+      if (end >= 0 && !loaderMayAssign(st, end, scope)) return false;
     }
   }
   return true;
@@ -468,8 +741,8 @@ function isLoader(code: string, st: Tok[], inTry = false): boolean {
     const fn = iifeBody(code, st);
     const inner = fn && statements(fn.body);
     if (!fn || !inner) return false;
-    const locals = declared(inner);
-    return inner.every((s) => isLoaderStep(fn.body, s, locals));
+    const scope = iifeScope(code, st, fn.body, inner);
+    return inner.every((s) => isLoaderStep(fn.body, s, scope));
   }
   // try { var pageTracker = _gat._getTracker("UA-1"); pageTracker._trackPageview(); } catch (err) {}
   const m = /^try\s*\{([\s\S]*)\}\s*catch\s*\(\s*\w+\s*\)\s*\{\s*\}$/.exec(text);
@@ -552,14 +825,13 @@ function blocks(code: string, st: Tok[]): Array<{ body: string; start: number }>
  * script tag at a tracker, also inside the site's own functions, callbacks and if blocks (a
  * consent check, a delayed loadGTM(), MonsterInsights' if (mi_track_user) { ... }).
  */
-function loaderRanges(code: string, base = 0, depth = 0, fill = ''): Array<[number, number, string]> {
-  const out: Array<[number, number, string]> = [];
+function loaderRanges(code: string, base = 0, depth = 0): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
   for (const st of statements(code) ?? []) {
-    if (isLoader(code, st) || setsTrackerSrc(code, st)) out.push([base + st[0].start, base + st[st.length - 1].end, fill]);
+    if (isLoader(code, st) || setsTrackerSrc(code, st)) out.push([base + st[0].start, base + st[st.length - 1].end]);
     else if (depth < MAX_DEPTH) {
       const parts: Part[] = (st[0].v === 'if' && ifBranches(code, st)) || blocks(code, st).map((b) => ({ ...b, braced: true }));
-      // A branch without braces keeps an empty statement in place of the loader: if (ok) ; else ...
-      for (const b of parts) out.push(...loaderRanges(b.body, base + b.start, depth + 1, b.braced ? '' : ';'));
+      for (const b of parts) out.push(...loaderRanges(b.body, base + b.start, depth + 1));
     }
   }
   return out;
@@ -571,12 +843,34 @@ function withoutLoaders(code: string): string {
   if (!cuts.length) return code;
   let out = '';
   let at = 0;
-  for (const [start, end, fill] of cuts) {
-    out += code.slice(at, start) + fill;
+  // An empty statement takes the loader's place. It ends the statement before, which may have no
+  // ; of its own (var a = 'x' then !function(){...}(); then (function(){...})() would otherwise
+  // read as 'x'(...)), and keeps an unbraced branch: if (ok) ; else ...
+  for (const [start, end] of cuts) {
+    out += code.slice(at, start) + ';';
     at = end;
   }
   out += code.slice(at);
   return compiles(out) || !compiles(code) ? out : code;
+}
+
+/**
+ * The script with each string that is the address of a tracker (handed to $.getScript, a site's
+ * own loadScript() or a consent handler) turned into an empty data: URL, so nothing loads from it
+ * and the code around it still runs; null when there is none or the result does not compile.
+ */
+function defused(code: string, tokens: Tok[]): string | null {
+  let out = '';
+  let at = 0;
+  for (const t of tokens) {
+    // A regex literal is no address; nor is markup (a stats badge written into the page).
+    if (t.kind !== 's' || t.v[0] === '/' || /[\s<>]/.test(t.v) || !loadsFrom(t.v)) continue;
+    out += code.slice(at, t.start) + t.v[0] + 'data:,' + t.v[0];
+    at = t.end;
+  }
+  if (!at) return null;
+  out += code.slice(at);
+  return compiles(out) ? out : null;
 }
 
 // Calls to removed trackers, left in the site's own scripts and onclick attributes, go to no-ops
@@ -584,7 +878,7 @@ function withoutLoaders(code: string): string {
 const TRACKER_STUBS =
   '(function(w){var t,f=function(){for(var i=0;i<arguments.length;i++){var a=arguments[i],c=a&&(a.hitCallback||a.event_callback||a.eventCallback);' +
   "if(typeof c=='function')setTimeout(c,0)}return t};t=typeof Proxy=='function'?new Proxy(f,{get:function(o,k){return k in o||typeof k!='string'||k=='then'?o[k]:f}}):f;" +
-  "['ga','gtag','fbq','_fbq','ym','hj','__gaTracker','urchinTracker','_gat','pageTracker','clicky'].forEach(function(n){w[n]=w[n]||t});" +
+  "['ga','gtag','fbq','_fbq','ym','hj','twq','__gaTracker','urchinTracker','_gat','pageTracker','clicky'].forEach(function(n){w[n]=w[n]||t});" +
   "['_gaq','_paq','_hmt','_qevents','dataLayer','clicky_site_ids'].forEach(function(n){if(!w[n]){var q=[];q.push=function(){f.apply(null,arguments);return Array.prototype.push.apply(q,arguments)};w[n]=q}})})(window);";
 
 export interface CleanStats {
@@ -647,12 +941,21 @@ export function cleanDocument($: Doc, opts: { stripTracking: boolean }): CleanSt
       stubs = true;
       return;
     }
-    const kept = withoutLoaders(code);
-    const tokens = jsTokens(kept);
+    let kept = withoutLoaders(code);
+    let tokens = jsTokens(kept);
     // When the script does not lex, comments are cut roughly so that a URL in one does not count.
-    const pointsAtTracker = tokens ? tokens.some((t) => t.kind === 's' && loadsFrom(t.v)) : loadsFrom(kept.replace(COMMENTS, '$1'));
+    const pointsAt = () => (tokens ? tokens.some((t) => t.kind === 's' && loadsFrom(t.v)) : loadsFrom(kept.replace(COMMENTS, '$1')));
+    let pointsAtTracker = pointsAt();
+    // A tracker address handed to a loader that is not cut out (jQuery's $.getScript, the site's
+    // own loadScript) goes on its own, the site code around it stays.
+    const safe = calls && pointsAtTracker && tokens ? defused(kept, tokens) : null;
+    if (safe) {
+      kept = safe;
+      tokens = jsTokens(kept);
+      pointsAtTracker = pointsAt();
+    }
     // Last resort, as before: a script that calls a tracker and still names where one loads from
-    // (a loader that could not be cut out cleanly) goes whole rather than load it.
+    // (in markup it writes, or a loader that could not be cut out cleanly) goes whole rather than load it.
     if (calls && pointsAtTracker) {
       removeNode($, el);
       stats.trackersRemoved++;

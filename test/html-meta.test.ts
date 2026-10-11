@@ -51,7 +51,7 @@ describe('frameset pages read their <noframes> text (finding 31)', () => {
 });
 
 describe("the page's own structured data survives the SEO layer (finding 32)", () => {
-  it('keeps Recipe, Product and FAQPage blocks and replaces Article, WebPage and BreadcrumbList', () => {
+  it('keeps Recipe, Product and FAQPage blocks and replaces a post\'s Article, WebPage and BreadcrumbList', () => {
     const recipe = { '@context': 'https://schema.org', '@type': 'Recipe', name: 'Sourdough', aggregateRating: { '@type': 'AggregateRating', ratingValue: '4.8', ratingCount: '31' } };
     const yoast = {
       '@context': 'https://schema.org',
@@ -64,7 +64,7 @@ describe("the page's own structured data survives the SEO layer (finding 32)", (
       ],
     };
     const webpage = { '@context': 'https://schema.org', '@type': 'WebPage', mainEntity: { '@type': 'FAQPage', mainEntity: [{ '@type': 'Question', name: 'Q?' }] } };
-    const $ = loadHtml(`<html><head><title>Sourdough | Bakery</title>
+    const $ = loadHtml(`<html><head><title>Sourdough | Bakery</title><meta property="article:published_time" content="2019-05-03T08:00:00+00:00">
 <script type="application/ld+json">${JSON.stringify(recipe)}</script>
 <script type="application/ld+json">${JSON.stringify(yoast)}</script>
 <script type="application/ld+json">{ broken json </script>
@@ -104,7 +104,7 @@ describe("the page's own structured data survives the SEO layer (finding 32)", (
         { '@type': 'Question', '@id': 'https://example.com/faq/#q1', name: 'Can I freeze bread?', acceptedAnswer: { '@type': 'Answer', text: 'Yes.' } },
       ],
     };
-    const video = { '@context': 'https://schema.org', '@type': 'BlogPosting', headline: 'Shaping', video: { '@type': 'VideoObject', name: 'Shaping a boule' } };
+    const video = { '@context': 'https://schema.org', '@type': 'WebPage', name: 'Shaping', video: { '@type': 'VideoObject', name: 'Shaping a boule' } };
     const $ = loadHtml(`<html><head><title>FAQ</title><script type="application/ld+json">${JSON.stringify(graph)}</script>
 <script type="application/ld+json">${JSON.stringify(video)}</script></head><body><h1>FAQ</h1></body></html>`);
     applySeo($, extractMeta($, new URL('http://example.com/faq/'), 'example.com'), SITE);
