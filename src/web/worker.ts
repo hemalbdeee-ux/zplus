@@ -12,6 +12,7 @@ import { rm } from 'node:fs/promises';
 import path from 'node:path';
 import { ArchiveClient, type ArchiveOptions } from '../engine/archive.ts';
 import { scanHealth, type HealthReport } from '../engine/health.ts';
+import { proxyEnv } from '../engine/proxy.ts';
 import type { RestoreReport } from '../engine/report.ts';
 import { restore, type RestoreOptions } from '../engine/restore.ts';
 import type { Job, JobStore } from './db.ts';
@@ -237,7 +238,7 @@ export class JobRunner {
     };
 
     return new Promise((resolve) => {
-      const child = fork(import.meta.filename, [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });
+      const child = fork(import.meta.filename, [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'], env: proxyEnv() });
       const controller = new AbortController();
       this.#processes.set(job.id, child);
       this.#aborts.set(job.id, controller);

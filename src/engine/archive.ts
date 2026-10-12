@@ -151,9 +151,12 @@ export class ArchiveClient {
         }
       } catch (err) {
         if (this.signal?.aborted) throw err;
-        if (attempt >= this.retries) throw err;
+        if (attempt >= this.retries) {
+          const host = URL.canParse(url) ? new URL(url).host : undefined;
+          throw host ? new Error(`${host}: ${networkError(err)}`, { cause: err }) : err;
+        }
         retryIn = this.#backoff(attempt);
-        this.log(`request failed (${(err as Error).message}); retrying in ${Math.round(retryIn / 1000)}s`);
+        this.log(`request failed (${networkError(err)}); retrying in ${Math.round(retryIn / 1000)}s`);
       } finally {
         this.#release();
       }
@@ -202,7 +205,11 @@ export class ArchiveClient {
       if (resumeKey) p.set('resumeKey', resumeKey);
 
       const res = await this.#get(`${this.base}/cdx/search/cdx?${p}`);
-      if (res.status !== 200) throw new Error(`CDX query failed with HTTP ${res.status}`);
+      if (res.status !== 200) {
+        // A proxy or the archive usually says why in a line of text ("Blocked by egress policy").
+        const why = res.body.toString('utf8').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+        throw new Error(`CDX query failed with HTTP ${res.status}${why ? `: ${why}` : ''}`);
+      }
       const parsed = parseCdxJson(res.body.toString('utf8'));
       resumeKey = parsed.resumeKey;
       if (parsed.captures.length) yield parsed.captures;
@@ -343,6 +350,28 @@ function parseArchiveUrl(u: URL, base: string): { timestamp: string; original: s
   let original = m[2].replace(/^(https?):\/(?!\/)/i, '$1://');
   if (!/^https?:\/\//i.test(original)) original = 'http://' + original.replace(/^\/+/, '');
   return { timestamp: m[1].padEnd(14, '0'), original };
+}
+
+/**
+ * fetch says only "fetch failed"; its causes name what went wrong (ECONNRESET, a timeout, a proxy
+ * that refused the tunnel). The reason can be several causes deep, and a DOMException's code is a
+ * number, so only string codes count.
+ */
+export function networkError(err: unknown): string {
+  type Cause = { code?: unknown; message?: unknown; cause?: unknown };
+  const top = err as Cause;
+  let code: string | undefined;
+  let message: string | undefined;
+  const seen = new Set<unknown>();
+  for (let c = top.cause as Cause | undefined; c && typeof c === 'object' && !seen.has(c); c = c.cause as Cause | undefined) {
+    seen.add(c);
+    if (typeof c.code === 'string' && c.code) code = c.code;
+    if (typeof c.message === 'string' && c.message) message = c.message;
+  }
+  const head = typeof top.message === 'string' && top.message ? top.message : String(err);
+  const detail = message && (!code || !message.includes(code)) ? message : undefined;
+  const why = code && detail ? `${code} (${detail})` : (code ?? detail);
+  return why && !head.includes(why) ? `${head}: ${why}` : head;
 }
 
 function isRetryable(status: number): boolean {

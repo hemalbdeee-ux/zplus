@@ -13,7 +13,9 @@ node src/cli.ts serve out/oldsite.com/site       # preview with the same URL rul
 npm test                                         # unit + end-to-end tests against a local fake archive
 ```
 
-Requires Node.js 22.18 or newer (TypeScript runs natively, there is no build step).
+Requires Node.js 22.18 or newer (TypeScript runs natively, there is no build step). Behind a proxy
+(`HTTPS_PROXY`), use Node.js 22.21 or newer: the CLI and the web app's job processes then turn on
+`NODE_USE_ENV_PROXY` themselves, since Node's fetch ignores the proxy otherwise.
 
 ## Web app
 
