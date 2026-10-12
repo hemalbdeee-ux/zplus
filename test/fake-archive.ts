@@ -35,6 +35,11 @@ export interface FakeArchive {
   requests: string[];
   /** Answer the next n playback requests with this status before serving normally. */
   failNext(status: number, n: number): void;
+  /**
+   * Drop the connection of the next n requests (CDX or playback) without an answer, as archive.org
+   * does to an address it is throttling: the client sees ECONNRESET, never an HTTP status.
+   */
+  resetNext(n: number): void;
   close(): Promise<void>;
 }
 
@@ -74,10 +79,16 @@ export async function startFakeArchive(captures: FakeCapture[], opts: FakeArchiv
 
   const requests: string[] = [];
   let failures: { status: number; n: number } = { status: 0, n: 0 };
+  let resets = 0;
 
   const server = http.createServer((req, res) => {
     const raw = req.url ?? '/';
     requests.push(raw);
+    if (resets > 0) {
+      resets--;
+      req.socket.resetAndDestroy();
+      return;
+    }
 
     if (raw.startsWith('/cdx/search/cdx')) {
       const q = new URL(raw, 'http://archive.local').searchParams;
@@ -216,6 +227,9 @@ export async function startFakeArchive(captures: FakeCapture[], opts: FakeArchiv
     requests,
     failNext(status, n) {
       failures = { status, n };
+    },
+    resetNext(n) {
+      resets = n;
     },
     close: () => new Promise<void>((r) => server.close(() => r())),
   };

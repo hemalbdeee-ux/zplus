@@ -9,6 +9,7 @@ import { parseArgs } from 'node:util';
 import { ArchiveClient } from './engine/archive.ts';
 import { scanHealth, type HealthReport } from './engine/health.ts';
 import { restore } from './engine/restore.ts';
+import { relaunchWithProxy } from './engine/proxy.ts';
 import { createPreviewServer } from './engine/serve.ts';
 import { normalizeDomain } from './engine/url.ts';
 
@@ -178,7 +179,9 @@ async function main(): Promise<void> {
   throw new Error(`Unknown command "${command}". Run wbd --help.`);
 }
 
-main().catch((err: Error) => {
-  console.error(paint('31', `error: ${err.message}`));
-  process.exitCode = 1;
-});
+if (!relaunchWithProxy()) {
+  main().catch((err: Error) => {
+    console.error(paint('31', `error: ${err.message}`));
+    process.exitCode = 1;
+  });
+}

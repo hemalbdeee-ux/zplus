@@ -151,9 +151,9 @@ export class ArchiveClient {
         }
       } catch (err) {
         if (this.signal?.aborted) throw err;
-        if (attempt >= this.retries) throw err;
+        if (attempt >= this.retries) throw new Error(`${new URL(url).host}: ${networkError(err)}`, { cause: err });
         retryIn = this.#backoff(attempt);
-        this.log(`request failed (${(err as Error).message}); retrying in ${Math.round(retryIn / 1000)}s`);
+        this.log(`request failed (${networkError(err)}); retrying in ${Math.round(retryIn / 1000)}s`);
       } finally {
         this.#release();
       }
@@ -202,7 +202,11 @@ export class ArchiveClient {
       if (resumeKey) p.set('resumeKey', resumeKey);
 
       const res = await this.#get(`${this.base}/cdx/search/cdx?${p}`);
-      if (res.status !== 200) throw new Error(`CDX query failed with HTTP ${res.status}`);
+      if (res.status !== 200) {
+        // A proxy or the archive usually says why in a line of text ("Blocked by egress policy").
+        const why = res.body.toString('utf8').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+        throw new Error(`CDX query failed with HTTP ${res.status}${why ? `: ${why}` : ''}`);
+      }
       const parsed = parseCdxJson(res.body.toString('utf8'));
       resumeKey = parsed.resumeKey;
       if (parsed.captures.length) yield parsed.captures;
@@ -343,6 +347,13 @@ function parseArchiveUrl(u: URL, base: string): { timestamp: string; original: s
   let original = m[2].replace(/^(https?):\/(?!\/)/i, '$1://');
   if (!/^https?:\/\//i.test(original)) original = 'http://' + original.replace(/^\/+/, '');
   return { timestamp: m[1].padEnd(14, '0'), original };
+}
+
+/** fetch says only "fetch failed"; the cause names what went wrong (ECONNRESET, a timeout, ...). */
+function networkError(err: unknown): string {
+  const e = err as Error & { cause?: { code?: string; message?: string } };
+  const why = e.cause?.code ?? e.cause?.message;
+  return why && !e.message.includes(why) ? `${e.message}: ${why}` : e.message;
 }
 
 function isRetryable(status: number): boolean {
