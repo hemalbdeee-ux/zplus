@@ -151,7 +151,10 @@ export class ArchiveClient {
         }
       } catch (err) {
         if (this.signal?.aborted) throw err;
-        if (attempt >= this.retries) throw new Error(`${new URL(url).host}: ${networkError(err)}`, { cause: err });
+        if (attempt >= this.retries) {
+          const host = URL.canParse(url) ? new URL(url).host : undefined;
+          throw host ? new Error(`${host}: ${networkError(err)}`, { cause: err }) : err;
+        }
         retryIn = this.#backoff(attempt);
         this.log(`request failed (${networkError(err)}); retrying in ${Math.round(retryIn / 1000)}s`);
       } finally {
@@ -349,11 +352,26 @@ function parseArchiveUrl(u: URL, base: string): { timestamp: string; original: s
   return { timestamp: m[1].padEnd(14, '0'), original };
 }
 
-/** fetch says only "fetch failed"; the cause names what went wrong (ECONNRESET, a timeout, ...). */
-function networkError(err: unknown): string {
-  const e = err as Error & { cause?: { code?: string; message?: string } };
-  const why = e.cause?.code ?? e.cause?.message;
-  return why && !e.message.includes(why) ? `${e.message}: ${why}` : e.message;
+/**
+ * fetch says only "fetch failed"; its causes name what went wrong (ECONNRESET, a timeout, a proxy
+ * that refused the tunnel). The reason can be several causes deep, and a DOMException's code is a
+ * number, so only string codes count.
+ */
+export function networkError(err: unknown): string {
+  type Cause = { code?: unknown; message?: unknown; cause?: unknown };
+  const top = err as Cause;
+  let code: string | undefined;
+  let message: string | undefined;
+  const seen = new Set<unknown>();
+  for (let c = top.cause as Cause | undefined; c && typeof c === 'object' && !seen.has(c); c = c.cause as Cause | undefined) {
+    seen.add(c);
+    if (typeof c.code === 'string' && c.code) code = c.code;
+    if (typeof c.message === 'string' && c.message) message = c.message;
+  }
+  const head = typeof top.message === 'string' && top.message ? top.message : String(err);
+  const detail = message && (!code || !message.includes(code)) ? message : undefined;
+  const why = code && detail ? `${code} (${detail})` : (code ?? detail);
+  return why && !head.includes(why) ? `${head}: ${why}` : head;
 }
 
 function isRetryable(status: number): boolean {

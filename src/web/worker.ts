@@ -238,7 +238,7 @@ export class JobRunner {
     };
 
     return new Promise((resolve) => {
-      const child = fork(import.meta.filename, [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'], env: proxyEnv(), execArgv: [...process.execArgv, '--disable-warning=UNDICI-EHPA'] });
+      const child = fork(import.meta.filename, [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'], env: proxyEnv() });
       const controller = new AbortController();
       this.#processes.set(job.id, child);
       this.#aborts.set(job.id, controller);
