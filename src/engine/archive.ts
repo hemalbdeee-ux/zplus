@@ -56,6 +56,28 @@ interface RawResponse {
   body: Buffer;
 }
 
+/**
+ * fetch() says only "fetch failed"; the reason (ECONNRESET, ENOTFOUND, a TLS error) is in its
+ * cause, and without it a blocked network and an archive.org outage look the same.
+ */
+function networkError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  const cause = err instanceof Error ? (err.cause as { code?: unknown; message?: unknown } | undefined) : undefined;
+  const why = typeof cause?.code === 'string' ? cause.code : typeof cause?.message === 'string' ? cause.message : '';
+  return why && !msg.includes(why) ? `${msg}: ${why}` : msg;
+}
+
+/**
+ * The first line of a short plain-text error body. A firewall or proxy between us and archive.org
+ * answers with its own 403 ("Blocked by egress policy"); quoting it shows the refusal was not
+ * archive.org's. HTML error pages are left out.
+ */
+function plainReason(res: RawResponse): string {
+  if (!/^text\/plain\b/i.test(res.headers.get('content-type') ?? '')) return '';
+  const line = res.body.subarray(0, 300).toString('utf8').split(/\r?\n/).find((l) => l.trim())?.trim() ?? '';
+  return line ? `: ${line.slice(0, 200)}` : '';
+}
+
 const CDX_FIELDS = ['urlkey', 'timestamp', 'original', 'mimetype', 'statuscode', 'digest', 'length'];
 
 export class ArchiveClient {
@@ -151,9 +173,9 @@ export class ArchiveClient {
         }
       } catch (err) {
         if (this.signal?.aborted) throw err;
-        if (attempt >= this.retries) throw err;
+        if (attempt >= this.retries) throw new Error(networkError(err), { cause: err });
         retryIn = this.#backoff(attempt);
-        this.log(`request failed (${(err as Error).message}); retrying in ${Math.round(retryIn / 1000)}s`);
+        this.log(`request failed (${networkError(err)}); retrying in ${Math.round(retryIn / 1000)}s`);
       } finally {
         this.#release();
       }
@@ -202,7 +224,7 @@ export class ArchiveClient {
       if (resumeKey) p.set('resumeKey', resumeKey);
 
       const res = await this.#get(`${this.base}/cdx/search/cdx?${p}`);
-      if (res.status !== 200) throw new Error(`CDX query failed with HTTP ${res.status}`);
+      if (res.status !== 200) throw new Error(`CDX query failed with HTTP ${res.status}${plainReason(res)}`);
       const parsed = parseCdxJson(res.body.toString('utf8'));
       resumeKey = parsed.resumeKey;
       if (parsed.captures.length) yield parsed.captures;
