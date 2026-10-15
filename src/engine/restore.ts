@@ -196,9 +196,12 @@ export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
   }
   let bounds: Window = health?.window ?? {};
   let around: Window | null = null;
-  if (health?.months.length && !health.lastGood && !(givenFrom && givenTo)) {
-    // The user picked the date after the scan found no good month. The window still ends at the
-    // months it found parked or taken over, or the later owner's pages would come back as the site.
+  // A date the user picked outside the period the scan found healthy (or with no healthy period at
+  // all) takes its pages from the period around that date instead.
+  const elsewhere = !!givenTarget && !!health?.lastGood && !inWindow(target, health.window);
+  if (health?.months.length && (!health.lastGood || elsewhere) && !(givenFrom && givenTo)) {
+    // The window still ends at the months the scan found parked or taken over, or the later owner's
+    // pages would come back as the site.
     around = windowAround(health.months, target);
     if (!around) {
       throw new Error(`The health scan found ${domain} parked or run by another owner around ${day(target)}. Pick a date when it was still the old site, or pass --from and --to to restore that period anyway.`);
@@ -210,7 +213,8 @@ export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
     if (window.from && window.to && window.from > window.to) {
       throw new Error(`The health scan cannot vouch for ${domain} around ${day(target)}: the months around it were bad or not checked, so the period to restore would run from ${day(window.from)} to ${day(window.to)}. Pick a date when it was still the old site, or pass --from and --to to restore that period anyway.`);
     }
-    emit('health', `no capture looks like a real website: pages are taken from ${window.from?.slice(0, 8) ?? 'the start'} to ${window.to?.slice(0, 8) ?? 'today'}, between the bad months around the chosen date`);
+    const why = health?.lastGood ? 'the chosen date is outside the period the scan picked' : 'no capture looks like a real website';
+    emit('health', `${why}: pages are taken from ${window.from?.slice(0, 8) ?? 'the start'} to ${window.to?.slice(0, 8) ?? 'today'}, between the bad months around the chosen date`);
   }
   if (givenTarget && !inWindow(target, window)) {
     warnings.push(`The chosen date ${target.slice(0, 8)} is outside the period the site looked healthy; pages were taken from that period instead.`);

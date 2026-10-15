@@ -1,4 +1,4 @@
-// A small stand-in for web.archive.org: the CDX index API and raw "id_" playback, served from
+// A small stand-in for web.archive.org: the CDX index API and raw "id_" (and "if_") playback, served from
 // fixture captures. It behaves like the real archive in the ways the engine depends on:
 // SURT-style keys that ignore www, scheme, case and query order, the nearest-timestamp redirect (no
 // Memento-Datetime), archived redirects with a Location on the archive (with Memento-Datetime),
@@ -146,7 +146,8 @@ export async function startFakeArchive(captures: FakeCapture[], opts: FakeArchiv
       return;
     }
 
-    const m = /^\/web\/(\d{14})id_\/(.+)$/.exec(raw);
+    // if_ is what the snapshots page frames for its preview; it plays back like id_ here.
+    const m = /^\/web\/(\d{14})(?:id|if)_\/(.+)$/.exec(raw);
     if (m) {
       if (failures.n > 0) {
         failures.n--;

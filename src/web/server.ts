@@ -15,6 +15,7 @@ import { normalizeDomain } from '../engine/url.ts';
 import { Content, paginate, type Entry } from './content.ts';
 import { JobStore, MAX_RETRIES, type Job } from './db.ts';
 import { Theme, type ViewContext } from './views.ts';
+import { ownSnapshotProblem, parseOwnSnapshot, waybackLinks } from './snapshot.ts';
 import { JobRunner, type RestoreJobResult, type ScanResult } from './worker.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
@@ -50,6 +51,13 @@ export function configFromEnv(env = process.env): WebConfig {
     scanLimit: Number(env.WBD_SCAN_LIMIT ?? 30),
     restoreLimit: Number(env.WBD_RESTORE_LIMIT ?? 10),
   };
+}
+
+/** What the restore form sent, shown again when it has to be corrected. */
+interface JobForm {
+  target?: string;
+  custom?: string;
+  full?: boolean;
 }
 
 const PER_PAGE = 10;
@@ -94,6 +102,9 @@ function timelineRows(h: HealthReport) {
       const m = h.months.find((x) => x.month === key);
       return {
         cls: m ? m.verdict : 'none',
+        month: key,
+        // The capture a click on the month picks on the snapshots page.
+        stamp: m?.timestamp ?? '',
         pick: h.lastGood?.month === key,
         title: m ? `${name} ${year}: ${m.verdict}${m.score !== null ? ` (${m.score}/100)` : ''}${m.reasons.length ? ' · ' + m.reasons.join('; ') : ''}` : `${name} ${year}: no capture`,
       };
@@ -129,11 +140,18 @@ function restorable(h: HealthReport) {
   );
 }
 
-function snapshotChoices(h: HealthReport) {
-  return restorable(h)
-    .reverse()
-    .slice(0, 36)
-    .map((m) => ({ timestamp: m.timestamp!, score: m.score, selected: m.timestamp === h.lastGood?.timestamp }));
+function snapshotChoices(h: HealthReport, chosen?: string) {
+  const list = restorable(h).reverse().slice(0, 36);
+  const pick = list.some((m) => m.timestamp === chosen) ? chosen : h.lastGood?.timestamp;
+  return list.map((m) => ({ timestamp: m.timestamp!, score: m.score, selected: m.timestamp === pick, last: m.timestamp === h.lastGood?.timestamp }));
+}
+
+/** What the scan says about the month of a timestamp, in the words of the timeline. */
+function monthNote(h: HealthReport, ts: string): { verdict: string; note: string } {
+  const m = h.months.find((x) => x.month === ts.slice(0, 6));
+  const name = `${MONTHS[Number(ts.slice(4, 6)) - 1]} ${ts.slice(0, 4)}`;
+  if (!m) return { verdict: 'none', note: `${name}: no homepage capture checked` };
+  return { verdict: m.verdict, note: `${name}: ${m.verdict}${m.score !== null ? ` (${m.score}/100)` : ''}${m.reasons.length ? ' · ' + m.reasons.join('; ') : ''}` };
 }
 
 /**
@@ -404,7 +422,22 @@ export async function createApp(config: WebConfig) {
     next();
   };
 
-  const jobView = (job: Job) => {
+  /**
+   * The capture the preview frame shows: the user's own snapshot when it is valid, else the one
+   * chosen in the list, else the last good one, else the newest capture that is not parked.
+   */
+  const previewOf = (h: HealthReport, form: JobForm) => {
+    const own = form.custom ? parseOwnSnapshot(form.custom, h.domain) : undefined;
+    const valid = own && !('error' in own) ? own : undefined;
+    const listed = form.target && restorable(h).some((m) => m.timestamp === form.target) ? form.target : undefined;
+    const newest = [...h.months].reverse();
+    const ts = valid?.timestamp ?? listed ?? h.lastGood?.timestamp ?? (newest.find((m) => m.timestamp && m.verdict !== 'bad') ?? newest.find((m) => m.timestamp))?.timestamp;
+    if (!ts) return undefined;
+    const url = valid?.url ?? (ts === h.lastGood?.timestamp && h.lastGood.original ? h.lastGood.original : `http://${h.host}/`);
+    return { ts, url, ...waybackLinks(config.archiveBase, ts, url), ...monthNote(h, ts) };
+  };
+
+  const jobView = (job: Job, form: JobForm = {}) => {
     const result = job.result ? JSON.parse(job.result) : undefined;
     // The scan a restore was made from is kept as long as the restore (JobRunner.sweep), except in
     // a database swept before that rule: then the restore cannot run again (worker.ts scanGone).
@@ -436,9 +469,24 @@ export async function createApp(config: WebConfig) {
       const h = (result as ScanResult).health;
       view.health = h;
       view.rows = timelineRows(h);
-      view.choices = snapshotChoices(h);
+      view.choices = snapshotChoices(h, form.target);
       view.probed = h.months.filter((m) => m.probed);
       view.refusal = refusedScan(job);
+      view.preview = previewOf(h, form);
+      view.archive = config.archiveBase.replace(/\/+$/, '');
+      view.custom = form.custom ?? '';
+      view.full = !!form.full;
+    }
+    if (job.kind === 'restore' && job.target) {
+      // The capture being restored, next to the progress and the result.
+      const parent = job.parent_id ? store.get(job.parent_id) : undefined;
+      const ph = parent?.kind === 'scan' && parent.result ? (JSON.parse(parent.result) as ScanResult).health : undefined;
+      const host = ph?.host ?? job.domain;
+      const url = `http://${host}/`;
+      view.preview = { ts: job.target, url, ...waybackLinks(config.archiveBase, job.target, url), ...(ph ? monthNote(ph, job.target) : { verdict: 'none', note: '' }) };
+      view.previewHost = host;
+      view.previewHeading = job.status === 'done' ? 'The snapshot it was restored from' : 'The snapshot being restored';
+      view.archive = config.archiveBase.replace(/\/+$/, '');
     }
     if (job.kind === 'restore' && result) {
       const r = result as RestoreJobResult;
@@ -468,16 +516,26 @@ export async function createApp(config: WebConfig) {
     const scan = res.locals.job as Job;
     if (scan.kind !== 'scan' || scan.status !== 'done') return res.redirect(303, `/job/${scan.id}/`);
     const health = (JSON.parse(scan.result!) as ScanResult).health;
-    const target = String(req.body?.target ?? '');
-    const valid = restorable(health).some((m) => m.timestamp === target);
+    const custom = String(req.body?.custom ?? '').trim().slice(0, 2000);
     const full = req.body?.mode === 'full';
+    const form: JobForm = { target: String(req.body?.target ?? ''), custom, full };
     const ip = clientKey(req.ip);
     const fail = (msg: string, status: number) => {
       res.locals.formError = msg;
       res.status(status);
-      render(res, 'job', { title: `Snapshots of ${scan.domain} · ${s.title}`, seo: meta({ path: `/job/${scan.id}/`, noindex: true }), job: jobView(scan), formError: msg }, status);
+      render(res, 'job', { title: `Snapshots of ${scan.domain} · ${s.title}`, seo: meta({ path: `/job/${scan.id}/`, noindex: true }), job: jobView(scan, form), formError: msg }, status);
     };
-    if (!valid) return fail('Choose one of the snapshots in the list.', 422);
+    // A snapshot the user names (a Wayback Machine link or a date) wins over the list.
+    let target = form.target!;
+    if (custom) {
+      const own = parseOwnSnapshot(custom, health.domain);
+      if ('error' in own) return fail(own.error, 422);
+      const problem = ownSnapshotProblem(health, own.timestamp);
+      if (problem) return fail(problem, 422);
+      target = own.timestamp;
+    } else if (!restorable(health).some((m) => m.timestamp === target)) {
+      return fail(snapshotChoices(health).length ? 'Choose one of the snapshots in the list.' : 'Paste the link of a capture from the Wayback Machine, or type a date.', 422);
+    }
     // Limits come before the code check, and once the tries are used up every code gets the same
     // answer, so the response never tells a right code from a wrong one.
     if (store.countByIp(ip, 24 * 3600_000, 'restore') >= config.restoreLimit) return fail('Too many restores from your address today. Please try again tomorrow.', 429);
