@@ -2,7 +2,7 @@
 // capture they found in the Wayback Machine, or a date.
 
 import type { HealthReport } from '../engine/health.ts';
-import { windowAround } from '../engine/restore.ts';
+import { monthAtOrBefore, monthName, windowAround } from '../engine/restore.ts';
 import { bareHost, parseTimestamp } from '../engine/url.ts';
 
 export interface OwnSnapshot {
@@ -64,17 +64,28 @@ export function parseOwnSnapshot(input: string, domain: string, now = new Date()
 
 /**
  * Why a restore cannot take its pages from around a date the user picked, or undefined when it can.
- * Mirrors restore(): a date in the healthy period uses that period, any other date the period around
- * it between the months the scan found parked or run by another owner.
+ * Mirrors restore(): a date in the healthy period uses that period; a date before it the period
+ * around it, between the months the scan found bad; a date after it is refused, since after it the
+ * scan found the site gone or taken over.
  */
 export function ownSnapshotProblem(h: HealthReport, timestamp: string): string | undefined {
   if (!h.months.length) return `The Wayback Machine has no captures of ${h.domain}.`;
   const inside = (!h.window.from || timestamp >= h.window.from) && (!h.window.to || timestamp <= h.window.to);
   if (h.lastGood && inside) return undefined;
+  if (h.lastGood && h.window.to && timestamp > h.window.to) {
+    return `After ${day(h.window.to)} our check found ${h.domain} down, parked or run by another owner. Choose an earlier date.`;
+  }
   const around = windowAround(h.months, timestamp);
   if (!around) return `Our check found ${h.domain} parked or run by another owner around ${day(timestamp)}. Choose a date when it was still the old site.`;
+  const last = monthAtOrBefore(h.months, timestamp);
+  if (last?.verdict === 'bad') {
+    return `Our check found the homepage of ${h.domain} bad in ${monthName(last.month)} (${last.reasons[0] ?? 'not a real website'}), the last month it checked before ${day(timestamp)}. Choose a date when the site was still fine.`;
+  }
   if (around.from && around.to && around.from > around.to) {
     return `We cannot vouch for ${h.domain} around ${day(timestamp)}: the months around it were bad or not checked. Choose another date.`;
+  }
+  if (around.to && around.to < `${h.months[0].month}01000000`) {
+    return `The first homepage capture of ${h.domain} is from ${monthName(h.months[0].month)} and our check found it bad, so there is nothing before it to restore. Choose a later date.`;
   }
   return undefined;
 }

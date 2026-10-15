@@ -39,6 +39,8 @@
   if (!panel) return;
   var archive = panel.getAttribute('data-archive');
   var domain = panel.getAttribute('data-domain');
+  var windowTo = panel.getAttribute('data-window-to') || '';
+  var lastGood = panel.getAttribute('data-last-good') || '';
   var home = 'http://' + panel.getAttribute('data-host') + '/';
   var box = panel.querySelector('.preview-frame');
   var frame = box.querySelector('iframe');
@@ -51,10 +53,12 @@
   var custom = document.getElementById('custom');
   var hint = document.getElementById('custom-hint');
   var table = document.querySelector('table.tl');
+  var MONTHS = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split(' ');
   var WIDTH = 1280;
   var LINK = /^(?:https?:\/\/)?(?:(?:web|wayback)\.)?archive\.org\/web\/([0-9*]*)(?:[a-z]{2}_)?\/(.+)$/i;
   var DATE = /^(\d{4})(?:[-/.](\d{1,2})(?:[-/.](\d{1,2})(?:[T ](\d{1,2})(?::(\d{1,2})(?::(\d{1,2}))?)?)?)?)?Z?$/i;
   var timer = null;
+  var buttons = [];
 
   // Laid out like a desktop screen, then scaled to the panel.
   function fit() {
@@ -70,7 +74,11 @@
   var slow = setTimeout(loaded, 15000);
 
   function day(ts) { return ts.slice(0, 4) + '-' + ts.slice(4, 6) + '-' + ts.slice(6, 8); }
+  function monthName(month) { return MONTHS[Number(month.slice(4, 6)) - 1] + ' ' + month.slice(0, 4); }
   function cellOf(ts) { return table ? table.querySelector('td[data-month="' + ts.slice(0, 6) + '"]') : null; }
+  function verdictOf(cell) {
+    return cell ? ['good', 'weak', 'bad'].filter(function (c) { return cell.classList.contains(c); })[0] || 'none' : 'none';
+  }
 
   function show(ts, url) {
     var src = archive + '/web/' + ts + 'if_/' + (url || home);
@@ -84,22 +92,23 @@
     label.textContent = day(ts);
     frame.title = 'Capture of ' + domain + ' from ' + day(ts);
     var cell = cellOf(ts);
-    var verdict = cell ? ['good', 'weak', 'bad'].filter(function (c) { return cell.classList.contains(c); })[0] || 'none' : 'none';
+    var verdict = verdictOf(cell);
     pill.className = 'pill ' + verdict;
     pill.textContent = verdict;
-    note.textContent = cell ? cell.getAttribute('title') : 'no homepage capture checked';
-    if (table) {
-      var picked = table.querySelectorAll('td.pick');
-      for (var i = 0; i < picked.length; i++) picked[i].classList.remove('pick');
-      if (cell) cell.classList.add('pick');
-    }
+    note.textContent = cell ? cell.getAttribute('title') : monthName(ts.slice(0, 6)) + ': no homepage capture checked';
+    mark(cell);
   }
 
   function bare(host) { return host.toLowerCase().replace(/\.$/, '').replace(/^www\d{0,3}\./, ''); }
+
+  // A Wayback timestamp from 4 to 14 digits, padded and checked as the server does (parseTimestamp).
   function stamp(digits) {
     var t = (digits + '00000000000000').slice(0, 14);
     if (t.slice(4, 6) === '00') t = t.slice(0, 4) + '01' + t.slice(6);
     if (t.slice(6, 8) === '00') t = t.slice(0, 6) + '01' + t.slice(8);
+    var y = Number(t.slice(0, 4)), mo = Number(t.slice(4, 6)), d = Number(t.slice(6, 8));
+    var days = mo >= 1 && mo <= 12 ? new Date(Date.UTC(y, mo, 0)).getUTCDate() : 0;
+    if (!days || d > days || Number(t.slice(8, 10)) > 23 || Number(t.slice(10, 12)) > 59 || Number(t.slice(12, 14)) > 59) return null;
     return t;
   }
 
@@ -107,26 +116,46 @@
   function parse(input) {
     var s = input.trim();
     if (!s) return null;
+    if (s.length > 2000) return { error: 'That link is too long.' };
     var m = LINK.exec(s);
+    var ts, url;
     if (m) {
       if (!/^\d{4,14}$/.test(m[1])) return { error: 'That link opens the calendar of all captures. Open one capture in it and copy the link from the address bar.' };
       var page;
       try { page = new URL(/^https?:\//i.test(m[2]) ? m[2].replace(/^(https?:)\/+/i, '$1//') : 'http://' + m[2]); } catch (e) { page = null; }
       if (!page || (page.protocol !== 'http:' && page.protocol !== 'https:')) return { error: 'That Wayback Machine link has no page address after the date.' };
       if (bare(page.hostname) !== domain) return { error: 'That link is a capture of ' + bare(page.hostname) + ', not of ' + domain + '.' };
+      ts = stamp(m[1]);
+      if (!ts) return { error: 'The date in that Wayback Machine link is not valid.' };
       page.hash = '';
-      return { ts: stamp(m[1]), url: page.href };
+      url = page.href;
+    } else {
+      if (/^[a-z][a-z0-9+.-]*:\/\//i.test(s) || /^www\./i.test(s) || /\.[a-z]{2,}(\/|$)/i.test(s)) {
+        return { error: 'Paste the link of one capture from web.archive.org, like https://web.archive.org/web/20150612000000/http://' + domain + '/' };
+      }
+      var d = DATE.exec(s);
+      var digits = /^\d{4,14}$/.test(s) ? s : '';
+      if (!digits && d) {
+        for (var i = 1; i < d.length && d[i] !== undefined; i++) digits += (d[i].length < 2 ? '0' : '') + d[i];
+      }
+      ts = digits ? stamp(digits) : null;
+      if (!ts) return { error: 'Type a date like 2015-06-12, or paste the link of a capture from web.archive.org.' };
     }
-    var d = DATE.exec(s);
-    var digits = /^\d{4,14}$/.test(s) ? s : '';
-    if (!digits && d) {
-      digits = '';
-      for (var i = 1; i < d.length && d[i] !== undefined; i++) digits += (d[i].length < 2 ? '0' : '') + d[i];
+    if (ts < '19960101000000') return { error: 'The Wayback Machine has no captures before 1996.' };
+    if (ts > new Date().toISOString().replace(/\D/g, '').slice(0, 14)) return { error: day(ts) + ' is in the future.' };
+    return { ts: ts, url: url };
+  }
+
+  // What the server will say about the period around a date, as far as the timeline tells.
+  function refusal(ts) {
+    if (lastGood && windowTo && ts > windowTo) return 'After ' + day(windowTo) + ' our check found ' + domain + ' down, parked or run by another owner, so this date will be refused. Choose an earlier date.';
+    var cells = table ? table.querySelectorAll('td[data-month]') : [];
+    var last = null;
+    for (var i = 0; i < cells.length; i++) {
+      if (cells[i].getAttribute('data-month') <= ts.slice(0, 6) && verdictOf(cells[i]) !== 'none') last = cells[i];
     }
-    if (!digits) return { error: 'Type a date like 2015-06-12, or paste the link of a capture from web.archive.org.' };
-    var ts = stamp(digits);
-    if (Number(ts.slice(4, 6)) > 12 || Number(ts.slice(6, 8)) > 31) return { error: 'Type a date like 2015-06-12, or paste the link of a capture from web.archive.org.' };
-    return { ts: ts };
+    if (last && verdictOf(last) === 'bad') return 'Our check found the homepage bad in ' + monthName(last.getAttribute('data-month')) + ', so this date will be refused. Choose a month when the site was still fine.';
+    return '';
   }
 
   function say(text, bad) {
@@ -134,6 +163,12 @@
     hint.textContent = text;
     hint.hidden = !text;
     hint.classList.toggle('bad', !!bad);
+    hint.removeAttribute('data-refused');
+    hint.removeAttribute('role');
+    if (custom) {
+      if (bad) custom.setAttribute('aria-invalid', 'true');
+      else custom.removeAttribute('aria-invalid');
+    }
   }
 
   function listed(ts) {
@@ -146,20 +181,35 @@
     if (select) show(select.value);
   }
 
+  // Tells what will happen with the snapshot in the field, and shows it.
   function fromCustom() {
     var own = parse(custom.value);
     if (!own) { say(''); fromList(); return; }
     if (own.error) { say(own.error, true); return; }
-    say(select ? 'Your snapshot is used instead of the list.' : '');
+    var problem = refusal(own.ts);
+    say(problem || (select ? 'Your snapshot is used instead of the list.' : ''), !!problem);
     show(own.ts, own.url);
   }
 
   if (select) select.addEventListener('change', function () { if (custom) custom.value = ''; say(''); fromList(); });
   if (custom) custom.addEventListener('input', function () { clearTimeout(timer); timer = setTimeout(fromCustom, 400); });
-  if (custom && custom.value.trim()) {
-    var own = parse(custom.value);
-    if (own && own.error) say(own.error, true);
-    else if (own && select) say('Your snapshot is used instead of the list.');
+  // A value the server refused keeps its message until it is edited; the preview shows the server's choice.
+  if (custom && custom.value.trim() && !(hint && hint.hasAttribute('data-refused'))) fromCustom();
+
+  // Months with a capture become buttons; one of them is in the tab order and arrows move between them.
+  function mark(cell) {
+    if (!table) return;
+    var picked = table.querySelectorAll('td.pick');
+    for (var i = 0; i < picked.length; i++) picked[i].classList.remove('pick');
+    if (cell) cell.classList.add('pick');
+    var current = cell ? cell.querySelector('.tl-btn') : null;
+    for (var j = 0; j < buttons.length; j++) {
+      buttons[j].setAttribute('aria-pressed', buttons[j] === current ? 'true' : 'false');
+    }
+    if (current) rove(current);
+  }
+  function rove(button) {
+    for (var i = 0; i < buttons.length; i++) buttons[i].tabIndex = buttons[i] === button ? 0 : -1;
   }
 
   function pick(cell) {
@@ -171,28 +221,68 @@
       show(ts);
     } else {
       custom.value = day(ts) + ' ' + ts.slice(8, 10) + ':' + ts.slice(10, 12) + ':' + ts.slice(12, 14);
-      say(select ? 'This month is not in the list, so it is filled in as your own snapshot.' : '');
+      var problem = refusal(ts);
+      say(problem || (select ? 'This month is not in the list, so it is filled in as your own snapshot.' : ''), !!problem);
       show(ts);
     }
   }
 
+  function step(button, key) {
+    var i = buttons.indexOf(button);
+    if (key === 'ArrowLeft') return buttons[i - 1];
+    if (key === 'ArrowRight') return buttons[i + 1];
+    if (key === 'Home') return buttons[0];
+    if (key === 'End') return buttons[buttons.length - 1];
+    // Up and down: the nearest month with a capture in the year above or below.
+    var td = button.parentNode;
+    var row = td.parentNode;
+    var col = Array.prototype.indexOf.call(row.children, td);
+    var other = key === 'ArrowUp' ? row.previousElementSibling : row.nextElementSibling;
+    while (other) {
+      var best = null;
+      for (var c = 0; c < other.children.length; c++) {
+        var b = other.children[c].querySelector && other.children[c].querySelector('.tl-btn');
+        if (b && (!best || Math.abs(c - col) < Math.abs(best.c - col))) best = { b: b, c: c };
+      }
+      if (best) return best.b;
+      other = key === 'ArrowUp' ? other.previousElementSibling : other.nextElementSibling;
+    }
+    return null;
+  }
+
   if (table && custom) {
-    table.classList.add('tl-pick');
     var cells = table.querySelectorAll('td[data-ts]');
     for (var i = 0; i < cells.length; i++) {
-      cells[i].tabIndex = 0;
-      cells[i].setAttribute('role', 'button');
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'tl-btn';
+      b.tabIndex = -1;
+      b.setAttribute('aria-pressed', 'false');
+      var sr = cells[i].querySelector('.sr');
+      if (sr) b.appendChild(sr);
+      cells[i].appendChild(b);
+      buttons.push(b);
+    }
+    if (buttons.length) {
+      var chosen = table.querySelector('td.pick .tl-btn');
+      mark(chosen ? chosen.parentNode : null);
+      if (!chosen) rove(buttons[0]);
+      var tip = document.querySelector('[data-tl-tip]');
+      if (tip) tip.hidden = false;
     }
     table.addEventListener('click', function (e) {
-      var cell = e.target.closest && e.target.closest('td[data-ts]');
-      if (cell) pick(cell);
+      var button = e.target.closest && e.target.closest('.tl-btn');
+      if (button) pick(button.parentNode);
     });
     table.addEventListener('keydown', function (e) {
-      if (e.key !== 'Enter' && e.key !== ' ') return;
-      var cell = e.target.closest && e.target.closest('td[data-ts]');
-      if (!cell) return;
+      var button = e.target.closest && e.target.closest('.tl-btn');
+      if (!button || ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].indexOf(e.key) < 0) return;
+      var next = step(button, e.key);
       e.preventDefault();
-      pick(cell);
+      if (next) {
+        rove(next);
+        next.focus();
+      }
     });
   }
 })();

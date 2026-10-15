@@ -39,7 +39,43 @@
         {{#if job.isScan}}
             {{#if job.health.months.length}}
             <div class="split split-job">
-                <div class="panel">
+                <div class="panel panel-form job-form">
+                    {{#unless job.choices.length}}{{#if job.refusal}}
+                    <div class="notice notice-bad"><h2>No healthy snapshot found yet</h2><p>None of the homepages we could check looks like a real website, but archive.org refused {{job.refusal.refused}} of the {{job.refusal.checked}} captures we asked for{{#if job.refusal.reason}} ({{job.refusal.reason}}){{/if}}. The site may be among those, so checking again later may find it.</p>{{> recheck domain=job.domain}}</div>
+                    {{else}}
+                    <div class="notice notice-bad"><h2>No healthy snapshot</h2><p>None of the archived homepages looks like a real website: they are parking pages, errors or spam. If you know a date when the site was still fine, you can restore that date below.</p></div>
+                    {{/if}}{{/unless}}
+                    <h2>{{#if job.choices.length}}Restore{{else}}Restore a date you choose{{/if}}</h2>
+                    <form class="stack restore-form" method="post" action="/job/{{job.id}}/restore">
+                        {{#if job.choices.length}}
+                        <label for="target">Snapshot</label>
+                        <select id="target" name="target">
+                            {{#each job.choices}}<option value="{{timestamp}}"{{#if selected}} selected{{/if}}>{{ts timestamp}} · score {{score}}{{#if last}} · last good{{/if}}</option>{{/each}}
+                        </select>
+                        {{/if}}
+                        <label for="custom">{{#if job.choices.length}}Or your own snapshot <span class="muted">(optional)</span>{{else}}Your snapshot{{/if}}</label>
+                        <input id="custom" name="custom" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="2000" placeholder="2015-06-12 or a web.archive.org link" value="{{job.custom}}" aria-describedby="custom-note custom-hint"{{#unless job.choices.length}} required{{/unless}}{{#if job.customError}} aria-invalid="true"{{/if}}>
+                        {{#if job.customError}}
+                        <p class="form-hint bad" id="custom-hint" data-hint data-refused role="alert">{{job.customError}}</p>
+                        {{else}}
+                        <p class="form-hint" id="custom-hint" data-hint aria-live="polite" hidden></p>
+                        {{/if}}
+                        <p class="form-note" id="custom-note">A date, or the link of a capture from the <a href="{{job.archive}}/web/*/{{job.domain}}" target="_blank" rel="noopener noreferrer">Wayback Machine calendar</a><span data-tl-tip hidden>; or click a month in the timeline</span>.{{#if job.choices.length}} It is used instead of the list.{{/if}}</p>
+                        <fieldset>
+                            <legend>What to restore</legend>
+                            <label class="radio"><input type="radio" name="mode" value="demo"{{#unless job.full}} checked{{/unless}}> <span><b>Demo</b>: the homepage and 3 more pages</span></label>
+                            <label class="radio"><input type="radio" name="mode" value="full"{{#if job.full}} checked{{/if}}> <span><b>Full site</b>: every archived URL of the chosen period, up to 20,000</span></label>
+                            {{#if job.codeRequired}}
+                            <label for="code">Access code for a full restore</label>
+                            <input id="code" name="code" type="password" autocomplete="off" aria-describedby="code-note">
+                            <p class="form-note" id="code-note">Not needed for a demo. After {{job.codeTries}} wrong codes, full restores from your address are blocked for an hour.</p>
+                            {{/if}}
+                        </fieldset>
+                        {{#if formError}}<p class="form-error" role="alert">{{formError}}</p>{{/if}}
+                        <button class="btn" type="submit">Restore this snapshot</button>
+                    </form>
+                </div>
+                <div class="panel job-health">
                     <h2>Homepage health by month</h2>
                     {{> timeline rows=job.rows}}
                     {{#if job.health.lastGood}}
@@ -47,49 +83,9 @@
                     Pages are taken from {{#if job.health.window.from}}<b>{{ts job.health.window.from}}</b>{{else}}the first capture{{/if}} to {{#if job.health.window.to}}<b>{{ts job.health.window.to}}</b>{{else}}the last capture{{/if}}. Host: <span class="mono">{{job.health.host}}</span>.</p>
                     {{/if}}
                 </div>
-                <div class="job-side">
-                    <div class="panel panel-form">
-                        {{#unless job.choices.length}}{{#if job.refusal}}
-                        <div class="notice notice-bad"><h2>No healthy snapshot found yet</h2><p>None of the homepages we could check looks like a real website, but archive.org refused {{job.refusal.refused}} of the {{job.refusal.checked}} captures we asked for{{#if job.refusal.reason}} ({{job.refusal.reason}}){{/if}}. The site may be among those, so checking again later may find it.</p>{{> recheck domain=job.domain}}</div>
-                        {{else}}
-                        <div class="notice notice-bad"><h2>No healthy snapshot</h2><p>None of the archived homepages looks like a real website: they are parking pages, errors or spam. If you know a date when the site was still fine, you can restore that date below.</p></div>
-                        {{/if}}{{/unless}}
-                        <h2>{{#if job.choices.length}}Restore{{else}}Restore a date you choose{{/if}}</h2>
-                        <form class="stack restore-form" method="post" action="/job/{{job.id}}/restore">
-                            <div class="rf-pick">
-                                {{#if job.choices.length}}
-                                <div class="field">
-                                    <label for="target">Snapshot</label>
-                                    <select id="target" name="target">
-                                        {{#each job.choices}}<option value="{{timestamp}}"{{#if selected}} selected{{/if}}>{{ts timestamp}} · score {{score}}{{#if last}} · last good{{/if}}</option>{{/each}}
-                                    </select>
-                                </div>
-                                {{/if}}
-                                <div class="field">
-                                    <label for="custom">{{#if job.choices.length}}Or your own snapshot <span class="muted">(optional)</span>{{else}}Your snapshot{{/if}}</label>
-                                    <input id="custom" name="custom" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="2000" placeholder="2015-06-12 or a web.archive.org link" value="{{job.custom}}" aria-describedby="custom-note custom-hint"{{#unless job.choices.length}} required{{/unless}}>
-                                </div>
-                            </div>
-                            <p class="form-note" id="custom-note">Paste the link of a capture you checked in the <a href="{{job.archive}}/web/*/{{job.domain}}" target="_blank" rel="noopener noreferrer">Wayback Machine calendar</a>, type a date, or click a month in the timeline{{#if job.choices.length}}. Your own snapshot is used instead of the list{{/if}}.</p>
-                            <p class="form-hint" id="custom-hint" data-hint aria-live="polite" hidden></p>
-                            <fieldset class="rf-mode">
-                                <legend>What to restore</legend>
-                                <label class="radio"><input type="radio" name="mode" value="demo"{{#unless job.full}} checked{{/unless}}> <span><b>Demo</b>: a quick preview of the homepage and 3 more pages</span></label>
-                                <label class="radio"><input type="radio" name="mode" value="full"{{#if job.full}} checked{{/if}}> <span><b>Full site</b>: every archived URL of the chosen period, up to 20,000</span></label>
-                                {{#if job.codeRequired}}
-                                <div class="field rf-code">
-                                    <label for="code">Access code for a full restore</label>
-                                    <input id="code" name="code" type="password" autocomplete="off" aria-describedby="code-note">
-                                    <p class="form-note" id="code-note">Not needed for a demo. After {{job.codeTries}} wrong codes, full restores from your address are blocked for an hour.</p>
-                                </div>
-                                {{/if}}
-                            </fieldset>
-                            {{#if formError}}<p class="form-error" role="alert">{{formError}}</p>{{/if}}
-                            <button class="btn" type="submit">Restore this snapshot</button>
-                        </form>
-                    </div>
-                    {{#if job.preview}}{{> preview p=job.preview archive=job.archive host=job.health.host domain=job.domain heading="How the site looked"}}{{/if}}
-                </div>
+                {{#if job.preview}}
+                <div class="job-preview">{{> preview p=job.preview archive=job.archive host=job.health.host domain=job.domain heading="How the site looked" windowTo=job.health.window.to lastGood=job.health.lastGood.timestamp}}</div>
+                {{/if}}
             </div>
             {{#if job.probed.length}}
             <details class="probes">
@@ -116,7 +112,7 @@
                     <div><dt>Not in the archive</dt><dd>{{number job.report.counts.missing}}</dd></div>
                 </dl>
                 <p class="actions">{{#if job.hasZip}}<a class="btn" href="/job/{{job.id}}/download">Download ZIP</a>{{/if}} <a class="btn btn-ghost" href="/job/{{job.id}}/report">Open the report</a></p>
-                {{#if job.demo}}<p class="notice">This demo contains the homepage and the first pages it links to. A {{#if job.parentId}}<a href="/job/{{job.parentId}}/">full restore</a>{{else}}full restore{{/if}} downloads every archived URL of the healthy period.</p>{{/if}}
+                {{#if job.demo}}<p class="notice">This demo contains the homepage and the first pages it links to. A {{#if job.parentId}}<a href="/job/{{job.parentId}}/?snapshot={{job.target}}&amp;mode=full">full restore</a>{{else}}full restore{{/if}} downloads every archived URL of the healthy period.</p>{{/if}}
                 {{#each job.report.warnings}}<p class="notice">{{this}}</p>{{/each}}
                 <h3>Put it online</h3>
                 <ol class="howto">

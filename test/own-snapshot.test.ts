@@ -94,6 +94,23 @@ describe('the period a named snapshot is restored from', () => {
     assert.match(ownSnapshotProblem(health, '20131001000000') ?? '', /found riverside\.example parked or run by another owner around 2013-10-01/);
   });
 
+  it('refuses a date after the healthy period, when the scan found the site gone or taken over', () => {
+    const ended: HealthReport = { ...health, months: health.months.slice(0, 3), lastGood: { month: '201205', timestamp: '20120510120000', score: 90, original: '' }, window: { to: '20130430235959' } };
+    assert.match(ownSnapshotProblem(ended, '20160510000000') ?? '', /After 2013-04-30 our check found riverside\.example down, parked or run by another owner/);
+    assert.match(ownSnapshotProblem(ended, '20130510120000') ?? '', /After 2013-04-30/);
+  });
+
+  it('refuses a date whose last checked month before it was bad, even when it looks like an outage', () => {
+    const down: HealthReport = { ...health, months: [month('201005', 'weak'), month('201205', 'weak'), month('201305', 'bad', ['homepage answered HTTP 404'])], lastGood: undefined, window: {} };
+    assert.match(ownSnapshotProblem(down, '20160510000000') ?? '', /homepage of riverside\.example bad in May 2013 \(homepage answered HTTP 404\)/);
+    assert.equal(ownSnapshotProblem(down, '20110101000000'), undefined);
+  });
+
+  it('refuses a date before a first capture that was already bad', () => {
+    const late: HealthReport = { ...health, months: [month('200905', 'bad', ['parked domain page ("this domain may be for sale")']), ...health.months.slice(0, 2)], window: { from: '20090601000000', to: '20130430235959' } };
+    assert.match(ownSnapshotProblem(late, '20080601000000') ?? '', /first homepage capture of riverside\.example is from May 2009 and our check found it bad/);
+  });
+
   it('refuses a domain without captures', () => {
     assert.match(ownSnapshotProblem({ ...health, months: [], lastGood: undefined }, '20110101000000') ?? '', /no captures of riverside\.example/);
   });
@@ -114,6 +131,18 @@ const RIVERSIDE: FakeCapture[] = [
   ...[2015, 2016, 2017].map((y) => ({ url: `${R}/`, ts: `${y}0510120000`, body: page('Riverside Fitness', GYM, ['about.html', 'classes.html']) })),
   { url: `${R}/about.html`, ts: '20160510120000', body: page('About Riverside Fitness', GYM) },
   { url: `${R}/classes.html`, ts: '20160510120000', body: page('Classes', GYM) },
+];
+
+// A bookshop until 2012 whose homepage answered 404 from 2013, while a later owner put spam on its
+// old inner URLs in 2014 and 2016: nothing on the homepage says "parked".
+const E = 'http://www.elmbooks.example';
+const ELM: FakeCapture[] = [
+  ...[2010, 2011, 2012].map((y) => ({ url: `${E}/`, ts: `${y}0510120000`, body: page('Elm Books', BOOKS, ['about.html', 'catalogue.html']) })),
+  { url: `${E}/about.html`, ts: '20110510120000', body: page('About Elm Books', BOOKS) },
+  { url: `${E}/catalogue.html`, ts: '20110510120000', body: page('Catalogue', BOOKS) },
+  { url: `${E}/`, ts: '20130510120000', status: 404, body: 'Not Found' },
+  { url: `${E}/about.html`, ts: '20140110120000', body: page('Casino Gacor', 'Slot online gacor hari ini, bonus new member. ') },
+  { url: `${E}/catalogue.html`, ts: '20160510120000', body: page('Slot Online', 'Slot online gacor hari ini, bonus new member. ') },
 ];
 
 describe('restoring a date outside the period the scan picked', () => {
@@ -141,6 +170,22 @@ describe('restoring a date outside the period the scan picked', () => {
       await assert.rejects(readFile(path.join(gym.siteDir, 'catalogue.html')), { code: 'ENOENT' });
 
       await assert.rejects(restore({ ...opts, outDir: await mkdtemp(path.join(work, 'r-')), target: '2013-09' }), /parked or run by another owner around 2013-09-01/);
+    } finally {
+      await archive.close();
+    }
+  });
+
+  it('never opens the period after a homepage that went down', async () => {
+    const archive = await startFakeArchive(ELM);
+    try {
+      const opts = { domain: 'elmbooks.example', zip: false, archive: { base: archive.base, ...FAST } };
+      for (const target of ['2016-05-10', '2013-05-10']) {
+        const r = await restore({ ...opts, outDir: await mkdtemp(path.join(work, 'r-')), target });
+        assert.ok(r.report.window.to && r.report.window.to < '20130501000000', `${target}: ${JSON.stringify(r.report.window)}`);
+        assert.match(await readFile(path.join(r.siteDir, 'about.html'), 'utf8'), /About Elm Books/, target);
+        assert.doesNotMatch(await readFile(path.join(r.siteDir, 'catalogue.html'), 'utf8'), /Slot Online/, target);
+        assert.ok(r.report.warnings.some((w) => /outside the period the site looked healthy/.test(w)), target);
+      }
     } finally {
       await archive.close();
     }
@@ -202,7 +247,7 @@ describe('web app: a snapshot the user names', () => {
     scanId = scan.headers.get('location')!.split('/')[2];
     assert.equal((await waitFor(scanId)).status, 'done');
     const html = await (await get(`/job/${scanId}/`)).text();
-    const frame = /<iframe src="([^"]+)"[^>]*sandbox="allow-scripts allow-same-origin"[^>]*referrerpolicy="no-referrer"/.exec(html);
+    const frame = /<iframe src="([^"]+)"[^>]*sandbox="allow-scripts allow-same-origin"[^>]*referrerpolicy="no-referrer"[^>]*tabindex="-1"/.exec(html);
     assert.ok(frame, 'preview frame');
     assert.equal(frame[1], `${archive.base}/web/20201114083015if_/http://www.oldbakery.example/`);
     assert.match(html, new RegExp(`href="${archive.base}/web/20201114083015/http://www.oldbakery.example/" data-open`));
@@ -243,7 +288,11 @@ describe('web app: a snapshot the user names', () => {
 
     const parked = await post(`/job/${scanId}/restore`, { custom: '2022-06', mode: 'demo' });
     assert.equal(parked.status, 422);
-    assert.match(await parked.text(), /found oldbakery\.example parked or run by another owner around 2022-06-01/);
+    const parkedPage = await parked.text();
+    assert.match(parkedPage, /After 2021-02-28 our check found oldbakery\.example down, parked or run by another owner\. Choose an earlier date\./);
+    // The message sits with the field, which is marked invalid, and the preview stays on the list's choice.
+    assert.match(parkedPage, /aria-invalid="true">\s*<p class="form-hint bad" id="custom-hint" data-hint data-refused role="alert">After 2021-02-28/);
+    assert.match(parkedPage, /web\/20201114083015if_\//);
 
     const calendar = await post(`/job/${scanId}/restore`, { custom: 'https://web.archive.org/web/2019*/oldbakery.example', mode: 'demo' });
     assert.equal(calendar.status, 422);
@@ -253,6 +302,24 @@ describe('web app: a snapshot the user names', () => {
   it('checks the code for a named snapshot like for one from the list', async () => {
     const res = await post(`/job/${scanId}/restore`, { custom: '2019-09-15', mode: 'full', code: 'wrong' });
     assert.equal(res.status, 403);
+  });
+
+  it('links a demo of a named snapshot to a full restore of the same snapshot', async () => {
+    const res = await post(`/job/${scanId}/restore`, { custom: '2016-06-12', mode: 'demo' });
+    const id = res.headers.get('location')!.split('/')[2];
+    assert.equal((await waitFor(id)).status, 'done');
+    const result = await (await get(`/job/${id}/`)).text();
+    const link = new RegExp(`href="/job/${scanId}/\\?snapshot=20160612000000&amp;mode=full">full restore</a>`);
+    assert.match(result, link);
+    assert.match(result, /The snapshot it was restored from/);
+    const form = await (await get(`/job/${scanId}/?snapshot=20160612000000&mode=full`)).text();
+    assert.match(form, /id="custom" name="custom"[^>]*value="2016-06-12 00:00:00"/);
+    assert.match(form, /name="mode" value="full" checked/);
+    assert.match(form, /web\/20160612000000if_\//);
+    assert.match(form, /<td class="(good|weak|none) pick" data-month="201606"/);
+    // A listed snapshot comes back selected in the list; anything else is ignored.
+    assert.match(await (await get(`/job/${scanId}/?snapshot=20190920120000`)).text(), /<option value="20190920120000" selected>/);
+    assert.match(await (await get(`/job/${scanId}/?snapshot=x"><script>`)).text(), /<option value="20201114083015" selected>/);
   });
 
   it('keeps the snapshot chosen in the list when the form comes back', async () => {

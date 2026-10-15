@@ -58,6 +58,8 @@ interface JobForm {
   target?: string;
   custom?: string;
   full?: boolean;
+  /** Why the server refused the snapshot in the custom field. */
+  customError?: string;
 }
 
 const PER_PAGE = 10;
@@ -93,7 +95,7 @@ export function clientKey(ip: string | undefined): string {
   return `${all.slice(0, 4).map((g) => parseInt(g, 16).toString(16)).join(':')}::/64`;
 }
 
-function timelineRows(h: HealthReport) {
+function timelineRows(h: HealthReport, pickMonth = h.lastGood?.month) {
   const years = [...new Set(h.months.map((m) => m.month.slice(0, 4)))];
   return years.map((year) => ({
     year,
@@ -105,7 +107,7 @@ function timelineRows(h: HealthReport) {
         month: key,
         // The capture a click on the month picks on the snapshots page.
         stamp: m?.timestamp ?? '',
-        pick: h.lastGood?.month === key,
+        pick: pickMonth === key,
         title: m ? `${name} ${year}: ${m.verdict}${m.score !== null ? ` (${m.score}/100)` : ''}${m.reasons.length ? ' · ' + m.reasons.join('; ') : ''}` : `${name} ${year}: no capture`,
       };
     }),
@@ -427,7 +429,7 @@ export async function createApp(config: WebConfig) {
    * chosen in the list, else the last good one, else the newest capture that is not parked.
    */
   const previewOf = (h: HealthReport, form: JobForm) => {
-    const own = form.custom ? parseOwnSnapshot(form.custom, h.domain) : undefined;
+    const own = form.custom && !form.customError ? parseOwnSnapshot(form.custom, h.domain) : undefined;
     const valid = own && !('error' in own) ? own : undefined;
     const listed = form.target && restorable(h).some((m) => m.timestamp === form.target) ? form.target : undefined;
     const newest = [...h.months].reverse();
@@ -467,14 +469,16 @@ export async function createApp(config: WebConfig) {
     };
     if (job.kind === 'scan' && result) {
       const h = (result as ScanResult).health;
+      const preview = previewOf(h, form);
       view.health = h;
-      view.rows = timelineRows(h);
+      view.rows = timelineRows(h, preview?.ts.slice(0, 6));
       view.choices = snapshotChoices(h, form.target);
       view.probed = h.months.filter((m) => m.probed);
       view.refusal = refusedScan(job);
-      view.preview = previewOf(h, form);
+      view.preview = preview;
       view.archive = config.archiveBase.replace(/\/+$/, '');
       view.custom = form.custom ?? '';
+      view.customError = form.customError;
       view.full = !!form.full;
     }
     if (job.kind === 'restore' && job.target) {
@@ -485,6 +489,7 @@ export async function createApp(config: WebConfig) {
       const url = `http://${host}/`;
       view.preview = { ts: job.target, url, ...waybackLinks(config.archiveBase, job.target, url), ...(ph ? monthNote(ph, job.target) : { verdict: 'none', note: '' }) };
       view.previewHost = host;
+      view.target = job.target;
       view.previewHeading = job.status === 'done' ? 'The snapshot it was restored from' : 'The snapshot being restored';
       view.archive = config.archiveBase.replace(/\/+$/, '');
     }
@@ -496,13 +501,22 @@ export async function createApp(config: WebConfig) {
     return view;
   };
 
-  app.get('/job/:id/', loadJob, (_req, res) => {
+  app.get('/job/:id/', loadJob, (req, res) => {
     const job = res.locals.job as Job;
+    // A demo's "full restore" link comes back here with the snapshot it restored.
+    const form: JobForm = {};
+    const asked = typeof req.query.snapshot === 'string' && /^\d{14}$/.test(req.query.snapshot) ? req.query.snapshot : undefined;
+    if (asked && job.kind === 'scan' && job.status === 'done' && job.result) {
+      const h = (JSON.parse(job.result) as ScanResult).health;
+      if (restorable(h).some((m) => m.timestamp === asked)) form.target = asked;
+      else form.custom = `${asked.slice(0, 4)}-${asked.slice(4, 6)}-${asked.slice(6, 8)} ${asked.slice(8, 10)}:${asked.slice(10, 12)}:${asked.slice(12, 14)}`;
+      form.full = req.query.mode === 'full';
+    }
     render(res, 'job', {
       title: `${job.kind === 'scan' ? 'Snapshots of' : 'Restoring'} ${job.domain} · ${s.title}`,
       seo: meta({ path: `/job/${job.id}/`, noindex: true }),
       bodyClass: 'job-template',
-      job: jobView(job),
+      job: jobView(job, form),
       formError: res.locals.formError,
     });
   });
@@ -520,18 +534,19 @@ export async function createApp(config: WebConfig) {
     const full = req.body?.mode === 'full';
     const form: JobForm = { target: String(req.body?.target ?? ''), custom, full };
     const ip = clientKey(req.ip);
-    const fail = (msg: string, status: number) => {
-      res.locals.formError = msg;
+    const fail = (msg: string, status: number, field?: 'custom') => {
+      if (field) form.customError = msg;
+      res.locals.formError = field ? undefined : msg;
       res.status(status);
-      render(res, 'job', { title: `Snapshots of ${scan.domain} · ${s.title}`, seo: meta({ path: `/job/${scan.id}/`, noindex: true }), job: jobView(scan, form), formError: msg }, status);
+      render(res, 'job', { title: `Snapshots of ${scan.domain} · ${s.title}`, seo: meta({ path: `/job/${scan.id}/`, noindex: true }), job: jobView(scan, form), formError: res.locals.formError }, status);
     };
     // A snapshot the user names (a Wayback Machine link or a date) wins over the list.
     let target = form.target!;
     if (custom) {
       const own = parseOwnSnapshot(custom, health.domain);
-      if ('error' in own) return fail(own.error, 422);
+      if ('error' in own) return fail(own.error, 422, 'custom');
       const problem = ownSnapshotProblem(health, own.timestamp);
-      if (problem) return fail(problem, 422);
+      if (problem) return fail(problem, 422, 'custom');
       target = own.timestamp;
     } else if (!restorable(health).some((m) => m.timestamp === target)) {
       return fail(snapshotChoices(health).length ? 'Choose one of the snapshots in the list.' : 'Paste the link of a capture from the Wayback Machine, or type a date.', 422);

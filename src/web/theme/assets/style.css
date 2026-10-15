@@ -106,7 +106,12 @@ legend { font-weight: 650; font-size: 0.95rem; padding: 0 0.3rem; }
 .domain-title { font-family: var(--f-mono); font-size: clamp(1.6rem, 4vw, 2.4rem); font-weight: 650; letter-spacing: -0.02em; overflow-wrap: anywhere; }
 .split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 2.5rem; align-items: start; }
 .split p + p { margin-top: 1rem; }
-.split-job { grid-template-columns: minmax(0, 23rem) minmax(0, 1fr); gap: 2rem; }
+/* Snapshots page: the form and the timeline on the left, the preview of the chosen capture on the
+   right, staying in view while months are picked further down. */
+.split-job { grid-template-columns: minmax(0, 23rem) minmax(0, 1fr); grid-template-areas: "form preview" "health preview"; gap: 1.5rem 2rem; }
+.job-form { grid-area: form; }
+.job-health { grid-area: health; }
+.job-preview { grid-area: preview; align-self: start; position: sticky; top: 5rem; min-width: 0; }
 
 ol.steps { list-style: none; counter-reset: s; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 1.5rem; }
 ol.steps li { counter-increment: s; display: grid; gap: 0.5rem; align-content: start; }
@@ -183,15 +188,6 @@ p.notice { display: block; }
 .probes { margin-top: 1.5rem; }
 .run-split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 2rem; align-items: start; }
 .run-main { display: grid; gap: 1.25rem; min-width: 0; }
-.job-side { display: grid; gap: 1.5rem; min-width: 0; container: side / inline-size; }
-.restore-form .field { display: grid; gap: 0.4rem; min-width: 0; }
-.rf-pick { display: grid; gap: 0.8rem; }
-@container side (min-width: 34rem) {
-  .rf-pick { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: end; }
-  .rf-mode { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-  .rf-mode .rf-code { grid-column: 1 / -1; }
-  .restore-form .btn { justify-self: start; }
-}
 .preview-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.3rem 1rem; flex-wrap: wrap; }
 .preview-head a { font-size: 0.92rem; }
 .preview-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 0.6rem; font-size: 0.9rem; }
@@ -203,9 +199,9 @@ p.notice { display: block; }
 html:not(.js) .preview-wait, .preview-wait[hidden] { display: none; }
 .form-hint { font-size: 0.9rem; color: var(--muted); }
 .form-hint.bad { color: var(--bad); font-weight: 600; }
-table.tl-pick td[data-ts] { cursor: pointer; }
-table.tl-pick td[data-ts]:hover { outline: 2px solid var(--accent); outline-offset: 1px; }
-table.tl td:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tl-btn { display: block; width: 100%; height: 100%; min-height: 1.25rem; padding: 0; border: 0; border-radius: 3px; background: transparent; cursor: pointer; }
+.tl-btn:hover { outline: 2px solid var(--accent); outline-offset: 1px; }
+.tl-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .probes summary { cursor: pointer; font-weight: 600; margin-bottom: 0.75rem; }
 .result { display: grid; gap: 1.1rem; max-width: 52rem; }
 .result h2 { margin: 0; }
@@ -219,6 +215,8 @@ table.tl td:focus-visible { outline: 2px solid var(--accent); outline-offset: 2p
 
 @media (max-width: 860px) {
   .hero-inner, .split, .split-job, .run-split { grid-template-columns: minmax(0, 1fr); gap: 2rem; }
+  .split-job { grid-template-areas: "form" "preview" "health"; }
+  .job-preview { position: static; }
   .hero-inner { padding-block: 2.5rem 3rem; }
   .site-nav { order: 3; width: 100%; margin-left: 0; }
   .site-head .btn-small { margin-left: auto; }
