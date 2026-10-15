@@ -46,6 +46,7 @@
                     <div class="notice notice-bad"><h2>No healthy snapshot</h2><p>None of the archived homepages looks like a real website: they are parking pages, errors or spam. If you know a date when the site was still fine, you can restore that date below.</p></div>
                     {{/if}}{{/unless}}
                     <h2>{{#if job.choices.length}}Restore{{else}}Restore a date you choose{{/if}}</h2>
+                    {{#if job.refusals}}<script type="application/json" id="refusals">{{json job.refusals}}</script>{{/if}}
                     <form class="stack restore-form" method="post" action="/job/{{job.id}}/restore">
                         {{#if job.choices.length}}
                         <label for="target">Snapshot</label>
@@ -56,7 +57,7 @@
                         <label for="custom">{{#if job.choices.length}}Or your own snapshot <span class="muted">(optional)</span>{{else}}Your snapshot{{/if}}</label>
                         <input id="custom" name="custom" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="2000" placeholder="2015-06-12 or a web.archive.org link" value="{{job.custom}}" aria-describedby="custom-note custom-hint"{{#unless job.choices.length}} required{{/unless}}{{#if job.customError}} aria-invalid="true"{{/if}}>
                         {{#if job.customError}}
-                        <p class="form-hint bad" id="custom-hint" data-hint data-refused role="alert">{{job.customError}}</p>
+                        <p class="form-hint bad" id="custom-hint" data-hint data-refused role="alert" aria-live="polite">{{job.customError}}</p>
                         {{else}}
                         <p class="form-hint" id="custom-hint" data-hint aria-live="polite" hidden></p>
                         {{/if}}
@@ -84,7 +85,7 @@
                     {{/if}}
                 </div>
                 {{#if job.preview}}
-                <div class="job-preview">{{> preview p=job.preview archive=job.archive host=job.health.host domain=job.domain heading="How the site looked" windowTo=job.health.window.to lastGood=job.health.lastGood.timestamp}}</div>
+                <div class="job-preview">{{> preview p=job.preview archive=job.archive host=job.health.host domain=job.domain heading="How the site looked"}}</div>
                 {{/if}}
             </div>
             {{#if job.probed.length}}

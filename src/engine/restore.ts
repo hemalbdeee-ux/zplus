@@ -231,8 +231,12 @@ export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
   }
   const window: Window = { from: givenFrom ?? bounds.from, to: givenTo ?? bounds.to };
   if (around) {
-    if (window.from && window.to && window.from > window.to) {
-      throw new Error(`The health scan cannot vouch for ${domain} around ${day(target)}: the months around it were bad or not checked, so the period to restore would run from ${day(window.from)} to ${day(window.to)}. Pick a date when it was still the old site, or pass --from and --to to restore that period anyway.`);
+    // windowAround leaves out unchecked months just before a bad one, so the period can end before
+    // the date, or before the first homepage capture: that is not the site as it was then.
+    const first = `${health!.months[0].month}01000000`;
+    const misses = !givenTo && !!around.to && (target > around.to || around.to < first);
+    if ((window.from && window.to && window.from > window.to) || misses) {
+      throw new Error(`The health scan cannot vouch for ${domain} around ${day(target)}: the months around it were bad or not checked, so the period to restore would run from ${window.from ? day(window.from) : 'the first capture'} to ${window.to ? day(window.to) : 'today'}. Pick a date when it was still the old site, or pass --from and --to to restore that period anyway.`);
     }
     const why = health?.lastGood ? 'the chosen date is outside the period the scan picked' : 'no capture looks like a real website';
     emit('health', `${why}: pages are taken from ${window.from?.slice(0, 8) ?? 'the start'} to ${window.to?.slice(0, 8) ?? 'today'}, between the bad months around the chosen date`);

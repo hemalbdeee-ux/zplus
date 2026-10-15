@@ -39,8 +39,8 @@
   if (!panel) return;
   var archive = panel.getAttribute('data-archive');
   var domain = panel.getAttribute('data-domain');
-  var windowTo = panel.getAttribute('data-window-to') || '';
-  var lastGood = panel.getAttribute('data-last-good') || '';
+  var refusals = null;
+  try { refusals = JSON.parse((document.getElementById('refusals') || {}).textContent || 'null'); } catch (e) { refusals = null; }
   var home = 'http://' + panel.getAttribute('data-host') + '/';
   var box = panel.querySelector('.preview-frame');
   var frame = box.querySelector('iframe');
@@ -146,16 +146,12 @@
     return { ts: ts, url: url };
   }
 
-  // What the server will say about the period around a date, as far as the timeline tells.
+  // What the server will say about a date: it sends its answer for every month (src/web/snapshot.ts).
   function refusal(ts) {
-    if (lastGood && windowTo && ts > windowTo) return 'After ' + day(windowTo) + ' our check found ' + domain + ' down, parked or run by another owner, so this date will be refused. Choose an earlier date.';
-    var cells = table ? table.querySelectorAll('td[data-month]') : [];
-    var last = null;
-    for (var i = 0; i < cells.length; i++) {
-      if (cells[i].getAttribute('data-month') <= ts.slice(0, 6) && verdictOf(cells[i]) !== 'none') last = cells[i];
-    }
-    if (last && verdictOf(last) === 'bad') return 'Our check found the homepage bad in ' + monthName(last.getAttribute('data-month')) + ', so this date will be refused. Choose a month when the site was still fine.';
-    return '';
+    if (!refusals) return '';
+    var month = ts.slice(0, 6);
+    var at = month < refusals.first ? refusals.before : refusals.months[month];
+    return at === undefined || at === null ? '' : refusals.messages[at].split('{date}').join(day(ts));
   }
 
   function say(text, bad) {
@@ -165,6 +161,7 @@
     hint.classList.toggle('bad', !!bad);
     hint.removeAttribute('data-refused');
     hint.removeAttribute('role');
+    hint.setAttribute('aria-live', 'polite');
     if (custom) {
       if (bad) custom.setAttribute('aria-invalid', 'true');
       else custom.removeAttribute('aria-invalid');
@@ -264,9 +261,10 @@
       buttons.push(b);
     }
     if (buttons.length) {
+      // A chosen month without a capture keeps its outline; the first month then holds the tab stop.
       var chosen = table.querySelector('td.pick .tl-btn');
-      mark(chosen ? chosen.parentNode : null);
-      if (!chosen) rove(buttons[0]);
+      if (chosen) mark(chosen.parentNode);
+      else rove(buttons[0]);
       var tip = document.querySelector('[data-tl-tip]');
       if (tip) tip.hidden = false;
     }

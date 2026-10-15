@@ -15,7 +15,7 @@ import { normalizeDomain } from '../engine/url.ts';
 import { Content, paginate, type Entry } from './content.ts';
 import { JobStore, MAX_RETRIES, type Job } from './db.ts';
 import { Theme, type ViewContext } from './views.ts';
-import { ownSnapshotProblem, parseOwnSnapshot, waybackLinks } from './snapshot.ts';
+import { ownSnapshotProblem, parseOwnSnapshot, refusalsByMonth, waybackLinks } from './snapshot.ts';
 import { JobRunner, type RestoreJobResult, type ScanResult } from './worker.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
@@ -479,6 +479,7 @@ export async function createApp(config: WebConfig) {
       view.archive = config.archiveBase.replace(/\/+$/, '');
       view.custom = form.custom ?? '';
       view.customError = form.customError;
+      view.refusals = refusalsByMonth(h);
       view.full = !!form.full;
     }
     if (job.kind === 'restore' && job.target) {

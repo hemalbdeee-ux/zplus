@@ -12,12 +12,37 @@ import { after, before, describe, it } from 'node:test';
 import type { HealthReport, MonthHealth } from '../src/engine/health.ts';
 import { restore } from '../src/engine/restore.ts';
 import { configFromEnv, createApp } from '../src/web/server.ts';
-import { ownSnapshotProblem, parseOwnSnapshot, waybackLinks } from '../src/web/snapshot.ts';
+import { ownSnapshotProblem, parseOwnSnapshot, refusalsByMonth, waybackLinks } from '../src/web/snapshot.ts';
 import { startFakeArchive, type FakeArchive, type FakeCapture } from './fake-archive.ts';
 import { OLD_BAKERY } from './fixtures/oldbakery.ts';
 
 const FAST = { minIntervalMs: 0, backoffMs: 1, retries: 1 };
 const NOW = new Date('2026-10-15T12:00:00Z');
+
+const monthOf = (m: string, verdict: MonthHealth['verdict'], reasons: string[] = []): MonthHealth => ({ month: m, captures: 1, timestamp: `${m}10120000`, score: verdict === 'good' ? 90 : 5, verdict, reasons, probed: true });
+
+// A shop, parked in 2010, a month the scan left unchecked, a 404, parked again, then a new owner's
+// gym. The unchecked month is trimmed off the period around it, which would leave only the stretch
+// after the parked month: a later owner's.
+const OAK: HealthReport = {
+  domain: 'oakshop.example',
+  host: 'www.oakshop.example',
+  probes: 8,
+  months: [
+    monthOf('200705', 'good'),
+    monthOf('200805', 'good'),
+    monthOf('200905', 'good'),
+    monthOf('201005', 'bad', ['parked domain page ("this domain may be for sale")']),
+    { ...monthOf('201105', 'weak', ['not checked; near a change']), score: 55, probed: false },
+    monthOf('201108', 'bad', ['homepage answered HTTP 404']),
+    monthOf('201110', 'weak'),
+    monthOf('201205', 'bad', ['parked domain page ("this domain may be for sale")']),
+    monthOf('201305', 'good'),
+    monthOf('201505', 'good'),
+  ],
+  lastGood: { month: '201505', timestamp: '20150510120000', score: 90, original: '' },
+  window: { from: '20120601000000' },
+};
 
 describe('a snapshot the user names', () => {
   const parse = (s: string) => parseOwnSnapshot(s, 'oldbakery.example', NOW);
@@ -111,6 +136,41 @@ describe('the period a named snapshot is restored from', () => {
     assert.match(ownSnapshotProblem(late, '20080601000000') ?? '', /first homepage capture of riverside\.example is from May 2009 and our check found it bad/);
   });
 
+  const oak = OAK;
+
+  it('refuses a date whose period would not hold it', () => {
+    assert.match(ownSnapshotProblem(oak, '20110510120000') ?? '', /cannot vouch for oakshop\.example around 2011-05-10/);
+    assert.equal(ownSnapshotProblem(oak, '20080101000000'), undefined);
+  });
+
+  it('does not call an unchecked first capture bad', () => {
+    const unplayed: HealthReport = {
+      ...health,
+      months: [{ ...month('200805', 'weak', ['capture not playable (HTTP 404)', 'not checked; near a change']), probed: true }, month('200905', 'bad', ['parked domain page ("this domain may be for sale")']), month('201005', 'good'), month('201205', 'good')],
+      lastGood: { month: '201205', timestamp: '20120510120000', score: 90, original: '' },
+      window: { from: '20090601000000' },
+    };
+    const msg = ownSnapshotProblem(unplayed, '20080510000000') ?? '';
+    assert.match(msg, /cannot vouch for riverside\.example around 2008-05-10/);
+    assert.doesNotMatch(msg, /found it bad/);
+  });
+
+  it('gives the page the same answer for every month', () => {
+    const r = refusalsByMonth(oak, NOW)!;
+    assert.equal(r.first, '200705');
+    const say = (m: string, date: string) => (r.months[m] === undefined ? undefined : r.messages[r.months[m]].split('{date}').join(date));
+    for (const m of ['200705', '200801', '200912', '201206', '201505', '202610']) assert.equal(say(m, 'x'), undefined, m);
+    assert.equal(say('201105', '2011-05-10'), ownSnapshotProblem(oak, '20110510120000'));
+    assert.equal(say('201006', '2010-06-02'), ownSnapshotProblem(oak, '20100602000000'));
+    assert.match(say('201205', '2012-05-03') ?? '', /parked or run by another owner around 2012-05-03/);
+    assert.ok(!('202611' in r.months), 'no months after this one');
+    assert.ok(r.messages.length < 8, `${r.messages.length} distinct messages`);
+    // An outage inside the healthy period is not refused.
+    const outage: HealthReport = { ...health, months: [month('201005', 'good'), month('201105', 'bad', ['homepage answered HTTP 503']), month('201205', 'good'), month('201305', 'good')], lastGood: { month: '201305', timestamp: '20130510120000', score: 90, original: '' }, window: {} };
+    assert.deepEqual(refusalsByMonth(outage, NOW)!.months, {});
+    assert.equal(ownSnapshotProblem(outage, '20110520000000'), undefined);
+  });
+
   it('refuses a domain without captures', () => {
     assert.match(ownSnapshotProblem({ ...health, months: [], lastGood: undefined }, '20110101000000') ?? '', /no captures of riverside\.example/);
   });
@@ -170,6 +230,19 @@ describe('restoring a date outside the period the scan picked', () => {
       await assert.rejects(readFile(path.join(gym.siteDir, 'catalogue.html')), { code: 'ENOENT' });
 
       await assert.rejects(restore({ ...opts, outDir: await mkdtemp(path.join(work, 'r-')), target: '2013-09' }), /parked or run by another owner around 2013-09-01/);
+    } finally {
+      await archive.close();
+    }
+  });
+
+  it('refuses a date in a month the scan left unchecked before a bad one', async () => {
+    const archive = await startFakeArchive([
+      { url: 'http://www.oakshop.example/about.html', ts: '20100910120000', body: page('Casino Gacor', 'Slot online gacor hari ini. ') },
+      { url: 'http://www.oakshop.example/', ts: '20090510120000', body: page('Oak Shop', BOOKS) },
+    ]);
+    try {
+      const opts = { domain: 'oakshop.example', zip: false, health: OAK, archive: { base: archive.base, ...FAST } };
+      await assert.rejects(restore({ ...opts, outDir: await mkdtemp(path.join(work, 'r-')), target: '2011-05-10' }), /cannot vouch for oakshop\.example around 2011-05-10/);
     } finally {
       await archive.close();
     }
@@ -256,6 +329,11 @@ describe('web app: a snapshot the user names', () => {
     assert.match(html, /<td class="bad" data-month="202103" data-ts="\d{14}"/);
     assert.match(html, /<td class="none" data-month="201501" title=/);
     assert.match(html, /<input id="custom" name="custom" type="text"/);
+    // The page gets the server's answer for every month, to warn while a date is typed.
+    const refusals = JSON.parse(/<script type="application\/json" id="refusals">(.*?)<\/script>/.exec(html)![1]) as { first: string; months: Record<string, number>; messages: string[] };
+    assert.equal(refusals.first, '201503');
+    assert.match(refusals.messages[refusals.months['202206']], /After 2021-02-28 our check found oldbakery\.example down/);
+    assert.equal(refusals.months['201906'], undefined);
     // The page the preview frames plays back.
     const played = await fetch(frame[1]);
     assert.equal(played.status, 200);
@@ -291,7 +369,7 @@ describe('web app: a snapshot the user names', () => {
     const parkedPage = await parked.text();
     assert.match(parkedPage, /After 2021-02-28 our check found oldbakery\.example down, parked or run by another owner\. Choose an earlier date\./);
     // The message sits with the field, which is marked invalid, and the preview stays on the list's choice.
-    assert.match(parkedPage, /aria-invalid="true">\s*<p class="form-hint bad" id="custom-hint" data-hint data-refused role="alert">After 2021-02-28/);
+    assert.match(parkedPage, /aria-invalid="true">\s*<p class="form-hint bad" id="custom-hint" data-hint data-refused role="alert" aria-live="polite">After 2021-02-28/);
     assert.match(parkedPage, /web\/20201114083015if_\//);
 
     const calendar = await post(`/job/${scanId}/restore`, { custom: 'https://web.archive.org/web/2019*/oldbakery.example', mode: 'demo' });
