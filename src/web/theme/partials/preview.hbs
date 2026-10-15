@@ -1,0 +1,12 @@
+<section class="panel preview" data-preview data-archive="{{archive}}" data-host="{{host}}" data-domain="{{domain}}" aria-labelledby="preview-title">
+    <div class="preview-head">
+        <h2 id="preview-title">{{heading}}</h2>
+        <a href="{{p.page}}" data-open target="_blank" rel="noopener noreferrer">Open in the Wayback Machine ↗</a>
+    </div>
+    <p class="preview-meta"><b class="mono" data-label>{{ts p.ts}}</b> <span class="pill {{p.verdict}}" data-verdict>{{p.verdict}}</span> <span class="muted" data-note>{{p.note}}</span></p>
+    <div class="preview-frame">
+        <iframe src="{{p.frame}}" title="Capture of {{domain}} from {{ts p.ts}}" sandbox="allow-scripts allow-same-origin" referrerpolicy="no-referrer" loading="lazy" tabindex="-1"></iframe>
+        <p class="preview-wait" aria-hidden="true">Loading the capture from archive.org…</p>
+    </div>
+    <p class="form-note">The homepage as the Wayback Machine shows it; the restored site has the same pages without the archive's toolbar. If the frame stays empty, open the capture in the Wayback Machine.</p>
+</section>

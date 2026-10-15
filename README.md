@@ -28,7 +28,13 @@ Markdown in `content/`, clean `/slug/` URLs with a trailing slash, `/tag/<slug>/
 `/blog/page/2/`, `/rss/`, a sitemap index and `robots.txt`.
 
 The app flow: `/restore/` (domain) -> `/job/<id>/` health timeline and snapshot choice -> a restore
-job with live progress -> ZIP download and report. App pages are `noindex`. Jobs are stored in SQLite
+job with live progress -> ZIP download and report. Next to the snapshot choice, the restore progress
+and the result, a preview shows the chosen capture's homepage as the Wayback Machine plays it back
+(`/web/<timestamp>if_/<url>`, loaded by the visitor's browser in a sandboxed frame, so it costs the
+server no archive requests). Besides the healthy snapshots in the list, a visitor can name a snapshot
+of their own: a month clicked in the timeline, a date, or the link of a capture they found in the
+Wayback Machine calendar. Its pages come from the period around that date, between the months the
+scan found parked or taken over; a date inside such months is refused. App pages are `noindex`. Jobs are stored in SQLite
 (`node:sqlite`, no native module). Each job runs in its own child process, so a heavy or crashing
 job cannot freeze or stop the web server. After a restart or a crash an interrupted job is tried
 once more and resumes from its work folder; a job that fails twice stops with an error. The page
@@ -68,7 +74,9 @@ Copy `.env.example` to `.env`, set the domain (and, if you want one, the access 
    suspended accounts, server default pages, redirects to other domains and spam that a later owner
    added all score as bad; splash pages, framesets and redirects inside the site are followed to
    the real homepage. The newest good month becomes the target, and the period around it in which
-   the site was itself becomes the window. Captures from outside the window are never used.
+   the site was itself becomes the window. Captures from outside the window are never used. A date
+   picked outside that period (`--target`, or a snapshot named on the web page) gets the period
+   around it instead, which also ends at the months the scan found parked or taken over.
 2. **Index**: the CDX API lists every archived URL; for each URL the capture closest to the target
    inside the window is kept (earlier captures win ties). CDX queries are never narrowed on the
    server: archive.org's CDX server counts rows that `filter`, `collapse` or `from`/`to` drop

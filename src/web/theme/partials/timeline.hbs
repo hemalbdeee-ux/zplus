@@ -3,7 +3,7 @@
     <thead><tr><th scope="col"><span class="sr">Year</span></th><th>J</th><th>F</th><th>M</th><th>A</th><th>M</th><th>J</th><th>J</th><th>A</th><th>S</th><th>O</th><th>N</th><th>D</th></tr></thead>
     <tbody>
     {{#each rows}}
-        <tr><th scope="row">{{year}}</th>{{#each cells}}<td class="{{cls}}{{#if pick}} pick{{/if}}" title="{{title}}"><span class="sr">{{title}}</span></td>{{/each}}</tr>
+        <tr><th scope="row">{{year}}</th>{{#each cells}}<td class="{{cls}}{{#if pick}} pick{{/if}}" data-month="{{month}}"{{#if stamp}} data-ts="{{stamp}}"{{/if}} title="{{title}}"><span class="sr">{{title}}</span></td>{{/each}}</tr>
     {{/each}}
     </tbody>
 </table>

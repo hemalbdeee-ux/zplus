@@ -114,6 +114,20 @@ export function windowAround(months: MonthHealth[], target: string): Window | nu
   return window;
 }
 
+/** The scanned month a date falls in, or the last one before it. */
+export function monthAtOrBefore(months: MonthHealth[], target: string): MonthHealth | undefined {
+  let found: MonthHealth | undefined;
+  for (const m of months) if (m.month <= target.slice(0, 6)) found = m;
+  return found;
+}
+
+const MONTH_NAMES = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split(' ');
+
+/** YYYYMM as "Jun 2019". */
+export function monthName(month: string): string {
+  return `${MONTH_NAMES[Number(month.slice(4, 6)) - 1]} ${month.slice(0, 4)}`;
+}
+
 function monthsBetween(a: string, b: string): number {
   return Number(b.slice(0, 4)) * 12 + Number(b.slice(4, 6)) - (Number(a.slice(0, 4)) * 12 + Number(a.slice(4, 6)));
 }
@@ -196,21 +210,36 @@ export async function restore(opts: RestoreOptions): Promise<RestoreResult> {
   }
   let bounds: Window = health?.window ?? {};
   let around: Window | null = null;
-  if (health?.months.length && !health.lastGood && !(givenFrom && givenTo)) {
-    // The user picked the date after the scan found no good month. The window still ends at the
-    // months it found parked or taken over, or the later owner's pages would come back as the site.
+  // A date the user picked before the period the scan found healthy (or with no healthy period at
+  // all) takes its pages from the period around that date instead. A date after that period keeps
+  // it: after it the scan found the site gone or taken over.
+  const beforeHealthy = !!givenTarget && !!health?.lastGood && !!health.window.from && target < health.window.from;
+  if (health?.months.length && (!health.lastGood || beforeHealthy) && !(givenFrom && givenTo)) {
+    // The window still ends at the months the scan found parked or taken over, or the later owner's
+    // pages would come back as the site.
     around = windowAround(health.months, target);
     if (!around) {
       throw new Error(`The health scan found ${domain} parked or run by another owner around ${day(target)}. Pick a date when it was still the old site, or pass --from and --to to restore that period anyway.`);
+    }
+    // windowAround lets a date through after bad months that look like an outage, which is right only
+    // when the site came back: a homepage last seen down may have a later owner on its other URLs.
+    const last = monthAtOrBefore(health.months, target);
+    if (last?.verdict === 'bad') {
+      throw new Error(`The health scan found ${domain}'s homepage bad in ${monthName(last.month)} (${last.reasons[0] ?? 'not a real website'}), the last month it checked before ${day(target)}. Pick a date when it was still the old site, or pass --from and --to to restore that period anyway.`);
     }
     bounds = around;
   }
   const window: Window = { from: givenFrom ?? bounds.from, to: givenTo ?? bounds.to };
   if (around) {
-    if (window.from && window.to && window.from > window.to) {
-      throw new Error(`The health scan cannot vouch for ${domain} around ${day(target)}: the months around it were bad or not checked, so the period to restore would run from ${day(window.from)} to ${day(window.to)}. Pick a date when it was still the old site, or pass --from and --to to restore that period anyway.`);
+    // windowAround leaves out unchecked months just before a bad one, so the period can end before
+    // the date, or before the first homepage capture: that is not the site as it was then.
+    const first = `${health!.months[0].month}01000000`;
+    const misses = !givenTo && !!around.to && (target > around.to || around.to < first);
+    if ((window.from && window.to && window.from > window.to) || misses) {
+      throw new Error(`The health scan cannot vouch for ${domain} around ${day(target)}: the months around it were bad or not checked, so the period to restore would run from ${window.from ? day(window.from) : 'the first capture'} to ${window.to ? day(window.to) : 'today'}. Pick a date when it was still the old site, or pass --from and --to to restore that period anyway.`);
     }
-    emit('health', `no capture looks like a real website: pages are taken from ${window.from?.slice(0, 8) ?? 'the start'} to ${window.to?.slice(0, 8) ?? 'today'}, between the bad months around the chosen date`);
+    const why = health?.lastGood ? 'the chosen date is outside the period the scan picked' : 'no capture looks like a real website';
+    emit('health', `${why}: pages are taken from ${window.from?.slice(0, 8) ?? 'the start'} to ${window.to?.slice(0, 8) ?? 'today'}, between the bad months around the chosen date`);
   }
   if (givenTarget && !inWindow(target, window)) {
     warnings.push(`The chosen date ${target.slice(0, 8)} is outside the period the site looked healthy; pages were taken from that period instead.`);

@@ -21,7 +21,8 @@ Usage:
 
 Restore options:
   --target <date>       Snapshot to restore (2019, 2019-06, 2019-06-12 or 20190612083015).
-                        Default: the last snapshot in which the site looked healthy
+                        Default: the last snapshot in which the site looked healthy. A date
+                        outside that period restores the period around the date instead
   --from <date>         Ignore captures before this date
   --to <date>           Ignore captures after this date
   --site-url <url>      Address of the restored site (default: https:// + the host the site used)
